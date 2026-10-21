@@ -4,6 +4,8 @@ A responsive personal options paper trading desk for Indian indices and MCX comm
 
 **New to coding? Start with [START-HERE.md](START-HERE.md).**
 
+As of **21 October 2026**, the laptop app is installed and running with an existing owner account. Its paired companion has saved and reopened a verified Excel workbook. App source has been pushed to the private [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader), and the **personal-options-trader** Neon Free project has been created in Singapore. Render and Vercel deployment remain pending; hosted access and physical-phone use have not yet been verified.
+
 ## Included workflows
 
 - Owner login, expiring server sessions, password hashing, optional TOTP, origin/CSRF checks, and a separate companion credential.
@@ -85,4 +87,4 @@ cd frontend
 npm run build
 ```
 
-The deployment and broker guides link to the official sources checked for this implementation. No external account has been created, connected, charged, or deployed by these local files.
+The deployment and broker guides link to the official sources checked for this implementation. See [the deployment guide](docs/DEPLOYMENT.md) for the current setup status and remaining hosting steps. No paid service has been selected, and genuine broker connectivity remains unverified.

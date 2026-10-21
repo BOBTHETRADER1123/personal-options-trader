@@ -1,10 +1,17 @@
-# Verification report — 20 October 2026
+# Verification and setup report — 21 October 2026
 
 ## Result
 
 **99 automated backend tests passed.** The final TypeScript check and Vite production build passed. A real local HTTP service launch also passed its health, authentication, static website and PWA-manifest checks.
 
-This report distinguishes code verification from external-account and device verification. No real broker order was placed. No broker credentials were supplied, no cloud account was created, and no paid service was selected.
+This report distinguishes code verification from external-account and device verification. No real broker order was placed. Genuine broker connectivity remains unverified, and no paid service has been selected.
+
+## Setup confirmed as of 21 October 2026
+
+- The laptop app is installed and running with an existing owner account.
+- The local companion is paired. A completed Excel workbook was saved in `Documents/PaperTrading/Trades` and reopened successfully.
+- App source was pushed to `main` in the private [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader), with initial source commit `f2d290d`.
+- The **personal-options-trader** Neon Free project was created in Singapore. Render and Vercel deployment are pending.
 
 ## Checks actually run
 
@@ -26,7 +33,7 @@ This report distinguishes code verification from external-account and device ver
 | Logical backup | Blob-safe, checksum-verified database backup/restore and transactional safety backup. |
 | Frontend | Strict TypeScript compilation and production asset generation. Keyboard modal focus/escape handling and responsive breakpoints are implemented. |
 
-The real local launch check verified HTTP 200 for `/api/health`, first-owner setup state, HTTP 401 for an unauthenticated dashboard, successful static website/PWA-manifest serving, and HTTP 404 for a real-order route.
+The isolated local launch check verified HTTP 200 for `/api/health`, first-owner setup state in its temporary test database, HTTP 401 for an unauthenticated dashboard, successful static website/PWA-manifest serving, and HTTP 404 for a real-order route. The installed laptop app now has its owner account already created.
 
 The suite produced one upstream Starlette/httpx test-helper deprecation warning. It produced no failing tests. The backend and frontend were tested in this Windows workspace with the project’s local environment and installed dependencies.
 
@@ -34,10 +41,10 @@ The suite produced one upstream Starlette/httpx test-helper deprecation warning.
 
 - **Browser visual and interaction QA was blocked by the desktop browser security policy.** No screenshot, browser click-through, or visual-layout pass is claimed. No alternate browser/control path was used to bypass that block. Static build and API-level checks passed; actual phone/desktop appearance needs a user-device check.
 - **Genuine account connectivity is not verified.** The adapters follow reviewed official documentation and have protocol/master tests. Broker authentication, subscription permissions, token expiry, rate/subscription limits, reconnect behavior and sustained live load must be checked with your accounts.
-- **Cloud deployment is prepared, not performed.** GitHub, Vercel, Render and Neon configuration/instructions are included. A public/private hosted URL, production PostgreSQL operation, TLS cookie behavior across the actual hosts, and cross-device synchronization still require account setup and deployment.
+- **Render and Vercel deployment are pending.** GitHub source publication and Neon project creation are complete. A hosted app URL, production PostgreSQL operation, TLS cookie behavior across the actual hosts, and cross-device synchronization remain unverified.
 - **Android installation is not verified on a physical phone.** The responsive PWA shell, service worker and manifest are included; actual device checks are in docs/OPERATIONS.md.
 - **No continuous high-volume benchmark is claimed.** Durable recovery tests do not establish millisecond exchange completeness, maximum throughput, continuous uptime, storage sufficiency, or any broker’s actual feed latency. Free hosting that sleeps cannot capture its missing interval.
-- **Laptop file locking and Windows sign-in startup require your environment.** The companion’s save/reopen/checksum/retry behavior was tested with temporary files and simulated HTTP. Your selected folder, real Excel locks and Windows startup shortcut still need checking.
+- **Real Excel file locking and automatic Windows sign-in startup remain unverified.** Companion save/reopen/checksum/retry behavior passed temporary-file and simulated-HTTP tests, and a workbook was also saved and reopened in the laptop’s selected report folder. The desktop launch shortcut exists; automatic launch at Windows sign-in has not been verified.
 
 ## Deliberate implementation boundaries
 

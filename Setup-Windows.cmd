@@ -16,5 +16,5 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Setup complete. Double-click Start-Windows.cmd to open your trading desk.
+echo Setup complete. Double-click Open-Trading-App.cmd to open your trading desk.
 pause

@@ -33,7 +33,7 @@ Running setup again preserves an existing private configuration and database. **
 
 ## Save reports to your laptop automatically
 
-The desktop shortcut and **Open-Trading-App.cmd** start the paired companion automatically. On this configured laptop, verified Excel reports save to **Documents/PaperTrading/Trades**. Reports are marked saved only after their checksum and Excel verification succeed. Keep the laptop awake; if it is offline, queued jobs resume when the companion reconnects.
+The desktop shortcut and **Open-Trading-App.cmd** start the paired companion automatically. On this configured laptop, verified Excel reports save to **Documents/PaperTrading/Trades**. A workbook has already been saved and reopened successfully. Reports are marked saved only after their checksum and Excel verification succeed. Keep the laptop awake; if it is offline, queued jobs resume when the companion reconnects.
 
 For manual pairing, a custom destination, or a hosted backend, use **Start-Companion.cmd**:
 
@@ -51,7 +51,7 @@ The local address above only works on this laptop. To use one login and shared t
 
 Your phone and laptop must open the **same Vercel HTTPS address**, connected to the **same Render backend and Neon database**. In Android Chrome, use **Add to Home screen** to install the app shortcut. The laptop companion still needs to run on the laptop for local file saving.
 
-No cloud account, paid plan, or payment details were created for you. Hosting requires your account access. A free backend can sleep, so it cannot guarantee uninterrupted feed capture. Use the deployment guide to understand the limits before choosing a plan.
+As of **21 October 2026**, your source is in the private [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader), and the **personal-options-trader** Neon Free project has been created in Singapore. Render and Vercel deployment are still pending, so there is no shared hosted app address yet. No paid service has been selected. A free backend can sleep, so it cannot guarantee uninterrupted feed capture.
 
 ## Connect real market prices
 

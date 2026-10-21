@@ -6,10 +6,25 @@ The laptop companion connects outward to Render to save completed workbooks.
 Your phone and laptop open the same HTTPS website and use the same owner
 password and database. The Python service owns market feeds and export jobs.
 
-No cloud account has been configured and no deployment or paid upgrade has
-been performed. You will need your own accounts and broker data permission.
-Complete the Windows practice walkthrough in `START-HERE.md`/`README.md`
-before deploying. Keep online deletion turned off while testing.
+## Setup status — 21 October 2026
+
+- The Windows laptop app is installed and running. Its owner account already
+  exists, and the paired companion has saved and reopened a verified Excel
+  workbook in `Documents/PaperTrading/Trades`.
+- App source has been pushed to `main` in the private
+  [personal-options-trader repository](https://github.com/BOBTHETRADER1123/personal-options-trader).
+  The initial source push is commit `f2d290d`.
+- The **personal-options-trader** Neon project has been created on the
+  **Free** plan in **Singapore**.
+- Render and Vercel deployment are pending. A hosted app URL, production
+  database operation and physical-phone access have not yet been verified.
+  No paid service has been selected. Genuine broker connectivity remains
+  unverified.
+
+The GitHub and Neon creation steps below are retained for reference; use
+the existing repository and Neon project for this setup. Continue with the
+Render backend steps, then Vercel and the hosted checks. Keep online deletion
+turned off while testing.
 
 ## 1. Understand the free-service limits
 
@@ -266,6 +281,6 @@ unattended work requires a running backend; free-tier sleep still applies.
 | Companion says HTTPS required | Use Render HTTPS URL and the Render-specific proxy command from Step 4. |
 | Excel job remains pending | Check companion token/hash, laptop online, destination writable, backend awake, and job error details. |
 
-The cloud and real-account checks in this guide require your accounts. They
-must be recorded as **not yet verified** until you perform them; the local
+The remaining hosted-app and real-broker checks in this guide require the
+actual services and accounts. They remain **not yet verified**; the local
 automated tests cannot establish phone-outside-network or real feed behavior.
