@@ -15,7 +15,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal
-from .reporting import ExportJob, archive_after_verified_save, now_iso, public_job, reconciliation
+from .reporting import ExportJob, archive_after_verified_save, now_iso, public_job, reconciliation, job_metadata
 
 router_browser = APIRouter(prefix="/api/exports", tags=["Excel exports"])
 router_companion = APIRouter(prefix="/api/companion", tags=["Local companion"])
@@ -72,8 +72,7 @@ def _download(job: ExportJob) -> Response:
 
 @router_browser.get("")
 def list_exports(db: Session = Depends(db_session)):
-    jobs = db.scalars(select(ExportJob).order_by(ExportJob.created_at.desc())).all()
-    return {"jobs": [public_job(job) for job in jobs]}
+    return {"jobs": job_metadata(db), "recent_limit": 200}
 
 
 @router_browser.get("/reconciliation")
@@ -103,12 +102,12 @@ def retry_export(job_id: str, db: Session = Depends(db_session)):
 
 @router_companion.get("/jobs", dependencies=[Depends(require_companion)])
 def companion_jobs(db: Session = Depends(db_session)):
-    jobs = db.scalars(select(ExportJob).where(or_(
+    query = select(ExportJob).where(or_(
         ExportJob.status == "ready",
         (ExportJob.status == "claimed") & (ExportJob.lease_until < now_iso()),
         (ExportJob.status == "failed") & (ExportJob.file_bytes.is_not(None)) & (ExportJob.lease_until < now_iso()),
-    )).order_by(ExportJob.created_at).limit(20)).all()
-    return {"jobs": [public_job(job) for job in jobs]}
+    )).order_by(ExportJob.created_at).limit(20)
+    return {"jobs": job_metadata(db, query)}
 
 
 class Claim(BaseModel):

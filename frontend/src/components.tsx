@@ -18,12 +18,12 @@ export function LineChart({data,height=230,payoff=false,spot=0}:{data:{x:number|
  const active=hover===null?data.length-1:hover,d=data[active];
  const spotIndex=payoff?data.findIndex(a=>Number(a.x)>=spot):-1;
  return <div className="line-chart" onMouseLeave={()=>setHover(null)}><svg role="img" aria-label={payoff?'Strategy payoff at expiry':'Recorded paper profit and loss over time'} viewBox={`0 0 ${W} ${H}`} onMouseMove={e=>{const r=e.currentTarget.getBoundingClientRect();setHover(Math.max(0,Math.min(data.length-1,Math.round(((e.clientX-r.left)/r.width*W-L)/pW*(data.length-1)))));}}>
-  <defs><linearGradient id={id} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#b8e786" stopOpacity=".18"/><stop offset="100%" stopColor="#b8e786" stopOpacity="0"/></linearGradient></defs>
-  {[0,1,2,3,4].map(i=>{const v=lo+(hi-lo)*i/4,py=y(v);return <g key={i}><line x1={L} y1={py} x2={W-R} y2={py} stroke="#252d29" strokeDasharray="3 6"/><text x={W-R+15} y={py+4} className="axis-label">{Math.abs(v)>999?`${(v/1000).toFixed(1)}k`:Math.round(v)}</text></g>;})}
-  {payoff&&<line x1={L} y1={y(0)} x2={W-R} y2={y(0)} stroke="#67736b" strokeDasharray="5 5"/>}
-  <path d={area} fill={`url(#${id})`}/><path d={path} fill="none" stroke="#bbeb8d" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round"/>
-  {spotIndex>=0&&<line x1={x(spotIndex)} x2={x(spotIndex)} y1={T} y2={H-B} stroke="#869681" strokeDasharray="4 4"/>}
-  {hover!==null&&<><line x1={x(active)} x2={x(active)} y1={T} y2={H-B} stroke="#6e7b70" strokeDasharray="3 3"/><circle cx={x(active)} cy={y(d.y)} r="4" fill="#b8e786" stroke="#151b17" strokeWidth="3"/></>}
+  <defs><linearGradient id={id} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#5ce0bb" stopOpacity=".18"/><stop offset="100%" stopColor="#5ce0bb" stopOpacity="0"/></linearGradient></defs>
+  {[0,1,2,3,4].map(i=>{const v=lo+(hi-lo)*i/4,py=y(v);return <g key={i}><line x1={L} y1={py} x2={W-R} y2={py} stroke="#1c3140" strokeDasharray="3 6"/><text x={W-R+15} y={py+4} className="axis-label">{Math.abs(v)>999?`${(v/1000).toFixed(1)}k`:Math.round(v)}</text></g>;})}
+  {payoff&&<line x1={L} y1={y(0)} x2={W-R} y2={y(0)} stroke="#5d7d94" strokeDasharray="5 5"/>}
+  <path d={area} fill={`url(#${id})`}/><path d={path} fill="none" stroke="#5ce0bb" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round"/>
+  {spotIndex>=0&&<line x1={x(spotIndex)} x2={x(spotIndex)} y1={T} y2={H-B} stroke="#779bb6" strokeDasharray="4 4"/>}
+  {hover!==null&&<><line x1={x(active)} x2={x(active)} y1={T} y2={H-B} stroke="#5d7d94" strokeDasharray="3 3"/><circle cx={x(active)} cy={y(d.y)} r="4" fill="#5ce0bb" stroke="#0c1b28" strokeWidth="3"/></>}
   {[0,1,2,3,4].map(i=>{const idx=Math.round((data.length-1)*i/4);return <text key={i} x={x(idx)} y={H-5} textAnchor={i===0?'start':i===4?'end':'middle'} className="axis-label">{payoff?num(Number(data[idx].x),0):time(String(data[idx].x)).slice(0,5)}</text>;})}
  </svg>{hover!==null&&<div className="chart-tooltip">{payoff?num(Number(d.x)):time(String(d.x))}<strong><Pnl value={d.y}/></strong></div>}</div>;
 }

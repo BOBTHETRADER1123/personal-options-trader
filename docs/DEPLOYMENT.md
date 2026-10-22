@@ -6,25 +6,39 @@ The laptop companion connects outward to Render to save completed workbooks.
 Your phone and laptop open the same HTTPS website and use the same owner
 password and database. The Python service owns market feeds and export jobs.
 
-## Setup status — 21 October 2026
+## Current status — 22 October 2026
 
-- The Windows laptop app is installed and running. Its owner account already
-  exists, and the paired companion has saved and reopened a verified Excel
-  workbook in `Documents/PaperTrading/Trades`.
-- App source has been pushed to `main` in the private
+The owner account is created and the user has opened the hosted dashboard. Neon's **monthly public network-transfer allowance is exhausted**, leaving the online database temporarily unavailable. No paid upgrade has been selected. The online companion is stopped during the outage. The new compact recording policy reduces repeated history reads, stores current marks and extrema, and produces small Excel summaries. Available laptop reports are verified in [Google Drive](https://drive.google.com/drive/folders/1CxpHsKBCJ8dxxNYbKAx6NMwEU9tojMn5); daily backup scheduling depends on this laptop and Codex being available. This does not reset Neon's transfer quota.
+
+The infrastructure and first-owner instructions below are retained for **fresh installations and recovery**, not as instructions to reset the existing owner account. End-to-end hosted trade/export and physical-phone checks remain outstanding until database access returns.
+
+## Initial deployment record — 21 October 2026
+
+- The website is live on Vercel Hobby at
+  **[personal-options-trader.vercel.app](https://personal-options-trader.vercel.app)**.
+  Its project root is `frontend`, the API proxy is connected, and
+  `VITE_WS_URL` is configured.
+- The backend is live on Render Free in Singapore at
+  **[personal-options-trader-api.onrender.com](https://personal-options-trader-api.onrender.com)**.
+  It uses the **personal-options-trader** Neon Free PostgreSQL project in
+  Singapore. Hosted health and the website's session endpoint returned HTTP
+  200 before the quota outage. The user subsequently created the owner account,
+  and the session endpoint confirmed first-owner setup was no longer required.
+- The **Personal Options Trader Online** desktop shortcut and
+  **Open-Online-Trading-App.cmd** start a separate authenticated companion.
+  Its destination is `Documents/PaperTrading/OnlineTrades`. Companion polling
+  returned HTTP 200, but no hosted workbook save has yet been verified.
+- The local practice app, existing local owner account and data are retained.
+  Its companion has saved and reopened a verified Excel workbook in
+  `Documents/PaperTrading/Trades`.
+- App source is in `main` in the private
   [personal-options-trader repository](https://github.com/BOBTHETRADER1123/personal-options-trader).
-  The initial source push is commit `f2d290d`.
-- The **personal-options-trader** Neon project has been created on the
-  **Free** plan in **Singapore**.
-- Render and Vercel deployment are pending. A hosted app URL, production
-  database operation and physical-phone access have not yet been verified.
-  No paid service has been selected. Genuine broker connectivity remains
-  unverified.
+  No paid service has been selected. Genuine broker connectivity is unverified.
 
-The GitHub and Neon creation steps below are retained for reference; use
-the existing repository and Neon project for this setup. Continue with the
-Render backend steps, then Vercel and the hosted checks. Keep online deletion
-turned off while testing.
+The infrastructure creation steps below are retained for reference and
+recovery; the existing repository and services are already configured. The
+next operational check is database access recovery, followed by the first
+online workbook and phone checks. Keep online deletion turned off while testing.
 
 ## 1. Understand the free-service limits
 
@@ -138,18 +152,17 @@ period when you intentionally update the backend.
 
 ## 5. Connect Vercel to Render
 
-1. Open `frontend/vercel.json` in Notepad. Replace only
-   `REPLACE-WITH-YOUR-RENDER-SERVICE` with the actual Render hostname prefix
-   from Step 4. Keep `https://`, `/api/:path*` and all other JSON punctuation.
-   For example, an actual Render service at `https://my-paper-api.onrender.com`
-   needs this destination:
+The current deployment already has this connection. For a replacement
+deployment, use the actual backend's hostname consistently.
+
+1. The API rewrite in `frontend/vercel.json` points to:
 
    ```json
-   "destination": "https://my-paper-api.onrender.com/api/:path*"
+   "destination": "https://personal-options-trader-api.onrender.com/api/:path*"
    ```
 
-2. Save the file. In GitHub Desktop commit **Connect Render backend**, then
-   click **Push origin**. The hostname is public configuration, not a secret.
+2. If you change this destination for a replacement service, save, commit
+   and push the file before redeploying. The hostname is public configuration.
 3. Sign in at [Vercel](https://vercel.com/) and choose **Add New → Project**.
    Import your GitHub repository.
 4. Set **Root Directory** to `frontend`, **Framework Preset** to **Vite**,
@@ -158,7 +171,7 @@ period when you intentionally update the backend.
    WebSocket URL, replacing `https://` with `wss://` and adding `/ws`:
 
    ```text
-   wss://my-paper-api.onrender.com/ws
+   wss://personal-options-trader-api.onrender.com/ws
    ```
 
 6. Leave **VITE_API_BASE_URL unset**. Browser `/api` requests travel through
@@ -168,22 +181,26 @@ period when you intentionally update the backend.
    credentials must never have a `VITE_` prefix.
 7. Choose the personal free/Hobby option if eligible, inspect any plan prompt,
    and deploy. Copy your stable production address, such as
-   `https://your-paper-trader.vercel.app`. Use this stable address on both
+   `https://personal-options-trader.vercel.app`. Use this stable address on both
    devices rather than a temporary preview deployment URL.
 
 Vercel's [external rewrites](https://vercel.com/docs/routing/rewrites) support
 this API proxy. API responses explicitly disable browser/CDN caching so one
-session's records are not cached as public content. The placeholder destination
-will fail until you replace it; it is not an already hosted backend.
+session's records are not cached as public content. This deployment's API proxy
+has passed its initial session/setup-state check.
 
 ## 6. Finish the owner account and shared-device test
 
-1. Return to **Render → Environment**. Set **ALLOWED_ORIGINS** to the exact
-   Vercel production origin, for example `https://your-paper-trader.vercel.app`.
-   Do not add a trailing slash, page path, or wildcard. Save and redeploy.
+The existing hosted owner account is already created. The setup steps below apply only to a new installation. The local practice owner account remains separate.
+
+1. The configured **ALLOWED_ORIGINS** is the Vercel production origin,
+   `https://personal-options-trader.vercel.app`. When changing the website
+   origin, update **Render → Environment** and redeploy. Do not add a
+   trailing slash, page path, or wildcard.
    If you later add a custom domain, add that exact HTTPS origin too,
    separated by a comma.
-2. Open the Vercel website. Enter your **SETUP_TOKEN** and create an owner
+2. Open [the Vercel website](https://personal-options-trader.vercel.app).
+   Enter the private **SETUP_TOKEN** and create an owner
    password of at least 12 characters. Keep it in a password manager.
    Optional `OWNER_TOTP_SECRET` enables an authenticator factor; this is
    independent of Kotak's broker login factor.
@@ -226,20 +243,37 @@ will fail until you replace it; it is not an already hosted backend.
 
 ## 8. Pair the laptop save companion
 
-1. Follow `docs/EXPORTS.md` to run `companion/configure.py` on your laptop.
-   Enter the **Render HTTPS service URL**, not the Vercel website URL, as the
-   companion backend address.
-2. The configuration utility creates a private local token and displays its
-   **SHA256 hash**. Put that hash into Render's **COMPANION_TOKEN_SHA256**
-   variable and redeploy. Keep the raw token only on the laptop.
-3. Choose a destination such as `Documents/PaperTrading/Trades`. Run the
-   companion's startup script; it polls outward over HTTPS and does not open
-   a public port on your laptop. It receives no broker or database secrets.
-4. Close a practice trade from the phone. The job should become **Pending**,
-   then **Saved locally** when the laptop receives it. Open its workbook and
-   check Summary, Timeline, Events, Legs, Market Updates and timestamps.
-5. Stop the companion, close another practice trade and verify that its job
-   stays online. Restart the companion and check that it saves exactly one
+Pairing is already configured for this laptop. **Personal Options Trader
+Online** or **Open-Online-Trading-App.cmd** opens the hosted website and
+starts its separate companion; **Stop-Online-Trading-App.cmd** stops that
+companion only. It polls outward over HTTPS and opens no public laptop port.
+The initial authenticated jobs request succeeded. The first workbook save
+still needs the checks below after hosted owner creation.
+
+The online launcher reads these private files, which are excluded from Git
+and the source release:
+
+- Root `.env.online`: `PUBLIC_WEBSITE_URL` points to the Vercel HTTPS origin.
+- `companion/.env.online`: `BACKEND_URL` points to the Render HTTPS origin;
+  `COMPANION_TOKEN` is the private online pairing token; `TRADES_FOLDER` is
+  the full path to `Documents/PaperTrading/OnlineTrades`; `POLL_SECONDS` is
+  the polling interval.
+
+Keep the raw token only on the laptop, with its SHA256 hash in Render's
+`COMPANION_TOKEN_SHA256`. The retained local companion uses different `.env`
+files and `Documents/PaperTrading/Trades`; do not repurpose its manifest or
+overwrite its connection to configure the online companion.
+
+To verify online saving:
+
+1. Complete a practice trade after finishing hosted owner setup.
+2. Watch **Excel reports** for **Pending**, then **Saved locally** when the
+   companion receives it. Open the workbook in
+   **Documents/PaperTrading/OnlineTrades** and check Summary, Timeline,
+   Events, Legs, Market Updates and timestamps.
+3. Stop the online companion with **Stop-Online-Trading-App.cmd**, then
+   complete another practice trade and verify that its job stays online.
+   Restart **Open-Online-Trading-App.cmd** and check that it saves one
    verified workbook and acknowledges it. Repeat the failure/restart tests
    in `EXPORTS.md` before considering optional online archiving.
 

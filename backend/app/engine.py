@@ -1,7 +1,8 @@
 """Paper-only ledger, weighted-average accounting and durable quote capture.
 
 No broker order submission method is imported or called from this module.
-Every quote receipt is journaled before the surrounding transaction commits.
+Active-position receipts are durable until valuation completes. Compact mode
+keeps current marks and observed trade extrema, without retaining tick history.
 """
 import copy
 import hashlib
@@ -10,34 +11,101 @@ import math
 import time
 import uuid
 import logging
+import threading
+import weakref
+from collections import OrderedDict
 from datetime import datetime, timezone
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, update, func, event as sqlalchemy_event
+from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from .database import iso_now
-from .models import Setting, Trade, Event, Timeline, QuoteEvent, ActionRecord, PendingQuote
+from .models import (Setting, Trade, Event, Timeline, QuoteEvent, ActionRecord,
+                     PendingQuote, LatestQuote, QuoteReceiptCounter, CompactQuoteReceipt)
 from .payoff import strategy_risk
 
 BROKERS={'dhan':'Dhan','kotak':'Kotak Neo','fivepaisa':'5paisa'}
-DEFAULT_SETTINGS={'brokerage_per_order':20.0,'charges_percent':0.05,'slippage_bps':0.0,'fill_basis':'bid_ask','logging_mode':'every_update','preferred_feed':'broker','stale_after_seconds':10,'demo_mode':True,'paper_capital':1000000.0,'delete_after_local_save':False,'auto_delete_online':False}
+DEFAULT_SETTINGS={'brokerage_per_order':20.0,'charges_percent':0.05,'slippage_bps':0.0,'fill_basis':'bid_ask','logging_mode':'summary','recording_policy_version':2,'preferred_feed':'broker','stale_after_seconds':10,'demo_mode':True,'paper_capital':1000000.0,'delete_after_local_save':False,'auto_delete_online':False}
 catalog = None
 log=logging.getLogger(__name__)
+_caches=weakref.WeakKeyDictionary()
+_cache_lock=threading.RLock()
+
+
+def _cache(db):
+    binding=db.get_bind()
+    binding=getattr(binding,'engine',binding)
+    with _cache_lock:
+        if binding not in _caches:
+            _caches[binding]={'quotes':OrderedDict(),'trades':None,'settings':None,
+                              'quotes_loaded':False,'baselines':{},'portfolio':[]}
+        return _caches[binding]
+
+
+def clear_cache(db=None):
+    """Use after out-of-process maintenance; a rollback also invalidates caches."""
+    with _cache_lock:
+        if db is None:_caches.clear()
+        else:
+            binding=db.get_bind();_caches.pop(getattr(binding,'engine',binding),None)
+
+
+@sqlalchemy_event.listens_for(Session,'after_rollback')
+def _rollback_cache(db):
+    clear_cache(db)
+
+
+@sqlalchemy_event.listens_for(Session,'before_flush')
+def _orm_changes_cache(db,flush_context,instances):
+    state=_cache(db)
+    for row in list(db.new)+list(db.dirty):
+        if isinstance(row,Trade) and state['trades'] is not None:
+            state['trades'][row.id]=copy.deepcopy(row.data)
+        if isinstance(row,Timeline):state['baselines'].clear()
+    for row in db.deleted:
+        if isinstance(row,Trade) and state['trades'] is not None:state['trades'].pop(row.id,None)
+
+
+def trade_records(db):
+    """The service runs one writer; reuse its ledger instead of rereading JSON."""
+    state=_cache(db)
+    with _cache_lock:
+        if state['trades'] is None:
+            state['trades']={row.id:copy.deepcopy(row.data) for row in db.scalars(select(Trade))}
+        # Include direct ORM changes in the caller's transaction (including
+        # maintenance/test imports), without publishing stale cached values.
+        for row in list(db.new)+list(db.dirty):
+            if isinstance(row,Trade):state['trades'][row.id]=copy.deepcopy(row.data)
+        for row in db.deleted:
+            if isinstance(row,Trade):state['trades'].pop(row.id,None)
+        return copy.deepcopy(list(state['trades'].values()))
 
 def set_catalog(value):
     global catalog
     catalog=value
+    clear_cache()
 
 def get_settings(db):
-    row=db.get(Setting,'app')
-    return {**DEFAULT_SETTINGS,**(row.value if row else {})}
+    state=_cache(db)
+    if state['settings'] is None:
+        row=db.get(Setting,'app');stored=row.value if row else {}
+        result={**DEFAULT_SETTINGS,**stored}
+        # Older installs inherited every-tick logging. Apply the user's new
+        # compact policy once, while still supporting deliberate later choices.
+        if stored.get('recording_policy_version',0)<2:
+            result['logging_mode']='summary';result['recording_policy_version']=2
+        state['settings']=result
+    return copy.deepcopy(state['settings'])
 
 def update_settings(db, changes):
     settings=get_settings(db)
     if 'delete_after_local_save' in changes: changes['auto_delete_online']=changes['delete_after_local_save']
     if 'auto_delete_online' in changes: changes['delete_after_local_save']=changes['auto_delete_online']
     settings.update(changes)
+    settings['recording_policy_version']=2
     row=db.get(Setting,'app')
     if row: row.value=settings
     else:db.add(Setting(key='app',value=settings))
+    _cache(db)['settings']=copy.deepcopy(settings)
     db.add(Event(trade_id='SETTINGS',kind='configuration_change',data={'changes':changes},timestamp=iso_now()))
     return settings
 
@@ -71,8 +139,38 @@ def contract_for(instrument_id,broker,demo):
     raise HTTPException(422,f'No matching contract in {BROKERS[broker]} instrument master.')
 
 def latest_quote(db,instrument_id,broker):
+    key=(broker,instrument_id);state=_cache(db)
+    if key in state['quotes']:return copy.deepcopy(state['quotes'][key])
+    latest=db.get(LatestQuote,{'broker':broker,'instrument_id':instrument_id})
+    if latest:
+        cache_quote(db,latest.data,persist=False)
+        return copy.deepcopy(latest.data)
     row=db.scalars(select(QuoteEvent).where(QuoteEvent.instrument_id==instrument_id,QuoteEvent.broker==broker).order_by(QuoteEvent.id.desc()).limit(1)).first()
-    return {**row.data,'event_id':row.id} if row else None
+    if row:
+        value={**row.data,'event_id':row.id};cache_quote(db,value,persist=False)
+        return value
+    return None
+
+
+def cache_quote(db,quote,persist=False):
+    """Bounded live lookup. Inactive option-chain rows need no database writes."""
+    value=copy.deepcopy(quote);key=(value['broker'],value['instrument_id'])
+    state=_cache(db)
+    with _cache_lock:
+        state['quotes'][key]=value;state['quotes'].move_to_end(key)
+        while len(state['quotes'])>5000:state['quotes'].popitem(last=False)
+    if persist:
+        values={'broker':value['broker'],'instrument_id':value['instrument_id'],
+                'received_at':value['received_at'],'data':value}
+        dialect=db.get_bind().dialect.name
+        if dialect=='postgresql':
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+        statement=insert(LatestQuote).values(**values)
+        db.execute(statement.on_conflict_do_update(index_elements=['broker','instrument_id'],
+                    set_={'received_at':value['received_at'],'data':value}))
+    return value
 
 def resolve_quote(db,contract,broker,settings):
     source=settings.get('preferred_feed','broker')
@@ -112,6 +210,18 @@ def monetary_units(leg):
 
 def recalculate(trade,at=None):
     at=at or iso_now()
+    from zoneinfo import ZoneInfo
+    moment=datetime.fromisoformat(at.replace('Z','+00:00'))
+    if not moment.tzinfo:moment=moment.replace(tzinfo=timezone.utc)
+    day=moment.astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat()
+    mark=trade.get('_daily_pnl')
+    if not mark or mark['day']!=day:
+        previous=trade.get('net_pnl',0.0)
+        created=datetime.fromisoformat(trade['created_at'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat()
+        updated=trade.get('updated_at',trade['created_at'])
+        updated_day=datetime.fromisoformat(updated.replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat()
+        trade['_daily_pnl']={'day':day,'baseline':0.0 if created==day else previous,
+                             'complete':created==day or updated_day<day}
     for leg in trade['legs']:
         direction=1 if leg['side']=='BUY' else -1
         leg['quantity']=leg['lots']*leg['lot_size']
@@ -144,9 +254,22 @@ def recalculate(trade,at=None):
     return trade
 
 def store_trade(db,trade):
-    row=db.get(Trade,trade['id'])
-    if row:row.data=copy.deepcopy(trade);row.status=trade['status']
-    else:db.add(Trade(id=trade['id'],broker=trade['broker'],status=trade['status'],data=copy.deepcopy(trade)))
+    values={'id':trade['id'],'broker':trade['broker'],'status':trade['status'],'data':copy.deepcopy(trade)}
+    dialect=db.get_bind().dialect.name
+    if dialect=='postgresql':
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    statement=insert(Trade).values(**values)
+    db.execute(statement.on_conflict_do_update(index_elements=['id'],set_={k:v for k,v in values.items() if k!='id'}))
+    # Existing ORM identities must agree with the Core upsert in this session.
+    row=db.identity_map.get((Trade,(trade['id'],),None))
+    if row:
+        from sqlalchemy.orm.attributes import set_committed_value
+        set_committed_value(row,'data',copy.deepcopy(trade));set_committed_value(row,'status',trade['status'])
+    state=_cache(db)
+    with _cache_lock:
+        if state['trades'] is not None:state['trades'][trade['id']]=copy.deepcopy(trade)
 
 def public_trade(trade,settings=None):
     result=copy.deepcopy(trade)
@@ -160,6 +283,7 @@ def public_trade(trade,settings=None):
     return result
 
 def snapshot(db,trade,kind='snapshot',force=False):
+    if get_settings(db)['logging_mode']=='summary':return None
     now=iso_now()
     quote_ids=[l.get('quote_event_id') for l in trade['legs']]
     carry=quote_ids==trade.get('_snapshot_quote_ids')
@@ -171,6 +295,11 @@ def snapshot(db,trade,kind='snapshot',force=False):
 def archive_close(db,trade):
     if trade.get('export_queued') or trade['status']!='closed':return
     db.flush()
+    if get_settings(db)['logging_mode']=='summary':
+        from .reporting import enqueue_export
+        enqueue_export(db,{**public_trade(trade),'report_detail':'summary'},[],[],[])
+        trade['export_queued']=True
+        return
     events=[{'id':e.id,'kind':e.kind,'timestamp':e.timestamp,**e.data} for e in db.scalars(select(Event).where(Event.trade_id==trade['id']).order_by(Event.id))]
     timeline=[{'id':s.id,**s.data} for s in db.scalars(select(Timeline).where(Timeline.trade_id==trade['id']).order_by(Timeline.id))]
     instrument_ids={l['instrument_id'] for l in trade['legs']}
@@ -259,7 +388,7 @@ def close_leg(db,trade,leg,lots,settings,manual=None,kind='exit',quote_override=
     leg['open_lots']-=lots;leg['current_price']=price;leg['charges']+=charges(price,quantity,settings);leg['slippage_cost']+=slip*quantity
     leg['quote_at']=quote.get('received_at');leg['quote_source']=quote.get('broker',quote.get('source',trade['broker']))
     if not leg['open_lots']:leg['status']='closed';leg['exit_at']=at
-    event(db,trade,kind,{'leg_id':leg['id'],'lots':lots,'price':price,'fill_source':leg['quote_source'],'quote_event_id':quote.get('event_id'),'processed_at':iso_now(),'accounting_method':'weighted_average'},at)
+    event(db,trade,kind,{'leg_id':leg['id'],'lots':lots,'price':price,'fill_source':leg['quote_source'],'quote_event_id':quote.get('event_id'),'trigger_quote':copy.deepcopy(quote),'processed_at':iso_now(),'accounting_method':'weighted_average'},at)
 
 def apply_action(db,trade_id,payload):
     payload=payload if isinstance(payload,dict) else payload.model_dump()
@@ -328,20 +457,41 @@ def record_quote(db,quote,process=True):
     contract=catalog.find(quote['instrument_id']) if catalog else None
     if contract:
         for key in ('underlying','exchange','segment','symbol','expiry','strike','option_type'):quote.setdefault(key,contract.get(key))
-    entry=QuoteEvent(broker=quote['broker'],instrument_id=quote['instrument_id'],received_at=quote['received_at'],data=quote)
+    settings=get_settings(db);compact=settings['logging_mode']=='summary'
+    interested=not compact or any(_trade_uses_quote(trade,quote,settings) for trade in trade_records(db))
+    if not interested:
+        cache_quote(db,quote,persist=False)
+        return None
+    # Compact receipts are removed after success; a counter prevents SQLite
+    # from reusing deleted row IDs and accidentally skipping a later mark.
+    counter=db.get(QuoteReceiptCounter,1)
+    if counter is None:
+        db.add(QuoteReceiptCounter(id=1,value=db.scalar(select(func.max(QuoteEvent.id))) or 0));db.flush()
+    next_id=db.execute(update(QuoteReceiptCounter).where(QuoteReceiptCounter.id==1)
+                       .values(value=QuoteReceiptCounter.value+1).returning(QuoteReceiptCounter.value)).scalar_one()
+    entry=QuoteEvent(id=next_id,broker=quote['broker'],instrument_id=quote['instrument_id'],received_at=quote['received_at'],data=quote)
     db.add(entry);db.flush()
     db.add(PendingQuote(quote_id=entry.id));db.flush()
+    if compact:db.add(CompactQuoteReceipt(quote_id=entry.id))
+    cache_quote(db,{**quote,'event_id':entry.id},persist=True)
     if process:revalue_quote(db,entry)
     return entry.id
 
+def _trade_uses_quote(trade,quote,settings):
+    if trade['status'] not in ('open','pending') or bool(trade.get('demo'))!=bool(quote['demo']):return False
+    source=settings['preferred_feed'];source=trade['broker'] if source=='broker' else source
+    return source==quote['broker'] and any(leg['status'] in ('open','pending') and
+        (leg['instrument_id']==quote['instrument_id'] or contract_identity(leg)==contract_identity(quote))
+        for leg in trade['legs'])
+
+
 def revalue_quote(db,entry):
+    if entry is None:return None
     quote={**entry.data,'event_id':entry.id}
     settings=get_settings(db)
-    for row in list(db.scalars(select(Trade).where(Trade.status.in_(['open','pending'])))):
-        trade=copy.deepcopy(row.data)
-        if bool(trade.get('demo'))!=bool(quote['demo']):continue
-        source=settings['preferred_feed'];source=trade['broker'] if source=='broker' else source
-        if source!=quote['broker']:continue
+    failed=False
+    for trade in trade_records(db):
+        if not _trade_uses_quote(trade,quote,settings):continue
         if trade.get('_last_quote_event_id',0)>=entry.id:continue
         changed=False
         try:
@@ -363,18 +513,26 @@ def revalue_quote(db,entry):
                         stop=leg.get('stop_loss');target=leg.get('target');p=quote['ltp'];buy=leg['side']=='BUY'
                         stop_hit=stop is not None and (p<=stop if buy else p>=stop)
                         target_hit=target is not None and (p>=target if buy else p<=target)
-                        if stop_hit or target_hit:close_leg(db,trade,leg,leg['open_lots'],settings,kind='stop_loss' if stop_hit else 'target',quote_override=quote)
+                        if stop_hit or target_hit:
+                            # Observe the incoming mark before the simulated
+                            # close applies bid/ask, slippage and exit charges.
+                            recalculate(trade,quote['received_at'])
+                            close_leg(db,trade,leg,leg['open_lots'],settings,kind='stop_loss' if stop_hit else 'target',quote_override=quote)
                 if changed:
                     recalculate(trade,quote['received_at']);trade['_last_quote_event_id']=entry.id;trade.pop('valuation_error',None)
                     if settings['logging_mode']=='every_update':snapshot(db,trade,'market_update')
                     if trade['status']=='closed':snapshot(db,trade,'closed');store_trade(db,trade);archive_close(db,trade)
                     store_trade(db,trade)
         except Exception as error:
-            log.exception('Valuation failed for trade %s at received event %s; raw receipt retained',row.id,entry.id)
-            retained=copy.deepcopy(row.data);retained['valuation_error']=f'{type(error).__name__}: price event {entry.id} retained; review trade journal'
-            row.data=retained
+            failed=True
+            log.exception('Valuation failed for trade %s at received event %s; raw receipt retained',trade['id'],entry.id)
+            retained=copy.deepcopy(db.get(Trade,trade['id']).data);retained['valuation_error']=f'{type(error).__name__}: price event {entry.id} retained; review trade journal'
+            store_trade(db,retained)
             event(db,retained,'valuation_error',{'quote_event_id':entry.id,'error_type':type(error).__name__})
     db.execute(delete(PendingQuote).where(PendingQuote.quote_id==entry.id))
+    compact_receipt=db.get(CompactQuoteReceipt,entry.id)
+    if compact_receipt and not failed:
+        db.delete(compact_receipt);db.delete(entry)
     return entry.id
 
 def recover_pending_quotes(db,limit=100):
@@ -383,41 +541,78 @@ def recover_pending_quotes(db,limit=100):
     return len(receipts)
 
 def take_snapshots(db):
+    if get_settings(db)['logging_mode']=='summary':return
     for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
         trade=copy.deepcopy(row.data);snapshot(db,trade,'one_second');store_trade(db,trade)
 
 def list_trades(db,demo=None):
     settings=get_settings(db)
     demo=settings['demo_mode'] if demo is None else demo
-    return [public_trade(t.data,settings) for t in db.scalars(select(Trade)).all() if bool(t.data.get('demo'))==bool(demo)][::-1]
+    return [public_trade(t,settings) for t in trade_records(db) if bool(t.get('demo'))==bool(demo)][::-1]
+
+def _dashboard_quotes(db,settings):
+    state=_cache(db)
+    if not state['quotes_loaded']:
+        # SQL selects latest IDs on the server; historical quote JSON never
+        # crosses the network merely to find the current market watch.
+        for row in db.scalars(select(LatestQuote).order_by(LatestQuote.received_at.desc()).limit(30)):
+            cache_quote(db,row.data,persist=False)
+        if not state['quotes']:
+            newest=select(func.max(QuoteEvent.id).label('id')).group_by(QuoteEvent.broker,QuoteEvent.instrument_id).order_by(func.max(QuoteEvent.id).desc()).limit(30).subquery()
+            for row in db.scalars(select(QuoteEvent).join(newest,QuoteEvent.id==newest.c.id)):
+                cache_quote(db,{**row.data,'event_id':row.id},persist=False)
+        state['quotes_loaded']=True
+    with _cache_lock:values=list(state['quotes'].values())
+    values=sorted((q for q in values if bool(q.get('demo'))==bool(settings['demo_mode'])),key=lambda q:q.get('received_at',''),reverse=True)[:30]
+    quotes=[]
+    for value in values:
+        age=age_seconds(value.get('received_at'))
+        quotes.append({**copy.deepcopy(value),'feed_age':round(age,3) if age is not None else None,
+                       'stale':age is None or age>settings['stale_after_seconds']})
+    return quotes
+
 
 def dashboard(db,statuses=None):
     settings=get_settings(db);trades=list_trades(db);open_trades=[t for t in trades if t['status'] in ('open','pending')]
     local_now=datetime.now(timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo('Asia/Kolkata'))
     midnight=local_now.replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc).isoformat(timespec='microseconds')
-    today_pnl=0.0;daily_complete=True
+    today_pnl=0.0;daily_complete=True;state=_cache(db)
     for trade in trades:
         if trade.get('closed_at') and trade['closed_at']<midnight:continue
         if trade['created_at']>=midnight:baseline=0.0
         else:
-            prior=db.scalars(select(Timeline).where(Timeline.trade_id==trade['id'],Timeline.timestamp<midnight).order_by(Timeline.timestamp.desc()).limit(1)).first()
-            if prior:baseline=prior.data['net_pnl']
+            mark=trade.get('_daily_pnl',{})
+            if settings['logging_mode']=='summary' and mark.get('day')==local_now.date().isoformat() and mark.get('complete'):
+                baseline=mark['baseline']
             else:
-                # Older imported histories without a day-open mark are incomplete.
-                baseline=0.0;daily_complete=False
+                cache_key=(trade['id'],midnight)
+                if cache_key not in state['baselines']:
+                    prior=db.scalars(select(Timeline).where(Timeline.trade_id==trade['id'],Timeline.timestamp<midnight).order_by(Timeline.timestamp.desc()).limit(1)).first()
+                    state['baselines'][cache_key]=prior.data['net_pnl'] if prior else None
+                prior_value=state['baselines'][cache_key]
+                baseline=prior_value if prior_value is not None else 0.0
+                if prior_value is None:daily_complete=False
         today_pnl+=trade['net_pnl']-baseline
     summary={'net_pnl':round(sum(t['net_pnl'] for t in trades),2),'total_pnl':round(sum(t['net_pnl'] for t in trades),2),'realized_pnl':round(sum(t['realized_pnl'] for t in trades),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in trades),2),'today_pnl':round(today_pnl,2),'today_pnl_complete':daily_complete,'charges':round(sum(t['charges'] for t in trades),2),'active_trades':len(open_trades),'active_positions':sum(sum(l['open_lots']>0 for l in t['legs']) for t in trades),'margin_estimate':round(sum(t.get('margin_estimate',0) for t in open_trades),2),'paper_capital':settings['paper_capital'],'available_paper_capital':settings['paper_capital']-sum(t.get('margin_estimate',0) for t in open_trades)}
     brokers=[]
     for broker,name in BROKERS.items():
         items=[t for t in trades if t['broker']==broker];status=(statuses or {}).get(broker,{})
         brokers.append({'id':broker,'name':name,'net_pnl':round(sum(t['net_pnl'] for t in items),2),'realized_pnl':round(sum(t['realized_pnl'] for t in items),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in items),2),'active_trades':sum(t['status']=='open' for t in items),'margin_estimate':round(sum(t.get('margin_estimate',0) for t in items if t['status']=='open'),2),'available_broker_margin':None,'status':'demo' if settings['demo_mode'] else status.get('status','disconnected'),'feed':status,'demo':settings['demo_mode']})
-    # Retain one most recent quote per instrument/source for the dashboard only.
-    rows=db.scalars(select(QuoteEvent).order_by(QuoteEvent.id.desc()).limit(10000)).all();seen=set();quotes=[]
-    for q in rows:
-        k=(q.broker,q.instrument_id)
-        if k in seen or bool(q.data.get('demo'))!=settings['demo_mode']:continue
-        seen.add(k);age=age_seconds(q.received_at);quotes.append({**q.data,'event_id':q.id,'feed_age':round(age,3) if age is not None else None,'stale':age is None or age>settings['stale_after_seconds']})
-        if len(quotes)>=1000:break
+    quotes=_dashboard_quotes(db,settings)
+    if settings['logging_mode']=='summary':
+        # A small live chart lives in memory only. Recorded trade extrema and
+        # final results survive restarts; each second of chart data does not.
+        portfolio=state['portfolio']
+        if not portfolio or portfolio[-1].get('demo')!=settings['demo_mode']:
+            portfolio.clear()
+        if not portfolio or portfolio[-1]['net_pnl']!=summary['net_pnl']:
+            portfolio.append({'timestamp':iso_now(),'net_pnl':summary['net_pnl'],'demo':settings['demo_mode']})
+            del portfolio[:-250]
+        return {'summary':summary,'brokers':brokers,'trades':trades,'quotes':quotes,'timeline':[],
+                'portfolio_timeline':copy.deepcopy(portfolio),'portfolio_timeline_complete':False,
+                'chart_notice':'Live session chart; Excel retains trade summaries and observed extrema.',
+                'feed_status':statuses or {},'mode':'PAPER','demo':settings['demo_mode'],
+                'recording_mode':'summary','server_time':iso_now()}
     trade_ids=[t['id'] for t in trades]
     history=db.scalars(select(Timeline).where(Timeline.trade_id.in_(trade_ids)).order_by(Timeline.timestamp.desc(),Timeline.id.desc()).limit(250)).all() if trade_ids else []
     points=[{'timestamp':p.timestamp,'trade_id':p.trade_id,**p.data} for p in reversed(history)]

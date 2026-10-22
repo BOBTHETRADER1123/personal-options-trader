@@ -35,6 +35,7 @@ def factory(tmp_path):
 @pytest.fixture
 def payload():
     return {
+        "format": "detailed",  # Explicit legacy reports remain readable.
         "trade": {
             "id": "trade_001", "strategy_id": "strategy_001", "name": "Bull Call Spread", "broker": "Dhan",
             "underlying": "NIFTY", "status": "closed", "created_at": "2026-10-22T03:45:00+00:00",
@@ -54,7 +55,7 @@ def payload():
 
 
 def enqueue(db, payload):
-    job = enqueue_export(db, payload["trade"], payload["events"], payload["timeline"], payload["quotes"])
+    job = enqueue_export(db, payload["trade"], payload["events"], payload["timeline"], payload["quotes"], report_format=payload.get("format", "summary"))
     db.commit()
     return job
 

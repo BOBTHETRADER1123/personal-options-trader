@@ -49,7 +49,7 @@ class SettingsInput(StrictModel):
     charges_percent: float | None = Field(default=None,ge=0,le=10)
     slippage_bps: float | None = Field(default=None,ge=0,le=10000)
     fill_basis: Literal['ltp','bid_ask'] | None = None
-    logging_mode: Literal['every_update','one_second'] | None = None
+    logging_mode: Literal['summary','every_update','one_second'] | None = None
     preferred_feed: Literal['broker','dhan','kotak','fivepaisa'] | None = None
     stale_after_seconds: int | None = Field(default=None,ge=2,le=3600)
     demo_mode: bool | None = None

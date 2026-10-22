@@ -51,7 +51,9 @@ def verify_file(path: Path, checksum: str, expected_size: int) -> None:
     with path.open("rb") as source:
         book = load_workbook(source, read_only=True, keep_links=False)
         try:
-            if not REQUIRED_SHEETS.issubset(book.sheetnames):
+            summary = dict(book["Trade Summary"].iter_rows(max_col=2, values_only=True)) if "Trade Summary" in book.sheetnames else {}
+            required = {"Trade Summary", "Strategy Legs"} if summary.get("Report format") == "summary-v1" else REQUIRED_SHEETS
+            if not required.issubset(book.sheetnames) or not summary.get("Trade ID"):
                 raise ValueError("Local Excel workbook is missing required sheets")
             for sheet in book:
                 for _ in sheet.iter_rows(values_only=True):

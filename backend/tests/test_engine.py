@@ -24,7 +24,9 @@ def db(tmp_path):
     Base.metadata.create_all(sql)
     catalog=ContractCatalog(tmp_path/'absent.json');engine.set_catalog(catalog)
     with sessionmaker(sql,expire_on_commit=False)() as session:
-        engine.update_settings(session,{'brokerage_per_order':0,'charges_percent':0,'slippage_bps':0,'fill_basis':'ltp','demo_mode':True})
+        # Legacy detailed mode remains explicit so its audit/replay contract is
+        # tested independently of the new default compact recording policy.
+        engine.update_settings(session,{'brokerage_per_order':0,'charges_percent':0,'slippage_bps':0,'fill_basis':'ltp','demo_mode':True,'logging_mode':'every_update'})
         session.commit();yield session
     sql.dispose()
 
@@ -96,7 +98,8 @@ def test_close_enqueues_workbook_in_same_transaction(db):
     assert closed['status']=='closed';assert closed['net_pnl']==2500
     job=db.scalar(select(ExportJob).where(ExportJob.trade_id==trade['id']))
     assert job and job.status=='pending'
-    assert len(job.payload['events'])>=2 and job.payload['timeline'] and job.payload['quotes']
+    assert job.payload['format']=='summary' and job.payload['trade']['net_pnl']==2500
+    assert not any(key in job.payload for key in ('events','timeline','quotes'))
     assert db.get(Trade,trade['id']).data['export_queued']
 
 def test_excursions_keep_observed_times_and_giveback(db):
@@ -399,3 +402,124 @@ def test_verified_database_backup_restore(db,tmp_path):
     assert restored['pre_restore_backup']
     db.expire_all();assert db.get(Trade,trade['id']) is not None
     with pytest.raises(FileExistsError):backup(backup_file,db.bind)
+
+
+def test_compact_policy_updates_legacy_default_without_deleting_records(db):
+    from app.models import Setting
+    enter(db)
+    historical=db.scalar(select(func.count()).select_from(QuoteEvent))
+    row=db.get(Setting,'app');row.value={'logging_mode':'every_update','demo_mode':True}
+    db.commit();engine.clear_cache(db)
+    assert engine.get_settings(db)['logging_mode']=='summary'
+    assert db.scalar(select(func.count()).select_from(QuoteEvent))==historical
+
+
+def test_compact_marks_keep_extrema_times_without_tick_history(db):
+    from app.models import LatestQuote,CompactQuoteReceipt
+    engine.update_settings(db,{'logging_mode':'summary'})
+    trade=enter(db,lots=1)['trades'][0]
+    low=iso_now();quote(db,price=80,received_at=low);db.commit()
+    high=iso_now();quote(db,price=140,received_at=high);db.commit()
+    quote(db,price=128);db.commit()
+    for _ in range(3):engine.take_snapshots(db)
+    result=action(db,trade,'exit_strategy')['trade']
+    assert result['mfe']==2000 and result['mfe_at']==high
+    assert result['mae']==-1000 and result['mae_at']==low
+    assert result['net_pnl']==1400
+    assert db.scalar(select(func.count()).select_from(Timeline))==0
+    assert db.scalar(select(func.count()).select_from(QuoteEvent))==0
+    assert db.scalar(select(func.count()).select_from(PendingQuote))==0
+    assert db.scalar(select(func.count()).select_from(CompactQuoteReceipt))==0
+    assert db.scalar(select(func.count()).select_from(LatestQuote))==1
+    job=db.scalar(select(ExportJob).where(ExportJob.trade_id==trade['id']))
+    assert job.payload['trade']['mfe']==2000 and set(job.payload)=={'format','trade'}
+
+
+def test_compact_receipt_replay_and_current_mark_survive_restart(db):
+    from app.models import LatestQuote
+    engine.update_settings(db,{'logging_mode':'summary'})
+    trade=enter(db,lots=1,order_type='LIMIT',price=90)['trades'][0];c=contract()
+    at=iso_now()
+    first=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':80,'received_at':at,'demo':True},process=False)
+    second=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':100,'received_at':iso_now(),'demo':True},process=False)
+    db.commit();db.expire_all();engine.clear_cache(db)
+    assert engine.recover_pending_quotes(db)==2
+    db.commit();engine.clear_cache(db)
+    result=db.get(Trade,trade['id']).data
+    assert result['legs'][0]['entry_price']==80 and result['legs'][0]['entry_at']==at
+    assert result['legs'][0]['current_price']==100
+    assert db.get(QuoteEvent,first) is None and db.get(QuoteEvent,second) is None
+    latest=engine.latest_quote(db,c['id'],'dhan')
+    assert latest['ltp']==100 and latest['event_id']==second
+    third=quote(db,c,110);db.commit()
+    assert third>second>first
+    assert db.scalar(select(func.count()).select_from(LatestQuote))==1
+    assert db.get(Trade,trade['id']).data['legs'][0]['current_price']==110
+
+
+def test_compact_target_observes_mark_before_exit_costs(db):
+    engine.update_settings(db,{'logging_mode':'summary'})
+    trade=enter(db,lots=1)['trades'][0]
+    action(db,trade,'edit',leg_id=trade['legs'][0]['id'],target=130)
+    engine.update_settings(db,{'fill_basis':'bid_ask','brokerage_per_order':20})
+    at=iso_now();quote(db,price=140,bid=139,ask=141,received_at=at);db.commit()
+    result=db.get(Trade,trade['id']).data
+    assert result['status']=='closed' and result['net_pnl']==1930
+    assert result['mfe']==2000 and result['mfe_at']==at
+    recorded=db.scalar(select(Event).where(Event.trade_id==trade['id'],Event.kind=='target'))
+    assert recorded.data['trigger_quote']['ltp']==140
+    assert recorded.data['trigger_quote']['bid']==139
+
+
+def test_compact_repeated_dashboard_does_not_reread_history_or_ledger(db):
+    from sqlalchemy import event as sql_event
+    engine.update_settings(db,{'logging_mode':'summary'})
+    enter(db,lots=1);quote(db,price=120);db.commit()
+    engine.dashboard(db)
+    statements=[]
+    def seen(connection,cursor,statement,parameters,context,executemany):statements.append(statement)
+    sql_event.listen(db.bind,'before_cursor_execute',seen)
+    try:
+        for _ in range(5):
+            data=engine.dashboard(db)
+            assert data['summary']['net_pnl']==1000
+        assert statements==[]
+    finally:sql_event.remove(db.bind,'before_cursor_execute',seen)
+
+
+def test_compact_failed_valuation_retains_raw_receipt(db,monkeypatch):
+    engine.update_settings(db,{'logging_mode':'summary'})
+    trade=enter(db,lots=1)['trades'][0]
+    def unavailable(*args,**kwargs):raise RuntimeError('test valuation failure')
+    monkeypatch.setattr(engine,'recalculate',unavailable)
+    receipt=quote(db,price=120);db.commit()
+    assert db.get(QuoteEvent,receipt).data['ltp']==120
+    assert db.get(Trade,trade['id']).data['valuation_error']
+
+
+def test_compact_quote_rollback_restores_cache_to_committed_values(db):
+    engine.update_settings(db,{'logging_mode':'summary'})
+    trade=enter(db,lots=1)['trades'][0]
+    quote(db,price=110);db.commit()
+    quote(db,price=80);db.rollback()
+    assert engine.dashboard(db)['summary']['net_pnl']==500
+    assert engine.latest_quote(db,contract()['id'],'dhan')['ltp']==110
+    result=db.get(Trade,trade['id']).data
+    assert result['mfe']==500 and result['mae']==0
+
+
+def test_compact_day_rollover_uses_last_observed_mark_without_timelines(db):
+    from zoneinfo import ZoneInfo
+    engine.update_settings(db,{'logging_mode':'summary'})
+    trade=enter(db,lots=1)['trades'][0]
+    midnight=datetime.now(ZoneInfo('Asia/Kolkata')).replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc)
+    previous=(midnight-timedelta(seconds=1)).isoformat(timespec='microseconds')
+    yesterday=(midnight-timedelta(days=1)).astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat()
+    row=db.get(Trade,trade['id']);value=copy.deepcopy(row.data)
+    value.update({'created_at':previous,'updated_at':previous,'net_pnl':500,
+                  '_daily_pnl':{'day':yesterday,'baseline':0,'complete':True}})
+    value['legs'][0]['current_price']=110;row.data=value;db.commit()
+    quote(db,price=120);db.commit()
+    data=engine.dashboard(db)
+    assert data['summary']['today_pnl']==500 and data['summary']['today_pnl_complete']
+    assert db.scalar(select(func.count()).select_from(Timeline))==0

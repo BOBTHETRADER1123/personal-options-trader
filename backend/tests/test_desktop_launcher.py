@@ -29,6 +29,82 @@ def project(tmp_path):
     return root
 
 
+def test_private_config_update_recovers_from_a_temporary_replace_lock(project, monkeypatch):
+    import dotenv.main
+    config = project / 'companion' / '.env'
+    config.write_text('POLL_SECONDS=10\nCUSTOM_SETTING=preserved\n', encoding='utf-8')
+    before = config.read_bytes()
+    original = dotenv.main.os.replace
+    calls, delays = [], []
+
+    def briefly_locked(source, destination):
+        if Path(destination) != config:
+            return original(source, destination)
+        calls.append(1)
+        assert config.read_bytes() == before
+        if len(calls) < 3:
+            raise PermissionError('Synthetic temporary file lock')
+        return original(source, destination)
+
+    monkeypatch.setattr(dotenv.main.os, 'replace', briefly_locked)
+    monkeypatch.setattr(launcher.time, 'sleep', delays.append)
+    launcher.put_env(config, 'POLL_SECONDS', '27')
+    assert launcher.env_values(config) == {'POLL_SECONDS': '27', 'CUSTOM_SETTING': 'preserved'}
+    assert len(calls) == 3
+    assert delays == [.1, .2]
+    assert not list(config.parent.glob('.tmp_*'))
+
+
+def test_persistent_replace_permission_error_is_bounded_and_keeps_config(project, monkeypatch):
+    import dotenv.main
+    config = project / 'companion' / '.env'
+    config.write_text('POLL_SECONDS=10\nCUSTOM_SETTING=preserved\n', encoding='utf-8')
+    before = config.read_bytes()
+    failure = PermissionError('Synthetic persistent file lock')
+    calls, delays = [], []
+    original = dotenv.main.os.replace
+
+    def locked(source, destination):
+        if Path(destination) != config:
+            return original(source, destination)
+        calls.append(1)
+        raise failure
+
+    monkeypatch.setattr(dotenv.main.os, 'replace', locked)
+    monkeypatch.setattr(launcher.time, 'sleep', delays.append)
+    with pytest.raises(PermissionError) as caught:
+        launcher.put_env(config, 'POLL_SECONDS', '27')
+    assert caught.value is failure
+    assert config.read_bytes() == before
+    assert len(calls) == 5
+    assert delays == [.1, .2, .4, .8]
+    assert not list(config.parent.glob('.tmp_*'))
+
+
+def test_other_config_write_errors_are_not_retried(project, monkeypatch):
+    import dotenv.main
+    config = project / 'companion' / '.env'
+    config.write_text('CUSTOM_SETTING=preserved\n', encoding='utf-8')
+    before = config.read_bytes()
+    failure = OSError('Synthetic non-permission I/O failure')
+    calls = []
+    original = dotenv.main.os.replace
+
+    def failed(source, destination):
+        if Path(destination) != config:
+            return original(source, destination)
+        calls.append(1)
+        raise failure
+
+    monkeypatch.setattr(dotenv.main.os, 'replace', failed)
+    monkeypatch.setattr(launcher.time, 'sleep', lambda _: pytest.fail('Only permission errors may be retried'))
+    with pytest.raises(OSError) as caught:
+        launcher.put_env(config, 'POLL_SECONDS', '27')
+    assert caught.value is failure and len(calls) == 1
+    assert config.read_bytes() == before
+    assert not list(config.parent.glob('.tmp_*'))
+
+
 def test_initial_pairing_keeps_raw_token_only_in_companion(project, tmp_path):
     destination = tmp_path / 'chosen-reports'
     assert launcher.prepare_config(project, destination) == destination.resolve()

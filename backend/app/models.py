@@ -59,6 +59,25 @@ class PendingQuote(Base):
     quote_id: Mapped[int] = mapped_column(Integer,primary_key=True)
     created_at: Mapped[str] = mapped_column(String(50),default=iso_now)
 
+class LatestQuote(Base):
+    """One durable current mark per broker contract, rather than tick history."""
+    __tablename__ = 'latest_quotes'
+    broker: Mapped[str] = mapped_column(String(30), primary_key=True)
+    instrument_id: Mapped[str] = mapped_column(String(150), primary_key=True)
+    received_at: Mapped[str] = mapped_column(String(50), index=True)
+    data: Mapped[dict] = mapped_column(JSON)
+
+class QuoteReceiptCounter(Base):
+    """Receipt IDs must never repeat after compact receipts are discarded."""
+    __tablename__ = 'quote_receipt_counter'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    value: Mapped[int] = mapped_column(Integer)
+
+class CompactQuoteReceipt(Base):
+    """Only new compact receipts may be discarded; legacy journals stay intact."""
+    __tablename__ = 'compact_quote_receipts'
+    quote_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
 class ActionRecord(Base):
     __tablename__ = 'actions'
     key: Mapped[str] = mapped_column(String(150), primary_key=True)

@@ -26,13 +26,14 @@ from openpyxl.chart import LineChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sqlalchemy import JSON, Boolean, Integer, LargeBinary, String, Text, func, or_, select, update
-from sqlalchemy.orm import Mapped, Session, mapped_column
+from sqlalchemy.orm import Mapped, Session, mapped_column, defer
 
 from .database import Base, SessionLocal
 
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 REQUIRED_SHEETS = {"Trade Summary", "P&L Timeline", "Trade Events", "Strategy Legs", "Market Updates"}
+SUMMARY_SHEETS = {"Trade Summary", "Strategy Legs"}
 MAX_EXCEL_ROWS = 1_048_576
 _delete_enabled: Callable[[Session], bool] = lambda db: False
 _delete_handler: Callable[[Session, str], dict[str, int]] | None = None
@@ -91,8 +92,8 @@ class ExportJob(Base):
     filename: Mapped[str] = mapped_column(String(255))
     relative_path: Mapped[str] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
-    payload: Mapped[dict] = mapped_column(JSON)
-    file_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, deferred=True)
+    file_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
     checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
     size: Mapped[int] = mapped_column(Integer, default=0)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -138,6 +139,7 @@ def enqueue_export(
     events: list[dict[str, Any]],
     timeline: list[dict[str, Any]],
     quotes: list[dict[str, Any]],
+    report_format: str = "summary",
 ) -> ExportJob:
     if str(trade.get("status", "")).lower() not in {"closed", "cancelled"}:
         raise ValueError("Only completed trades can be archived")
@@ -155,7 +157,8 @@ def enqueue_export(
         filename=filename,
         relative_path=f"{safe_name(broker)}/{closed:%Y/%m}/Trade_{safe_name(trade_id)}/{filename}",
         status="pending",
-        payload={"trade": trade, "events": events, "timeline": timeline, "quotes": quotes},
+        payload=({"format": "summary", "trade": trade} if report_format == "summary" else
+                 {"format": "detailed", "trade": trade, "events": events, "timeline": timeline, "quotes": quotes}),
         created_at=now_iso(),
         updated_at=now_iso(),
     )
@@ -164,7 +167,7 @@ def enqueue_export(
     return job
 
 
-def public_job(job: ExportJob) -> dict[str, Any]:
+def public_job(job: ExportJob, demo: bool | None = None) -> dict[str, Any]:
     result = {
         key: getattr(job, key)
         for key in (
@@ -173,8 +176,15 @@ def public_job(job: ExportJob) -> dict[str, Any]:
             "verification_status", "deletion_status", "deleted_at", "deleted_counts",
         )
     }
-    result["demo"] = bool(job.payload.get("trade", {}).get("demo"))
+    # Listing a report must never download its complete JSON history or XLSX.
+    result["demo"] = bool(demo if demo is not None else job.__dict__.get("payload", {}).get("trade", {}).get("demo"))
     return result
+
+
+def job_metadata(db: Session, statement=None) -> list[dict[str, Any]]:
+    query = statement if statement is not None else select(ExportJob).order_by(ExportJob.created_at.desc()).limit(200)
+    query = query.add_columns(ExportJob.payload["trade"]["demo"].as_boolean())
+    return [public_job(job, demo) for job, demo in db.execute(query)]
 
 
 def _flatten(record: dict[str, Any]) -> dict[str, Any]:
@@ -229,7 +239,68 @@ def _style_table(ws) -> None:
                 cell.number_format = '#,##0.00;[Red](#,##0.00);0.00'
 
 
+def build_summary_workbook(payload: dict[str, Any]) -> bytes:
+    """A completed-trade record, without individual quotes or timeline rows."""
+    trade = payload["trade"]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Trade Summary"
+    ws.append(["PERSONAL OPTIONS TRADER", "COMPACT PAPER TRADE REPORT"])
+    profit = max(0, float(trade.get("mfe") or 0))
+    loss = max(0, -float(trade.get("mae") or 0))
+    rows = [
+        ("Report format", "summary-v1"),
+        ("Trade ID", trade.get("id")), ("Strategy name", trade.get("name")),
+        ("Broker", trade.get("broker")), ("Underlying", trade.get("underlying")),
+        ("Status", trade.get("status")),
+        ("Mode", "PAPER — simulated orders and fills"),
+        ("Quote and contract origin", "SYNTHETIC SAMPLE" if trade.get("demo") else "Received broker market data"),
+        ("Entry time (IST)", local_excel_time(trade.get("created_at"))),
+        ("Closing time (IST)", local_excel_time(trade.get("closed_at"))),
+        ("Gross closing P&L (INR)", trade.get("gross_pnl")),
+        ("Estimated brokerage and charges (INR)", trade.get("charges")),
+        ("Net closing P&L (INR)", trade.get("net_pnl")),
+        ("Maximum profit reached (INR)", profit),
+        ("Maximum profit time (IST)", local_excel_time(trade.get("mfe_at")) if profit else None),
+        ("Maximum loss reached (INR)", loss),
+        ("Maximum loss time (IST)", local_excel_time(trade.get("mae_at")) if loss else None),
+        ("Highest observed net P&L / MFE (INR)", trade.get("mfe")),
+        ("MFE time (IST)", local_excel_time(trade.get("mfe_at"))),
+        ("Lowest observed net P&L / MAE (INR)", trade.get("mae")),
+        ("MAE time (IST)", local_excel_time(trade.get("mae_at"))),
+        ("Observation basis", "Net paper P&L after estimated charges, at received quotes and recorded trade actions. No prices between updates are inferred."),
+        ("Time zone", "Asia/Kolkata (IST, UTC+05:30)"),
+    ]
+    for label, value in rows:
+        ws.append([label, safe_cell(value)])
+    _style_table(ws)
+    ws.column_dimensions["A"].width = 46
+    ws.column_dimensions["B"].width = 82
+    ws.auto_filter.ref = None
+    for row in ws:
+        row[1].alignment = Alignment(vertical="top", wrap_text=True)
+    ws.row_dimensions[23].height = 44
+    _table(wb, "Strategy Legs", [
+        ("symbol", "Trading symbol"), ("expiry", "Expiry"), ("strike", "Strike"),
+        ("option_type", "CE / PE"), ("side", "Buy / sell"), ("lots", "Entry lots"),
+        ("lot_size", "Contract lot size"), ("price_multiplier", "Monetary price multiplier"),
+        ("entry_price", "Average entry price"), ("exit_price", "Average exit price"),
+        ("entry_at", "Entry time (IST)"), ("exit_at", "Exit time (IST)"),
+    ], trade.get("legs", []))
+    stream = io.BytesIO()
+    wb.save(stream)
+    value = stream.getvalue()
+    verify_workbook(value)
+    return value
+
+
 def build_workbook(payload: dict[str, Any]) -> bytes:
+    if payload.get("format") != "detailed":
+        return build_summary_workbook(payload)
+    return build_detailed_workbook(payload)
+
+
+def build_detailed_workbook(payload: dict[str, Any]) -> bytes:
     trade = payload["trade"]
     wb = Workbook()
     ws = wb.active
@@ -384,7 +455,9 @@ def verify_workbook(content: bytes) -> None:
     with io.BytesIO(content) as stream:
         wb = load_workbook(stream, read_only=True, data_only=False, keep_links=False)
         try:
-            if not REQUIRED_SHEETS.issubset(wb.sheetnames):
+            summary = dict(wb["Trade Summary"].iter_rows(max_col=2, values_only=True)) if "Trade Summary" in wb.sheetnames else {}
+            required = SUMMARY_SHEETS if summary.get("Report format") == "summary-v1" else REQUIRED_SHEETS
+            if not required.issubset(wb.sheetnames) or not summary.get("Trade ID"):
                 raise ValueError("Excel report is missing required sheets")
             for sheet in wb:
                 if not sheet.max_row:
@@ -483,7 +556,7 @@ async def reporting_loop(stop_event: asyncio.Event | None = None) -> None:
         except Exception:
             log.exception("Report worker iteration failed; durable jobs remain queued")
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=2)
+            await asyncio.wait_for(stop_event.wait(), timeout=15)
         except asyncio.TimeoutError:
             pass
 
@@ -511,17 +584,15 @@ def archive_after_verified_save(db: Session, job: ExportJob) -> None:
 
 def reconciliation(db: Session) -> dict[str, Any]:
     """Each call is a daily reconciliation view; no invented successful saves."""
-    jobs = db.scalars(select(ExportJob).order_by(ExportJob.created_at.desc())).all()
-    counts: dict[str, int] = {}
-    for job in jobs:
-        counts[job.status] = counts.get(job.status, 0) + 1
+    jobs = job_metadata(db)
+    counts = dict(db.execute(select(ExportJob.status, func.count()).group_by(ExportJob.status)).all())
     return {
         "date": datetime.now(IST).date().isoformat(),
-        "timezone": "Asia/Kolkata", "generated_at": now_iso(), "total": len(jobs), "counts": counts,
-        "pending": sum(job.status in {"pending", "generating", "ready", "claimed"} for job in jobs),
+        "timezone": "Asia/Kolkata", "generated_at": now_iso(), "total": sum(counts.values()), "counts": counts,
+        "pending": sum(counts.get(state, 0) for state in ("pending", "generating", "ready", "claimed")),
         "saved": counts.get("saved", 0), "failed": counts.get("failed", 0),
-        "mismatches": [public_job(job) for job in jobs if job.status == "saved" and job.verification_status != "verified"],
-        "jobs": [public_job(job) for job in jobs],
+        "mismatches": [job for job in jobs if job["status"] == "saved" and job["verification_status"] != "verified"],
+        "jobs": jobs, "recent_limit": 200,
     }
 
 

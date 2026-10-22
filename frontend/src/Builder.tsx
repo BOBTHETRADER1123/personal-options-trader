@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, Trash2, Plus, Minus, RotateCcw, ArrowRight, ArrowUpRight, Layers, Info, ShieldCheck } from 'lucide-react';
 import { brokers, money, num, uid } from './api';
 import { Badge, Help, LineChart, Panel, Pnl } from './components';
 import type { Row } from './components';
-type Leg={key:string;enabled:boolean;side:'BUY'|'SELL';expiry:string;strike:number;option_type:'CE'|'PE';lots:number;price:number;stop_loss?:number;target?:number};
+import type { ChainSelection } from './OptionChain';
+type Leg={key:string;enabled:boolean;side:'BUY'|'SELL';expiry:string;strike:number;option_type:'CE'|'PE';lots:number;price:number;instrument_id?:string;stop_loss?:number;target?:number};
 type Template={name:string;category:string;legs:[string,string,number][]};
 const templates:Template[]=[
  {name:'Long Call',category:'Bullish',legs:[['BUY','CE',0]]},{name:'Bull Call Spread',category:'Bullish',legs:[['BUY','CE',0],['SELL','CE',2]]},{name:'Bull Put Spread',category:'Bullish',legs:[['SELL','PE',0],['BUY','PE',-2]]},{name:'Short Put',category:'Bullish',legs:[['SELL','PE',0]]},
@@ -12,28 +13,35 @@ const templates:Template[]=[
  {name:'Long Straddle',category:'Volatility',legs:[['BUY','CE',0],['BUY','PE',0]]},{name:'Long Strangle',category:'Volatility',legs:[['BUY','CE',2],['BUY','PE',-2]]},{name:'Custom Strategy',category:'Custom',legs:[['BUY','CE',0]]}
 ];
 function smallPayoff(template:Template){const payoff=(x:number)=>template.legs.reduce((n,[s,t,k])=>n+(s==='BUY'?1:-1)*((t==='CE'?Math.max(x-k,0):Math.max(k-x,0))-(2-Math.abs(k)*.15)),0);const a=Array.from({length:15},(_,i)=>payoff(i-7)),lo=Math.min(...a),hi=Math.max(...a);return <svg viewBox="0 0 120 43" aria-hidden="true"><line x1="0" y1="25" x2="120" y2="25" stroke="#333e35" strokeDasharray="3 4"/><polyline points={a.map((y,i)=>`${i/14*120},${37-(y-lo)/(hi-lo||1)*32}`).join(' ')} stroke="#abd783" strokeWidth="2" fill="none"/></svg>;}
-export default function Builder({instruments,quotes,onReview,addingTo,onCancelAdd,preferredFeed='broker'}:{preferredFeed?:string;instruments:Row[];quotes:Row[];onReview:(payload:Row,analysis:Row)=>void;addingTo?:Row|null;onCancelAdd:()=>void}){
- const available=useMemo(()=>Array.from(new Set(instruments.map(i=>i.underlying))),[instruments]);
+export default function Builder({instruments,quotes,onReview,addingTo,onCancelAdd,preferredFeed='broker',staleAfterSeconds=10,initialSelection,onSelectionConsumed}:{preferredFeed?:string;staleAfterSeconds?:number;instruments:Row[];quotes:Row[];onReview:(payload:Row,analysis:Row)=>void;addingTo?:Row|null;onCancelAdd:()=>void;initialSelection?:ChainSelection|null;onSelectionConsumed?:()=>void}){
+ const [clock,setClock]=useState(Date.now());
+ useEffect(()=>{const timer=setInterval(()=>{if(document.visibilityState==='visible')setClock(Date.now());},1000);return()=>clearInterval(timer);},[]);
+ const [importedContracts,setImportedContracts]=useState<Row[]>([]),[importedQuotes,setImportedQuotes]=useState<Row[]>([]);
+ const imported=useRef<{nonce:string;underlying:string;expiry:string;pending:boolean}|null>(null),appliedSelection=useRef('');
+ const catalogInstruments=useMemo(()=>{const rows=new Map(instruments.map(i=>[`${i.broker}:${i.instrument_id||i.id}`,i]));for(const i of importedContracts){const key=`${i.broker}:${i.instrument_id||i.id}`;if(!rows.has(key))rows.set(key,i);}return [...rows.values()];},[instruments,importedContracts]);
+ const quoteRows=useMemo(()=>{const rows=new Map<string,Row>();for(const q of [...importedQuotes,...quotes]){const key=`${q.broker}:${q.instrument_id}`,previous=rows.get(key);if(!previous||Date.parse(q.received_at||q.quote_at||'')>=Date.parse(previous.received_at||previous.quote_at||'')||!previous.received_at)rows.set(key,q);}return [...rows.values()];},[quotes,importedQuotes]);
+ const available=useMemo(()=>Array.from(new Set(catalogInstruments.map(i=>i.underlying))),[catalogInstruments]);
  const [underlying,setUnderlying]=useState('NIFTY'),[expiry,setExpiry]=useState(''),[legs,setLegs]=useState<Leg[]>([]),[name,setName]=useState('Bull Call Spread'),[selectedBrokers,setSelectedBrokers]=useState<string[]>(['dhan']),[category,setCategory]=useState('Bullish'),[tab,setTab]=useState('Payoff graph'),[orderType,setOrderType]=useState('MARKET'),[advanced,setAdvanced]=useState(false);
- const ownContracts=useMemo(()=>instruments.filter(i=>i.underlying===underlying),[instruments,underlying]);
+ const ownContracts=useMemo(()=>catalogInstruments.filter(i=>i.underlying===underlying),[catalogInstruments,underlying]);
  const expiries=useMemo(()=>Array.from(new Set(ownContracts.map(i=>i.expiry))).sort(),[ownContracts]);
  const strikes=useMemo(()=>Array.from(new Set(ownContracts.filter(i=>i.expiry===expiry).map(i=>Number(i.strike)))).sort((a,b)=>a-b),[ownContracts,expiry]);
  const spot=Number(ownContracts[0]?.spot||strikes[Math.floor(strikes.length/2)]||0);
  const spotKnown=Boolean(ownContracts[0]?.spot);
  const atm=strikes.length?strikes.reduce((a,b)=>Math.abs(b-spot)<Math.abs(a-spot)?b:a,strikes[0]):0;
  const demo=ownContracts.some(i=>i.demo);
- function contract(leg:Leg){return ownContracts.find(i=>i.expiry===leg.expiry&&Number(i.strike)===leg.strike&&i.option_type===leg.option_type&&i.broker===selectedBrokers[0])||ownContracts.find(i=>i.expiry===leg.expiry&&Number(i.strike)===leg.strike&&i.option_type===leg.option_type);}
- function quoteFor(leg:Leg){const c=contract(leg),source=preferredFeed==='broker'?selectedBrokers[0]:preferredFeed;return quotes.find(q=>q.broker===source&&((q.instrument_id===(c?.instrument_id||c?.id))||(q.underlying===c?.underlying&&q.expiry===c?.expiry&&Number(q.strike)===Number(c?.strike)&&q.option_type===c?.option_type)));}
+ function contract(leg:Leg){const matches=(i:Row)=>i.expiry===leg.expiry&&Number(i.strike)===leg.strike&&i.option_type===leg.option_type;return (leg.instrument_id?ownContracts.find(i=>(i.instrument_id||i.id)===leg.instrument_id&&i.broker===selectedBrokers[0]&&matches(i)):undefined)||ownContracts.find(i=>matches(i)&&i.broker===selectedBrokers[0])||ownContracts.find(matches);}
+ function quoteFor(leg:Leg){const c=contract(leg),source=preferredFeed==='broker'?selectedBrokers[0]:preferredFeed;return quoteRows.find(q=>q.broker===source&&((q.instrument_id===(c?.instrument_id||c?.id))||(q.underlying===c?.underlying&&q.expiry===c?.expiry&&Number(q.strike)===Number(c?.strike)&&q.option_type===c?.option_type)));}
  function price(leg:Leg){const c=contract(leg),quote=quoteFor(leg);if(orderType==='LIMIT')return leg.price||Number(quote?.ltp||c?.base_price||0);return Number(quote?.ltp||c?.base_price||0);}
- function loadTemplate(template:Template){const a=strikes.indexOf(atm);setName(template.name);setLegs((addingTo?template.legs.slice(0,1):template.legs).map(([side,type,offset])=>({key:uid(),enabled:true,side:side as Leg['side'],option_type:type as Leg['option_type'],expiry,strike:strikes[Math.max(0,Math.min(strikes.length-1,a+offset))]||atm,lots:1,price:0})));}
- useEffect(()=>{if(available.length&&!available.includes(underlying))setUnderlying(available[0]);},[available,underlying]);
- useEffect(()=>{if(expiries.length&&!expiries.includes(expiry))setExpiry(expiries[0]);},[expiries,expiry]);
- useEffect(()=>{if(strikes.length){const chosen=addingTo?{...templates[14],name:`${addingTo.name} · new leg`}:templates.find(t=>t.name===name)||templates[1];loadTemplate(chosen);}},[underlying,expiry,strikes.join(','),addingTo?.id]);
+ function loadTemplate(template:Template){imported.current=null;const a=strikes.indexOf(atm);setName(template.name);setLegs((addingTo?template.legs.slice(0,1):template.legs).map(([side,type,offset])=>({key:uid(),enabled:true,side:side as Leg['side'],option_type:type as Leg['option_type'],expiry,strike:strikes[Math.max(0,Math.min(strikes.length-1,a+offset))]||atm,lots:1,price:0})));}
+ useEffect(()=>{if(!initialSelection||appliedSelection.current===initialSelection.nonce)return;appliedSelection.current=initialSelection.nonce;const first=initialSelection.legs[0];if(!first)return;const targetUnderlying=first.underlying||initialSelection.underlying,targetExpiry=first.expiry;imported.current={nonce:initialSelection.nonce,underlying:targetUnderlying,expiry:targetExpiry,pending:true};setImportedContracts(initialSelection.contracts);setImportedQuotes(initialSelection.quotes||[]);setUnderlying(targetUnderlying);setExpiry(targetExpiry);setName(initialSelection.name);setSelectedBrokers([initialSelection.broker]);setCategory('Custom');setOrderType('MARKET');setLegs(initialSelection.legs.map(l=>({key:uid(),enabled:true,instrument_id:l.instrument_id||l.id,side:l.side==='SELL'?'SELL':'BUY',expiry:l.expiry,strike:Number(l.strike),option_type:l.option_type==='PE'?'PE':'CE',lots:Math.max(1,Math.min(1000,Math.trunc(Number(l.lots)||1))),price:Number(l.price)||0})));onSelectionConsumed?.();},[initialSelection?.nonce]);
+ useEffect(()=>{if(imported.current?.pending)return;if(available.length&&!available.includes(underlying))setUnderlying(available[0]);},[available,underlying]);
+ useEffect(()=>{if(imported.current?.pending)return;if(expiries.length&&!expiries.includes(expiry))setExpiry(expiries[0]);},[expiries,expiry]);
+ useEffect(()=>{if(imported.current){if(imported.current.pending){if(underlying===imported.current.underlying&&expiry===imported.current.expiry)imported.current.pending=false;return;}if(underlying===imported.current.underlying&&expiry===imported.current.expiry)return;imported.current=null;}if(strikes.length){const chosen=addingTo?{...templates[14],name:`${addingTo.name} · new leg`}:templates.find(t=>t.name===name)||templates[1];loadTemplate(chosen);}},[underlying,expiry,strikes.join(','),addingTo?.id]);
  useEffect(()=>{if(addingTo){setUnderlying(addingTo.underlying);setSelectedBrokers([addingTo.broker]);setName(`${addingTo.name} · new leg`);}},[addingTo]);
- function change(key:string,fields:Partial<Leg>){setLegs(prev=>prev.map(l=>l.key===key?{...l,...fields}:l));}
+ function change(key:string,fields:Partial<Leg>){setLegs(prev=>prev.map(l=>l.key===key?{...l,...fields,...('expiry'in fields||'strike'in fields||'option_type'in fields?{instrument_id:undefined}:{})}:l));}
  const active=legs.filter(l=>l.enabled&&contract(l));
  const invalid=legs.filter(l=>l.enabled&&!contract(l));
- const waiting=active.filter(l=>!demo&&(!quoteFor(l)||quoteFor(l)?.stale||!(price(l)>0)));
+ const waiting=active.filter(l=>{if(demo)return false;const quote=quoteFor(l),received=Date.parse(quote?.received_at||quote?.quote_at||'');return !quote||quote.stale||!Number.isFinite(received)||clock-received>staleAfterSeconds*1000||!(price(l)>0);});
  const unknownMultiplier=active.some(l=>contract(l)?.exchange==='MCX'&&!contract(l)?.price_multiplier);
  const canValue=active.length>0&&!invalid.length&&!waiting.length&&!unknownMultiplier;
  const canReview=canValue&&selectedBrokers.length>0&&Boolean(name.trim());
@@ -52,7 +60,7 @@ export default function Builder({instruments,quotes,onReview,addingTo,onCancelAd
  return <div className="builder-page">
   {addingTo&&<div className="banner"><Layers size={16}/>Adding a leg to {addingTo.name} · {brokers[addingTo.broker]}<button className="text-btn" onClick={onCancelAdd}>Cancel</button></div>}
   <div className="builder-toolbar"><div className="underlying-select"><span className="instrument-icon">{underlying.slice(0,1)}</span><select aria-label="Underlying" disabled={Boolean(addingTo)} value={underlying} onChange={e=>setUnderlying(e.target.value)}>{available.map(u=><option key={u}>{u}</option>)}</select><span className="muted" title={spotKnown?'Sample underlying reference':'Median imported strike, not a live underlying quote'}>{num(spot)}{!spotKnown&&<small> strike reference</small>}</span></div><div className="toolbar-right"><Badge tone="amber">{demo?'Sample contracts':'Instrument master'}</Badge><span className="muted">Options strategy workspace</span></div></div>
-  {!instruments.length?<Panel title="Your contract catalog is empty"><div className="empty"><h3>Import an instrument master</h3><p>Connect a broker and import current contracts, or enable sample mode in Settings to explore the app.</p></div></Panel>:<>
+  {!catalogInstruments.length?<Panel title="Your contract catalog is empty"><div className="empty"><h3>Import an instrument master</h3><p>Connect a broker and import current contracts, or enable sample mode in Settings to explore the app.</p></div></Panel>:<>
   <div className="builder-grid">
    <section className="panel leg-panel"><div className="panel-head"><div><span className="eyebrow">STRATEGY BUILDER</span><input className="strategy-name" aria-label="Strategy name" value={name} maxLength={100} onChange={e=>setName(e.target.value)}/></div><button className="icon-btn" title="Reset legs to selected template" onClick={()=>loadTemplate(templates.find(t=>t.name===name)||templates[1])}><RotateCcw size={17}/></button></div>
     <div className="leg-toolbar"><span><Check size={14}/>{active.length} selected legs</span><select aria-label="Entry order type" value={orderType} onChange={e=>setOrderType(e.target.value)}><option value="MARKET">Market simulation</option><option value="LIMIT">Limit simulation</option></select></div>

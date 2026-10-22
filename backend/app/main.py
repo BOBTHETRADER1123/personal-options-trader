@@ -12,7 +12,9 @@ from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, delete
+from sqlalchemy.exc import SQLAlchemyError
 from .database import Base, engine as db_engine, SessionLocal, get_db, iso_now
 from .models import Owner, UserSession, SocketTicket, Trade, Event, Timeline, QuoteEvent, Setting, SchemaVersion, ActionRecord
 from .security import require_session, create_session, password_hash, verify_password, verify_totp, digest, rate_limit, validate_origin, session_from_cookie, COOKIE, ALLOWED_ORIGINS
@@ -26,6 +28,34 @@ stop_event=asyncio.Event()
 feed_manager=None
 feed_status={}
 catalog=None
+_feed_contract_ids=None
+database_ready=True
+DATABASE_RETRY_SECONDS=60
+
+def database_unavailable():
+    global database_ready
+    database_ready=False
+
+async def wait_for_shutdown(seconds):
+    try:await asyncio.wait_for(stop_event.wait(),timeout=seconds)
+    except asyncio.TimeoutError:pass
+
+def selected_feed_contracts(db):
+    wanted={s.strip() for s in os.getenv('FEED_INSTRUMENT_IDS','').split(',') if s.strip()}
+    for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
+        if row.data.get('demo') is False:
+            wanted.update(l['instrument_id'] for l in row.data.get('legs',[]) if l.get('status') in {'open','pending'})
+    return [c for c in catalog.all(demo=False) if c['id'] in wanted]
+
+async def refresh_selected_feeds(db,force=False):
+    global _feed_contract_ids
+    if feed_manager is None:return
+    contracts=selected_feed_contracts(db)
+    identities=frozenset((c['id'],c['broker']) for c in contracts)
+    if force or identities!=_feed_contract_ids:
+        await feed_manager.stop()
+        await feed_manager.start(contracts)
+        _feed_contract_ids=identities
 
 def demo_quote(contract,broker,now=None):
     now=now or time.time();base=float(contract.get('base_price') or 100)
@@ -93,46 +123,103 @@ def seed_demo(db):
             engine.recalculate(trade);trade['mfe']=2000;trade['mae']=-1900;trade['mfe_at']=(started+timedelta(minutes=193)).isoformat(timespec='microseconds');trade['mae_at']=(started+timedelta(minutes=61)).isoformat(timespec='microseconds');trade['profit_giveback']=2000-trade['net_pnl'];engine.snapshot(db,trade,'closed');engine.store_trade(db,trade);engine.archive_close(db,trade);engine.store_trade(db,trade)
     db.commit()
 
+def process_quote_receipt(quote):
+    with SessionLocal() as db:
+        receipt_id=engine.record_quote(db,quote,process=False)
+        db.commit()  # Durable receipt precedes simulation/Excel processing.
+        if receipt_id is not None:
+            engine.revalue_quote(db,db.get(QuoteEvent,receipt_id));db.commit()
+
 async def quote_received(quote):
     async with write_lock:
-        with SessionLocal() as db:
-            receipt_id=engine.record_quote(db,quote,process=False)
-            db.commit()  # Durable receipt precedes simulation/Excel processing.
-            engine.revalue_quote(db,db.get(QuoteEvent,receipt_id));db.commit()
+        await asyncio.to_thread(process_quote_receipt,quote)
 
 async def status_received(broker,status):
     feed_status[broker]=status
 
+def capture_once():
+    with SessionLocal() as db:
+        engine.recover_pending_quotes(db)
+        settings=engine.get_settings(db)
+        if settings['demo_mode']:
+            needed=set()
+            for trade in engine.trade_records(db):
+                if trade['status'] in ('open','pending') and trade.get('demo'):
+                    source=trade['broker'] if settings['preferred_feed']=='broker' else settings['preferred_feed']
+                    needed.update((source,l['instrument_id']) for l in trade['legs'] if l['status'] in ('open','pending'))
+            for broker,instrument_id in needed:
+                contract=engine.contract_for(instrument_id,broker,True)
+                engine.record_quote(db,demo_quote(contract,broker))
+        engine.take_snapshots(db);db.commit()
+
 async def background_loop():
-    while not stop_event.is_set():
+    while not stop_event.is_set() and database_ready:
         try:
             async with write_lock:
-                with SessionLocal() as db:
-                    engine.recover_pending_quotes(db)
-                    settings=engine.get_settings(db)
-                    if settings['demo_mode']:
-                        needed=set()
-                        for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
-                            if row.data.get('demo'):
-                                source=row.broker if settings['preferred_feed']=='broker' else settings['preferred_feed']
-                                needed.update((source,l['instrument_id']) for l in row.data['legs'] if l['status'] in ('open','pending'))
-                        for broker,instrument_id in needed:
-                            contract=engine.contract_for(instrument_id,broker,True)
-                            engine.record_quote(db,demo_quote(contract,broker))
-                    engine.take_snapshots(db);db.commit()
+                # Database latency must not prevent HTTP health checks or UI input.
+                await asyncio.to_thread(capture_once)
+        except SQLAlchemyError:
+            database_unavailable()
+            log.warning('Database capture unavailable; background activity paused until reconnection.')
+            return
         except Exception:
             log.exception('Background capture failed; journal data retained. Feed/UI should be checked.')
         try:await asyncio.wait_for(stop_event.wait(),timeout=1)
         except asyncio.TimeoutError:pass
 
+def initialize_database():
+    """Run blocking database setup outside the HTTP event loop."""
+    Base.metadata.create_all(db_engine)
+    with SessionLocal() as db:
+        if not db.get(SchemaVersion,1):db.add(SchemaVersion(version=1));db.commit()
+        persisted_trades=[row.data for row in db.scalars(select(Trade))]
+        catalog.restore_demo_contracts(persisted_trades)
+        catalog.restore_live_contracts(persisted_trades)
+        while engine.recover_pending_quotes(db):db.commit()
+        seed_demo(db)
+
+async def try_initialize_database():
+    global database_ready
+    try:
+        await asyncio.to_thread(initialize_database)
+        with SessionLocal() as db:
+            await refresh_selected_feeds(db,force=True)
+    except SQLAlchemyError as exc:
+        database_unavailable()
+        log.warning('Database initialization unavailable (%s); retrying in %s seconds.',type(exc).__name__,DATABASE_RETRY_SECONDS)
+        return False
+    database_ready=True
+    return True
+
+async def database_services(reporting_loop):
+    """Pause all SQL workers during an outage instead of continuously retrying."""
+    workers=[]
+    try:
+        while not stop_event.is_set():
+            if not database_ready:
+                for task in workers:task.cancel()
+                if workers:await asyncio.gather(*workers,return_exceptions=True)
+                workers=[]
+                await feed_manager.stop()
+                await wait_for_shutdown(DATABASE_RETRY_SECONDS)
+                if stop_event.is_set():break
+                if not await try_initialize_database():continue
+            if not workers:
+                workers=[asyncio.create_task(background_loop()),asyncio.create_task(reporting_loop(stop_event))]
+            await wait_for_shutdown(5)
+    finally:
+        for task in workers:task.cancel()
+        if workers:await asyncio.gather(*workers,return_exceptions=True)
+
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event
+    global catalog,feed_manager,stop_event,database_ready
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
     from .brokers import FeedManager
-    stop_event=asyncio.Event();catalog=ContractCatalog();engine.set_catalog(catalog)
+    stop_event=asyncio.Event();database_ready=False
+    catalog=ContractCatalog();engine.set_catalog(catalog)
     def delete_archived_rows(db,trade_id):
         row=db.get(Trade,trade_id)
         if not row or row.status!='closed':
@@ -142,28 +229,30 @@ async def lifespan(app):
         row.data={**row.data,'archived':True}
         return {'trade_events':events,'timeline':timeline}
     reporting.configure_archival(lambda db:engine.get_settings(db).get('delete_after_local_save',False),delete_archived_rows)
-    Base.metadata.create_all(db_engine)
-    with SessionLocal() as db:
-        if not db.get(SchemaVersion,1):db.add(SchemaVersion(version=1));db.commit()
-        catalog.restore_demo_contracts([row.data for row in db.scalars(select(Trade))])
-        while engine.recover_pending_quotes(db):db.commit()
-        seed_demo(db)
     feed_manager=FeedManager(on_quote=quote_received,on_status=status_received)
-    await feed_manager.start(catalog.all(demo=False))
-    tasks=[asyncio.create_task(background_loop()),asyncio.create_task(reporting_loop(stop_event))]
-    yield
-    stop_event.set()
-    await feed_manager.stop()
-    for task in tasks:
-        try:await asyncio.wait_for(task,timeout=10)
-        except (asyncio.TimeoutError,asyncio.CancelledError):task.cancel()
+    await try_initialize_database()
+    services=asyncio.create_task(database_services(reporting_loop))
+    try:yield
+    finally:
+        stop_event.set()
+        await feed_manager.stop()
+        try:await asyncio.wait_for(services,timeout=20)
+        except (asyncio.TimeoutError,asyncio.CancelledError):
+            services.cancel()
+            await asyncio.gather(services,return_exceptions=True)
 
 app=FastAPI(title='Personal Options Trader',version='1.0.0',lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=ALLOWED_ORIGINS,allow_credentials=True,allow_methods=['GET','POST','PATCH','DELETE','OPTIONS'],allow_headers=['Content-Type','X-CSRF-Token','Authorization'])
 
 @app.middleware('http')
 async def security_headers(request,call_next):
-    response=await call_next(request)
+    if request.url.path.startswith('/api/') and request.url.path!='/api/health' and not database_ready:
+        response=JSONResponse({'detail':'The cloud database is temporarily unavailable. Background activity is paused; saved records are retained. Try again after database access is restored.','database_ready':False},status_code=503,headers={'Retry-After':str(DATABASE_RETRY_SECONDS)})
+    else:
+        try:response=await call_next(request)
+        except SQLAlchemyError:
+            database_unavailable()
+            response=JSONResponse({'detail':'The database connection is temporarily unavailable. Background activity is paused; saved records are retained.','database_ready':False},status_code=503,headers={'Retry-After':str(DATABASE_RETRY_SECONDS)})
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['X-Frame-Options']='DENY'
     response.headers['Referrer-Policy']='no-referrer'
@@ -172,7 +261,7 @@ async def security_headers(request,call_next):
     return response
 
 @app.get('/api/health')
-def health():return {'ok':True,'mode':'PAPER','live_orders_supported':False,'time':iso_now()}
+def health():return {'ok':True,'mode':'PAPER','live_orders_supported':False,'database_ready':database_ready,'time':iso_now()}
 
 @app.get('/api/session')
 def session(request:Request,db=Depends(get_db)):
@@ -226,7 +315,9 @@ async def create_trade(payload:TradeInput,db=Depends(get_db)):
     async with write_lock:
         existing=db.get(ActionRecord,payload.idempotency_key)
         if not existing:refresh_demo_for_payload(db,payload.model_dump())
-        result=engine.create_trades(db,payload);db.commit();return result
+        result=engine.create_trades(db,payload);db.commit()
+        await refresh_selected_feeds(db)
+        return result
 
 @app.get('/api/trades/{trade_id}',dependencies=[Depends(require_session)])
 def get_trade(trade_id:str,include_history:bool=True,db=Depends(get_db)):
@@ -239,7 +330,9 @@ async def trade_action(trade_id:str,payload:ActionInput,db=Depends(get_db)):
     async with write_lock:
         row=db.get(Trade,trade_id)
         if row and not db.get(ActionRecord,payload.idempotency_key):refresh_demo_for_payload(db,{**payload.model_dump(),'trade_id':trade_id},row.broker)
-        result=engine.apply_action(db,trade_id,payload);db.commit();return result
+        result=engine.apply_action(db,trade_id,payload);db.commit()
+        await refresh_selected_feeds(db)
+        return result
 
 @app.get('/api/events',dependencies=[Depends(require_session)])
 def recent_events(limit:int=20,db=Depends(get_db)):
@@ -254,7 +347,10 @@ def instruments(underlying:str|None=None,broker:str|None=None,db=Depends(get_db)
 @app.post('/api/instruments/reload',dependencies=[Depends(require_session)])
 async def reload_instruments():
     catalog.reload()
-    if feed_manager:await feed_manager.stop();await feed_manager.start(catalog.all(demo=False))
+    with SessionLocal() as db:
+        active=[row.data for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending'])))]
+        catalog.restore_live_contracts(active)
+        await refresh_selected_feeds(db,force=True)
     return {'ok':True,'live_contracts':len(catalog.all(demo=False))}
 
 @app.get('/api/brokers',dependencies=[Depends(require_session)])
@@ -284,28 +380,37 @@ async def issue_ws_ticket(current=Depends(require_session),db=Depends(get_db)):
         db.commit()
         return {'ticket':raw,'expires_in':30}
 
+def socket_identity(ticket,request):
+    with SessionLocal() as db:
+        if ticket:
+            row=db.get(SocketTicket,digest(ticket))
+            session=db.get(UserSession,row.session_hash) if row and row.expires_at>time.time() else None
+            if row:db.delete(row);db.commit()
+        else:session=session_from_cookie(request,db)
+        if not session or session.expires_at<=time.time():return None
+        return session.expires_at,session.token_hash
+
+def socket_dashboard(session_hash,statuses):
+    with SessionLocal() as db:
+        current=db.get(UserSession,session_hash)
+        if not current or current.expires_at<=time.time():return None
+        return engine.dashboard(db,statuses)
+
 @app.websocket('/ws')
 @app.websocket('/api/ws')
 async def websocket(ws:WebSocket):
     origin=ws.headers.get('origin')
     if origin and origin.rstrip('/') not in ALLOWED_ORIGINS:await ws.close(code=4403);return
     async with write_lock:
-        with SessionLocal() as db:
-            ticket=ws.query_params.get('ticket')
-            if ticket:
-                row=db.get(SocketTicket,digest(ticket))
-                session=db.get(UserSession,row.session_hash) if row and row.expires_at>time.time() else None
-                if row:db.delete(row);db.commit()
-            else:session=session_from_cookie(ws,db)
-            if not session or session.expires_at<=time.time():await ws.close(code=4401);return
-            expiry=session.expires_at;session_hash=session.token_hash
+        identity=await asyncio.to_thread(socket_identity,ws.query_params.get('ticket'),ws)
+        if not identity:await ws.close(code=4401);return
+        expiry,session_hash=identity
     await ws.accept()
     try:
         while time.time()<expiry:
-            with SessionLocal() as db:
-                current=db.get(UserSession,session_hash)
-                if not current or current.expires_at<=time.time():break
-                await ws.send_json({'type':'dashboard','data':engine.dashboard(db,feed_manager.statuses() if feed_manager else {})})
+            data=await asyncio.to_thread(socket_dashboard,session_hash,feed_manager.statuses() if feed_manager else {})
+            if data is None:break
+            await ws.send_json({'type':'dashboard','data':data})
             await asyncio.sleep(1)
         await ws.close(code=4401)
     except (WebSocketDisconnect,RuntimeError):pass
@@ -314,6 +419,11 @@ async def websocket(ws:WebSocket):
 from .companion_api import router_browser,router_companion
 app.include_router(router_browser,dependencies=[Depends(require_session)])
 app.include_router(router_companion)
+
+# Register before the SPA catch-all, with the same owner/session/CSRF rules.
+from . import option_chain
+option_chain.configure(write_lock)
+app.include_router(option_chain.router)
 
 # The built PWA can be opened with one Windows backend process. API routes above
 # always take precedence and are never caught by the SPA fallback.

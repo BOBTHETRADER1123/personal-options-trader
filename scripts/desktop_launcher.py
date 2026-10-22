@@ -26,7 +26,15 @@ def env_values(path: Path):
 def put_env(path: Path, key: str, value: str):
     from dotenv import set_key
     # python-dotenv replaces one key without displaying private values.
-    set_key(str(path), key, value, quote_mode='always')
+    # Windows sync/scanning tools can briefly lock the atomic replacement.
+    for attempt in range(5):
+        try:
+            set_key(str(path), key, value, quote_mode='always')
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(.1 * (2 ** attempt))
 
 def prepare_config(root: Path = ROOT, folder: Path | None = None):
     config = root / '.env'

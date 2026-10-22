@@ -16,7 +16,8 @@ if DATABASE_URL.startswith('postgres://'):
 elif DATABASE_URL.startswith('postgresql://'):
     DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+psycopg://', 1)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True,
-    connect_args={'check_same_thread': False, 'timeout': 30} if DATABASE_URL.startswith('sqlite') else {})
+    connect_args=({'check_same_thread': False, 'timeout': 30} if DATABASE_URL.startswith('sqlite') else
+                  {'connect_timeout': 10, 'options': '-c statement_timeout=15000 -c lock_timeout=10000'}))
 def configure_sqlite(target):
     """Disable sqlite3 legacy transactions so SAVEPOINT release cannot commit early."""
     @event.listens_for(target, 'connect')

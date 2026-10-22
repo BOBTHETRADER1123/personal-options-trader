@@ -283,6 +283,48 @@ class ContractCatalog:
     def contracts(self, demo: bool = True):
         return self.all(demo)
 
+    def merge_live_contracts(self, contracts: list[dict]) -> int:
+        """Install only selected master rows, never subscribe the full universe."""
+        current = {(c['id'], c['broker']): c for c in self._live}
+        for contract in contracts:
+            if (contract.get('demo') is not False or contract.get('broker') not in BROKERS
+                    or not str(contract.get('token', '')).isdigit()
+                    or not str(contract.get('id', '')).startswith(contract['broker'] + ':')):
+                raise ValueError('Only verified broker-master contracts may enter the live catalog.')
+            current[(contract['id'], contract['broker'])] = dict(contract)
+        self._live = list(current.values())
+        return len(contracts)
+
+    def select_chain_contracts(self, contracts: list[dict], active_ids: set[str]) -> int:
+        """Replace browsed chain rows while retaining active and imported contracts.
+
+        Browsing every underlying must not accumulate the full exchange master
+        in process memory or subscribe every possible option to market feeds.
+        """
+        previous = self._live
+        try:
+            self._live = [c for c in previous if not c.get('chain_key') or c['id'] in active_ids]
+            return self.merge_live_contracts(contracts)
+        except Exception:
+            self._live = previous
+            raise
+
+    def restore_live_contracts(self, trades: list[dict]) -> int:
+        """Active journal legs retain their original master identity on restart."""
+        contracts = []
+        required = {'id','broker','token','underlying','exchange','segment','symbol','expiry','strike','option_type','lot_size'}
+        for trade in trades:
+            if trade.get('demo') is not False or trade.get('status') not in {'open','pending'}:
+                continue
+            for leg in trade.get('legs', []):
+                if leg.get('status') not in {'open','pending'} or leg.get('demo') is not False:
+                    continue
+                contract = dict(leg)
+                contract['id'] = leg.get('instrument_id')
+                if required.issubset(contract):
+                    contracts.append(contract)
+        return self.merge_live_contracts(contracts)
+
     def find(self, instrument_id: str, broker: str | None = None) -> dict | None:
         for row in self._demo + self._live:
             if row["id"] == instrument_id and (broker is None or row["broker"] == broker):

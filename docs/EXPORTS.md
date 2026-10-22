@@ -2,18 +2,16 @@
 
 Every completed paper trade has its own export job, workbook and immutable manifest. Dhan, Kotak Neo and 5paisa reports are separated by broker, year, month and trade ID. All report times use **Asia/Kolkata**. Sample-mode reports state that prices and fills are simulated.
 
-The closing transaction queues the complete trade, its trade events, the recorded P&L timeline and relevant received quotes in the database. A background worker generates Excel without delaying the trading request. The workbook bytes are stored in that database too, so a Render restart or an ephemeral filesystem does not discard an unsaved report. Use Neon PostgreSQL in cloud deployment; the Windows setup uses SQLite locally.
+The closing transaction queues a compact trade summary. A background worker generates Excel without delaying the trading request. Workbook bytes stay in the database until collected; Render's ephemeral filesystem is not their only copy. New summary jobs omit raw quote and timeline arrays. Report lists read metadata without loading full workbooks or histories.
 
 ## What each workbook contains
 
-- **Trade Summary:** closing P&L, charges, entry and exit times, MFE and MAE with times, profit giveback, risk and margin assumptions.
-- **P&L Timeline:** the recorded strategy P&L timeline, including explicitly marked carried-forward snapshots. This is the strategy total once per snapshot, so multi-leg totals are not double counted.
-- **Leg Timeline:** individual leg quotes and P&L for snapshots containing multiple-leg details.
-- **Trade Events:** entries, additions, edits, exits and their journal/action identifiers.
-- **Strategy Legs:** contract, exchange, expiry, strike, CE/PE, direction, quantity, entry/exit prices and individual results.
-- **Market Updates:** actual received quote records with their individual broker sources and original full source data. No intermediate ticks are invented. Nanosecond receive identifiers are text to preserve all digits in Excel.
+- **Trade Summary:** final gross/net result and charges; maximum profit and maximum loss actually reached with IST times; signed highest/lowest observed net P&L (MFE/MAE); entry/closing times and sample/live-data origin.
+- **Strategy Legs:** symbol, expiry, strike, CE/PE, direction, lots, contract multiplier and average entry/exit prices.
 
-Large histories are split into numbered continuation sheets before Excel's row limit. Market timestamps retain their original source values inside the complete-record columns as well as their sortable IST display columns. A runtime timestamp's precision does not establish exchange accuracy or feed latency.
+New files omit individual price updates and one-second timelines. Existing detailed workbooks remain readable and are not rewritten. Extrema include estimated charges and only reflect received marks/actions. If a trade never became profitable, maximum profit is zero with no invented profit timestamp; the signed highest net P&L and its time remain available separately.
+
+The connected [Google Drive backup workflow](GOOGLE-DRIVE-BACKUPS.md) saves available completed laptop reports before storage fills. It never deletes source records and does not reset Neon's monthly public network-transfer allowance. Cloud-only records cannot be exported while database access is suspended.
 
 ## Set up automatic saving on your laptop
 

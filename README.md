@@ -4,7 +4,11 @@ A responsive personal options paper trading desk for Indian indices and MCX comm
 
 **New to coding? Start with [START-HERE.md](START-HERE.md).**
 
-As of **21 October 2026**, the laptop app is installed and running with an existing owner account. Its paired companion has saved and reopened a verified Excel workbook. App source has been pushed to the private [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader), and the **personal-options-trader** Neon Free project has been created in Singapore. Render and Vercel deployment remain pending; hosted access and physical-phone use have not yet been verified.
+Open your online app at **[personal-options-trader.vercel.app](https://personal-options-trader.vercel.app)**. On the configured laptop, the **Personal Options Trader Online** desktop shortcut or **Open-Online-Trading-App.cmd** also starts its separate Excel companion. Online reports are configured to save in **Documents/PaperTrading/OnlineTrades**.
+
+As of **22 October 2026**, the hosted owner account is created. **Neon's monthly public network transfer allowance is exhausted, so the online database is temporarily unavailable.** Excel archiving does not reset that allowance. No paid upgrade has been selected. The local practice app and records remain available separately. The update adds a navy/mint dashboard, a searchable stock/index option chain, compact reports, and reduced database reads. Source is in the private [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader).
+
+Available laptop reports have been backed up and downloaded again for checksum verification in [Personal Options Trader Backups](https://drive.google.com/drive/folders/1CxpHsKBCJ8dxxNYbKAx6NMwEU9tojMn5). A daily **4:00 pm IST** Codex backup checks new completed reports when this laptop and Codex are available. Cloud-only records cannot be exported until database access returns. See [Google Drive backups](docs/GOOGLE-DRIVE-BACKUPS.md).
 
 ## Included workflows
 
@@ -12,7 +16,8 @@ As of **21 October 2026**, the laptop app is installed and running with an exist
 - Market and limit paper simulations for Dhan, Kotak Neo and 5paisa, with one action ID and independent broker results.
 - Custom strategies and 15 templates; selectable contracts and strikes, enable/disable legs, buy/sell, lots and optional stops/targets.
 - Add legs and lots, weighted average accounting, partial and full exits, cancel pending, duplicate and audited paper assumption edits.
-- Received quote journal, one-second snapshots and carry-forward labels, stale detection, source timestamps, WebSocket delivery and polling fallback.
+- Compact recording by default: current marks, durable processing of active-position quotes, observed extrema, stale detection, and WebSocket delivery. Successful compact receipts are removed after valuation; existing historical records are preserved.
+- Searchable current NSE/BSE stock and index option chains from the official Dhan master, with expiry selection, paired CE/PE columns and a paper-strategy basket. Live prices and Greeks require a working Dhan market-data session.
 - Gross/realized/unrealized/net P&L, estimated fees, same-expiry piecewise payoff, finite or unbounded risk, heuristic margin and hedge estimates.
 - MFE, MAE, their times, closing result and profit giveback.
 - Per-trade/broker Excel workbooks, durable jobs, reconciliation and companion verification before optional journal compaction.
@@ -32,6 +37,8 @@ docs/BROKERS.md          Official APIs, session setup and master ingestion
 docs/EXPORTS.md          Pairing, acknowledgement, recovery and retention
 docs/DEPLOYMENT.md       GitHub Desktop, Vercel, Render, Neon and Android
 scripts/                 Installation, backup, restore and packaging helpers
+Open-Online-Trading-App.cmd Open the hosted app and start its report companion
+Stop-Online-Trading-App.cmd Stop only the online report companion
 Open-Trading-App.cmd     Start the local app and paired report companion
 Stop-Trading-App.cmd     Stop the local services started by the launcher
 .env.example             Private backend configuration template
@@ -39,7 +46,15 @@ render.yaml              Render deployment template (free tier initially)
 frontend/vercel.json     Website deployment proxy template
 ```
 
-## Open the Windows app
+## Open the online app
+
+Open the hosted website and sign in with the password you already created once Neon database access returns. The online report companion has been stopped during the quota outage. **Personal Options Trader Online** or **Open-Online-Trading-App.cmd** starts it again. Physical-phone synchronization still needs verification.
+
+The online launcher runs the outbound Excel companion in the background and keeps its settings and report folder separate from local practice. Its connection is paired; the first completed hosted report still needs a save-and-reopen check in **Documents/PaperTrading/OnlineTrades**. **Stop-Online-Trading-App.cmd** stops that companion. It does not stop the hosted service or the local practice app.
+
+Render Free can sleep or restart, so it cannot guarantee uninterrupted feed capture. A running companion does not make the free backend continuously available.
+
+## Keep using the local practice app
 
 On the configured laptop, double-click the **Personal Options Trader** desktop shortcut or **Open-Trading-App.cmd** in the project folder. It starts the backend and paired Excel companion in the background and opens the app in your browser. Sign in with your existing owner password. Closing the browser leaves the services running while the laptop is awake. Double-click **Stop-Trading-App.cmd** to stop them; saved records remain on disk.
 
@@ -66,12 +81,12 @@ For PostgreSQL set the root `DATABASE_URL` to the private Neon connection string
 
 ## Operating rules and limits
 
-- Received broker updates are journaled; the provider’s delivery capabilities and network interruptions bound what can be recorded. Timestamp precision is not delivery accuracy. No intermediate ticks are invented.
-- One-second snapshots are produced while the backend runs; a stopped or sleeping server cannot record the missing interval. Reports preserve observed data and identify carried-forward marks.
+- Observed extrema reflect received quotes and recorded actions, including estimated charges. No intermediate ticks are invented. Unfinished quote processing remains recoverable; successful compact processing retains current state rather than a growing tick history.
+- The short live chart is held in memory and resets on restart. Trade extrema and final results persist. New Excel files contain Trade Summary and Strategy Legs; existing detailed workbooks remain readable.
 - Margin is a disclosed heuristic, not the broker’s blocked margin. Broker margin and account balances remain unavailable until explicitly supported and verified. Paper capital is an assumption.
 - Expiry payoff requires the same underlying and expiry; calendar strategies can be recorded but do not receive a misleading combined expiry risk estimate.
 - Live contracts come from imported current broker masters. A contract without a verified MCX price multiplier cannot be used for monetary paper P&L. The exchange calendar must be configured to claim session-open status accurately.
-- Live broker sessions, production Neon/PostgreSQL, cloud hosting, Android installation and sustained high-volume throughput require checks in the actual user environment. Read [the test report](TEST-REPORT.md) for what was run.
+- Live broker sessions, completed hosted trade/export flows, Android installation and sustained live throughput still require checks in the actual user environment. Hosted owner setup and initial session/proxy/companion authentication were verified before the quota outage. Read [the test report](TEST-REPORT.md).
 - Excel is generated on trade completion and can be downloaded from Reports. The journal remains authoritative while a trade is active. Automatic journal compaction retains summary/manifests/cloud workbooks and shared quotes; it is not complete online data erasure.
 - Secrets stay in backend environment variables. SQLite backups include private account/trading data; store them securely. Never upload `.env`, database files, raw masters, generated workbooks, or the companion’s private manifest to GitHub.
 

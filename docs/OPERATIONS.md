@@ -1,8 +1,20 @@
 # Operating and checking your app
 
+## Open and stop the online companion
+
+The hosted owner account is created. As of 22 October 2026, Neon has exhausted its monthly public network-transfer allowance, and the online companion is stopped to avoid unsuccessful polling. Once access returns, **Personal Options Trader Online** or **Open-Online-Trading-App.cmd** restarts it. It is paired and saves to **Documents/PaperTrading/OnlineTrades**. The first hosted workbook still needs an end-to-end check.
+
+**Stop-Online-Trading-App.cmd** stops only the online companion. The hosted backend continues according to its Render service state, and local practice services remain available. Closing the browser leaves the companion running while the laptop is awake. With the laptop off, completed online report jobs remain in Neon until a companion can collect them.
+
+The online launcher uses private `.env.online` and `companion/.env.online` files. Local practice uses its existing `.env` files and **Documents/PaperTrading/Trades**. Keep these credentials, manifests and folders separate. Both private configuration variants are excluded from source releases and GitHub.
+
 ## What runs when the website is closed
 
-The backend owns broker feeds, journal writes, one-second snapshots, export jobs and daily reconciliation. The desktop shortcut and **Open-Trading-App.cmd** start the backend and paired companion in the background. Closing the browser leaves them running while the laptop is awake. **Stop-Trading-App.cmd**, closing the laptop, or sleeping cloud compute stops capture. If using the optional **Start-Windows.cmd** console, closing that window stops its backend too. Pending durable jobs resume after restart, but prices never received during an outage cannot be recreated.
+The backend owns feeds, current trade state, observed extrema and export jobs. Compact mode avoids growing tick and one-second histories. Active quote receipts persist before processing and are removed after successful valuation; unfinished work remains recoverable. Database outages pause SQL workers and retry with backoff. The short live chart resets on restart; trade extrema persist. Free hosting cannot guarantee continuous capture or recreate missed prices.
+
+Daily Google Drive backups at **4:00 pm IST** use the connected Codex account while this laptop and Codex are available. See [Google Drive backups](GOOGLE-DRIVE-BACKUPS.md). These include completed summaries and verified archives, never credentials or account/session records. They do not reset the monthly transfer allowance.
+
+The retained local practice app has its own account and records. The **Personal Options Trader** desktop shortcut and **Open-Trading-App.cmd** start its backend and local companion in the background. Closing the browser leaves them running while the laptop is awake. **Stop-Trading-App.cmd** or closing the laptop stops local capture. If using the optional **Start-Windows.cmd** console, closing that window stops its backend too. These local controls do not stop the hosted backend or online companion.
 
 The companion owns laptop filesystem writes. It must be running on an awake laptop to save files. It does not need the website to be open. No browser website can silently write to an arbitrary laptop folder.
 
@@ -13,7 +25,7 @@ Use exactly one backend worker/instance for this personal deployment. The applic
 1. Open the main project folder and double-click **Backup-Local.cmd**.
 2. It creates a timestamped SQLite backup in the **backups** folder and verifies its database integrity. This uses SQLite’s backup API, so committed WAL records are included.
 3. Copy the verified backup to a separate secure drive. Also back up your completed Excel archive and the companion’s `.companion/manifest.sqlite3`.
-4. Keep private `.env` configuration separately in a password manager or other private backup. Never attach it to GitHub or reports.
+4. Keep private `.env` and `.env.online` configuration separately in a password manager or other private backup. Never attach it to GitHub or reports. Back up the separate online report folder and its companion manifest too.
 
 Do not back up a running SQLite application by copying only `trader.db`: recently committed journal rows may still be in its WAL file.
 
@@ -41,11 +53,13 @@ An optional developer helper also supports a checksum-verified logical backup in
 - Live quote receipt is committed before processing. A durable pending-receipt table allows unfinished revaluation work to replay at startup. A stale event can still be preserved without treating it as a valid fill.
 - Confirmed multi-broker actions use a shared idempotency key and database transaction. Retry the same network request with the same key; do not repeatedly create new actions after an uncertain response.
 - Completion queues the immutable report payload in the closing transaction. The report worker generates a workbook separately and keeps its bytes/checksum in the database.
-- A failed or locked convenience file does not discard the journal or its cloud report. Use Reports → Retry. For the background launcher, inspect `.desktop/companion.log` in the project folder; for a manually started companion, check its window.
+- A failed or locked convenience file does not discard the journal or its cloud report. Use Reports → Retry. The online companion writes `.desktop/online-companion.log`; the local launcher writes `.desktop/companion.log`. For a manually started companion, check its window.
 - Crashed worker/companion claims expire and can resume. Restarts do not intentionally sample away received events. Workbook sheets split before Excel’s row limit.
-- The detailed event journal is authoritative. A workbook contains observed updates and snapshots, not a guarantee of every exchange event or every millisecond.
+- Compact mode keeps durable current state, observed extrema and final results. Existing historical records remain preserved. Neither mode guarantees receipt of every exchange event.
 
 ## Sessions and access
+
+The user created the hosted account and opened its dashboard. After database access returns, verify sign-out/sign-in and the first completed online report. The local owner account and trades belong to a separate practice database.
 
 Local development uses HTTP on loopback and a non-secure local cookie. The cloud template uses HTTPS, secure HttpOnly cookies and explicit allowed origins. The Vercel API proxy keeps browser sessions on the website’s origin; WebSocket access uses short-lived single-use tickets tied to that session. Logging out or changing a password revokes the session.
 
@@ -55,9 +69,16 @@ Never bind a local unauthenticated companion port publicly, turn off TLS validat
 
 ## Beginner acceptance checklist
 
+### Online handoff still to verify
+
+- [ ] Finish hosted owner setup with your chosen password; sign out and sign in again.
+- [ ] Complete a practice trade online and confirm its workbook is saved and reopenable in `Documents/PaperTrading/OnlineTrades`.
+- [ ] Open the same Vercel address on the phone and laptop; confirm the same hosted trade and export state appear.
+- [ ] Check Android installation and secure session behavior on the physical phone.
+
 ### Local paper engine
 
-- [ ] Create your own password and sign in; a wrong password is rejected.
+- [ ] Sign in with the existing local password; on a fresh installation, create an owner password first. A wrong password is rejected.
 - [ ] Sample badge remains visible on sample prices, contracts and reports.
 - [ ] Select contracts from dropdowns. Shift strikes with minus/plus.
 - [ ] Make a two-leg strategy and select all three paper accounts. Confirm once; see three separate results.
@@ -95,6 +116,6 @@ Never bind a local unauthenticated companion port publicly, turn off TLS validat
 
 ## Troubleshooting without exposing secrets
 
-Check the broker’s status detail and the backend’s error messages. The background launcher writes local logs to `.desktop/backend.log` and `.desktop/companion.log`; a manually started backend shows its messages in the console. Share only sanitized error text. Never share URLs containing access tokens, private environment contents or database connection strings. A disconnected API is not replaced with a synthetic price in market-data mode.
+Check the broker’s status detail and the backend’s error messages. Hosted backend messages are in Render's logs. The online companion writes `.desktop/online-companion.log`. The local launcher writes `.desktop/backend.log` and `.desktop/companion.log`; a manually started backend shows its messages in the console. Share only sanitized error text. Never share URLs containing access tokens, private environment contents or database connection strings. A disconnected API is not replaced with a synthetic price in market-data mode.
 
 If a free service sleeps, restart it through its normal dashboard/website request. Do not claim that uptime pings make a free plan suitable for continuous capture. Review [the deployment guide](DEPLOYMENT.md) before changing to paid resources.
