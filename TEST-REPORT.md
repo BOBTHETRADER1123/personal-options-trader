@@ -16,7 +16,9 @@
 
 ## External status and limits
 
-The user created the hosted owner account and opened its dashboard. Session state was verified before the outage. Neon has now exhausted its free monthly public network-transfer allowance. Hosted health/database probes are unavailable. Cloud-only records cannot currently be exported, and Excel archiving does not reset the allowance. No records were deleted. The online companion was stopped to avoid unsuccessful polling.
+The user created the hosted owner account and opened its dashboard. Session state was verified before the outage. The update at commit `7707832` is published: Vercel reports Ready, and Render deploy `dep-dbcs9emi0phs73fsg4qg` is Live. Its health endpoint responds with `database_ready: false`, confirming the app is running while the database remains unavailable after the Neon transfer-quota warning. Cloud-only records cannot currently be exported. Excel archiving does not reset the allowance. No records were deleted. The online companion was stopped to avoid unsuccessful polling.
+
+The local app was stopped safely, a private verified SQLite safety copy was saved, and the new local backend/companion were started. Four existing trades remain present and the effective recording mode is `summary`.
 
 The daily **4:00 pm IST** Google Drive heartbeat is configured in Codex. It depends on this laptop and Codex being available and backs up completed reports available locally. Google credentials are not installed into the trading application. This is not a continuously running cloud Drive service.
 
