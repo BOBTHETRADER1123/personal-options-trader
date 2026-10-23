@@ -1,6 +1,12 @@
 # Verification report — 23 October 2026
 
-**Current result: 185 automated tests passed** (178 backend/launcher tests and 7 VM scaffold tests, with 14 subtests) in 6.51 seconds using `.test-vm-mobile-release`; one upstream test-helper deprecation warning remains. TypeScript and the Vite production build passed. The user confirmed the installed **Laptop workspace** dashboard opens with the existing local account.
+**Current result: 187 automated tests passed** (180 backend/launcher tests and 7 VM scaffold tests, with 14 subtests) in 9.98 seconds using `.test-feed-selection-release`; one upstream test-helper deprecation warning remains. TypeScript and the Vite production build previously passed; no frontend source changed in this verification. The user confirmed the installed **Laptop workspace** dashboard opens with the existing local account.
+
+## Unattended position feed correction
+
+The feed manager no longer applies the configured watchlist a second time after the application has selected watched contracts plus open and pending trade legs. The second filter could exclude an active trade outside the watchlist, leaving it without streaming quotes when no option-chain page was refreshing it. Broker and demo filtering remain in place.
+
+Two isolated regression cases cover configured and empty watchlists: active and pending legs reach the adapter, while closed trades, closed legs and unused catalog entries stay excluded. The focused broker tests passed (30 tests), followed by the complete backend and VM suite above. The tests use a fake adapter and an isolated database; genuine broker connectivity and server deployment are not asserted by this result.
 
 ## Phone controls and persistent VM preparation
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import random
 
 from .base import FeedAuthenticationError, FeedProtocolError, utc_now
@@ -42,14 +41,14 @@ class FeedManager:
         if self._tasks:
             return
         self._stopping = False
-        # Only a chosen watchlist is subscribed. Do not silently subscribe the
-        # first N contracts and pretend the rest are covered.
-        watchlist = {s.strip() for s in os.environ.get("FEED_INSTRUMENT_IDS", "").split(",") if s.strip()}
+        # The caller supplies the bounded union of watched contracts and active
+        # trade legs. Filtering by the watchlist again would drop an unattended
+        # position as soon as its option-chain page is closed.
         for adapter in self._adapters:
             if not adapter.configured():
                 await self._status(adapter.broker, {"status": "not_configured", "detail": "Backend credentials required"})
                 continue
-            contracts = [r for r in instruments if r.get("broker") == adapter.broker and not r.get("demo") and (not watchlist or r["id"] in watchlist)]
+            contracts = [r for r in instruments if r.get("broker") == adapter.broker and not r.get("demo")]
             if not contracts:
                 await self._status(adapter.broker, {"status": "awaiting_instruments", "detail": "Import a current master and configure the feed watchlist"})
                 continue
