@@ -10,6 +10,8 @@ As of **22 October 2026**, the hosted owner account is created. **Neon's monthly
 
 Available laptop reports have been backed up and downloaded again for checksum verification in [Personal Options Trader Backups](https://drive.google.com/drive/folders/1CxpHsKBCJ8dxxNYbKAx6NMwEU9tojMn5). A daily **4:00 pm IST** Codex backup checks new completed reports when this laptop and Codex are available. Cloud-only records cannot be exported until database access returns. See [Google Drive backups](docs/GOOGLE-DRIVE-BACKUPS.md).
 
+**23 October laptop repair:** short SQLite write conflicts now retry on a fresh transaction without disabling the whole workspace. The user confirmed that the local dashboard opens. The installed app identifies itself as **Laptop workspace** at `http://127.0.0.1:8000`; the Vercel address identifies the separate **Online workspace**. The laptop launcher's readiness check now requires a usable database, not merely a running web server.
+
 ## Included workflows
 
 - Owner login, expiring server sessions, password hashing, optional TOTP, origin/CSRF checks, and a separate companion credential.

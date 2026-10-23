@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import io
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,17 @@ spec = importlib.util.spec_from_file_location(
 )
 launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
+
+
+@pytest.mark.parametrize('ready,expected', [(True, True), (False, False), (None, True)])
+def test_health_requires_database_readiness_when_reported(monkeypatch, ready, expected):
+    payload = {'mode': 'PAPER', 'live_orders_supported': False}
+    if ready is not None:
+        payload['database_ready'] = ready
+    class Response(io.StringIO):
+        status = 200
+    monkeypatch.setattr(launcher.urllib.request, 'urlopen', lambda *args, **kwargs: Response(json.dumps(payload)))
+    assert launcher.health() is expected
 
 
 @pytest.fixture

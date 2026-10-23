@@ -15,7 +15,9 @@ from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, delete
 from sqlalchemy.exc import SQLAlchemyError
-from .database import Base, engine as db_engine, SessionLocal, get_db, iso_now
+from .database import (Base, engine as db_engine, SessionLocal, get_db, iso_now,
+                       is_database_unavailable, is_sqlite_contention,
+                       run_transaction, sqlite_error_code)
 from .models import Owner, UserSession, SocketTicket, Trade, Event, Timeline, QuoteEvent, Setting, SchemaVersion, ActionRecord
 from .security import require_session, create_session, password_hash, verify_password, verify_totp, digest, rate_limit, validate_origin, session_from_cookie, COOKIE, ALLOWED_ORIGINS
 from .schemas import AuthInput, PasswordInput, TradeInput, ActionInput, SettingsInput, RiskInput
@@ -35,6 +37,13 @@ DATABASE_RETRY_SECONDS=60
 def database_unavailable():
     global database_ready
     database_ready=False
+
+def log_database_error(operation,error):
+    # SQLAlchemy exception strings contain SQL and bound values, including
+    # account/session data. Only diagnostic types and numeric SQLite codes belong
+    # in this log; the original exception is deliberately not interpolated.
+    log.warning('%s failed (error_type=%s, sqlite_code=%s, database_unavailable=%s).',
+                operation,type(error).__name__,sqlite_error_code(error),is_database_unavailable(error))
 
 async def wait_for_shutdown(seconds):
     try:await asyncio.wait_for(stop_event.wait(),timeout=seconds)
@@ -124,21 +133,26 @@ def seed_demo(db):
     db.commit()
 
 def process_quote_receipt(quote):
-    with SessionLocal() as db:
-        receipt_id=engine.record_quote(db,quote,process=False)
-        db.commit()  # Durable receipt precedes simulation/Excel processing.
-        if receipt_id is not None:
-            engine.revalue_quote(db,db.get(QuoteEvent,receipt_id));db.commit()
+    receipt_id=run_transaction(lambda db:engine.record_quote(db,quote,process=False),SessionLocal)
+    # Durable receipt precedes simulation/Excel processing. A valuation retry
+    # must replay this receipt, not receive the same quote a second time.
+    if receipt_id is not None:
+        run_transaction(lambda db:engine.revalue_quote(db,db.get(QuoteEvent,receipt_id)),SessionLocal)
 
 async def quote_received(quote):
-    async with write_lock:
-        await asyncio.to_thread(process_quote_receipt,quote)
+    try:
+        async with write_lock:
+            await asyncio.to_thread(process_quote_receipt,quote)
+    except SQLAlchemyError as error:
+        log_database_error('Quote processing',error)
+        if is_database_unavailable(error):database_unavailable()
+        raise
 
 async def status_received(broker,status):
     feed_status[broker]=status
 
 def capture_once():
-    with SessionLocal() as db:
+    def capture(db):
         engine.recover_pending_quotes(db)
         settings=engine.get_settings(db)
         if settings['demo_mode']:
@@ -150,7 +164,8 @@ def capture_once():
             for broker,instrument_id in needed:
                 contract=engine.contract_for(instrument_id,broker,True)
                 engine.record_quote(db,demo_quote(contract,broker))
-        engine.take_snapshots(db);db.commit()
+        engine.take_snapshots(db)
+    run_transaction(capture,SessionLocal)
 
 async def background_loop():
     while not stop_event.is_set() and database_ready:
@@ -158,10 +173,13 @@ async def background_loop():
             async with write_lock:
                 # Database latency must not prevent HTTP health checks or UI input.
                 await asyncio.to_thread(capture_once)
-        except SQLAlchemyError:
-            database_unavailable()
-            log.warning('Database capture unavailable; background activity paused until reconnection.')
-            return
+        except SQLAlchemyError as error:
+            log_database_error('Database capture',error)
+            if is_database_unavailable(error):
+                database_unavailable()
+                return
+            # A short local write conflict or one invalid statement must not
+            # turn a healthy workspace into a minute-long connection outage.
         except Exception:
             log.exception('Background capture failed; journal data retained. Feed/UI should be checked.')
         try:await asyncio.wait_for(stop_event.wait(),timeout=1)
@@ -185,8 +203,8 @@ async def try_initialize_database():
         with SessionLocal() as db:
             await refresh_selected_feeds(db,force=True)
     except SQLAlchemyError as exc:
-        database_unavailable()
-        log.warning('Database initialization unavailable (%s); retrying in %s seconds.',type(exc).__name__,DATABASE_RETRY_SECONDS)
+        if is_database_unavailable(exc):database_unavailable()
+        log_database_error('Database initialization',exc)
         return False
     database_ready=True
     return True
@@ -247,12 +265,18 @@ app.add_middleware(CORSMiddleware,allow_origins=ALLOWED_ORIGINS,allow_credential
 @app.middleware('http')
 async def security_headers(request,call_next):
     if request.url.path.startswith('/api/') and request.url.path!='/api/health' and not database_ready:
-        response=JSONResponse({'detail':'The cloud database is temporarily unavailable. Background activity is paused; saved records are retained. Try again after database access is restored.','database_ready':False},status_code=503,headers={'Retry-After':str(DATABASE_RETRY_SECONDS)})
+        response=JSONResponse({'detail':'The database is temporarily unavailable. Background activity is paused; saved records are retained. Try again after database access is restored.','database_ready':False},status_code=503,headers={'Retry-After':str(DATABASE_RETRY_SECONDS)})
     else:
         try:response=await call_next(request)
-        except SQLAlchemyError:
-            database_unavailable()
-            response=JSONResponse({'detail':'The database connection is temporarily unavailable. Background activity is paused; saved records are retained.','database_ready':False},status_code=503,headers={'Retry-After':str(DATABASE_RETRY_SECONDS)})
+        except SQLAlchemyError as error:
+            log_database_error('API database operation',error)
+            if is_database_unavailable(error):
+                database_unavailable()
+                response=JSONResponse({'detail':'The database connection is temporarily unavailable. Background activity is paused; saved records are retained.','database_ready':False},status_code=503,headers={'Retry-After':str(DATABASE_RETRY_SECONDS)})
+            elif is_sqlite_contention(error):
+                response=JSONResponse({'detail':'Another local save is completing. Please retry this action.','database_ready':True},status_code=503,headers={'Retry-After':'1'})
+            else:
+                response=JSONResponse({'detail':'This database operation could not be completed. Saved records are retained; please review the action or contact support.'},status_code=500)
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['X-Frame-Options']='DENY'
     response.headers['Referrer-Policy']='no-referrer'
@@ -414,6 +438,10 @@ async def websocket(ws:WebSocket):
             await asyncio.sleep(1)
         await ws.close(code=4401)
     except (WebSocketDisconnect,RuntimeError):pass
+    except SQLAlchemyError as error:
+        log_database_error('Workspace stream',error)
+        if is_database_unavailable(error):database_unavailable()
+        with suppress(RuntimeError):await ws.close(code=1013)
 
 # Reporting tables are imported before lifespan's create_all and share the same journal.
 from .companion_api import router_browser,router_companion

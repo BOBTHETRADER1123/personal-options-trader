@@ -20,6 +20,8 @@ Render's free backend can sleep or restart. An initial visit may take longer whi
 
 Your local practice app, account and data are retained. Double-click the **Personal Options Trader** shortcut on your desktop, or **Open-Trading-App.cmd** in the project folder. It opens [your local app](http://127.0.0.1:8000), starts the local backend and report companion in the background, and reuses your existing settings. Sign in with the local password you already created.
 
+Check that the page says **Laptop workspace**. If its address ends in `vercel.app`, you are using the separate online workspace. The local connection error caused by competing price/report writes was repaired on 23 October; refresh the local page after starting the app. Your local records and password were preserved.
+
 You can close the browser and reopen the shortcut later. The services continue running while the laptop is awake. When you want to stop the app and companion, double-click **Stop-Trading-App.cmd** in the project folder. Your saved records stay in place.
 
 Local practice works separately from the hosted workspace; its trades do not automatically appear online. Keep the whole **personal-options-trader** folder together. Do not move individual files out of it. Both desktop shortcuts point to this folder.

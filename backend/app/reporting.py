@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import JSON, Boolean, Integer, LargeBinary, String, Text, func, or_, select, update
 from sqlalchemy.orm import Mapped, Session, mapped_column, defer
 
-from .database import Base, SessionLocal
+from .database import Base, SessionLocal, run_transaction
 
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -597,12 +597,15 @@ def reconciliation(db: Session) -> dict[str, Any]:
 
 
 def save_daily_reconciliation(session_factory=SessionLocal) -> dict[str, Any]:
-    with session_factory() as db:
+    def save(db):
         report = reconciliation(db)
         row = db.get(DailyExportReconciliation, report["date"])
         if row is None:
             db.add(DailyExportReconciliation(date=report["date"], generated_at=report["generated_at"], data=report))
         else:
             row.generated_at, row.data = report["generated_at"], report
-        db.commit()
         return report
+    # Report generation and companion acknowledgements can commit between the
+    # summary read and its daily-row write. A new WAL snapshot must recompute
+    # the report, rather than retrying an UPDATE based on stale counts.
+    return run_transaction(save, session_factory)

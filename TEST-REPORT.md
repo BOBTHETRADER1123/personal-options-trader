@@ -1,4 +1,21 @@
-# Verification report — 22 October 2026
+# Verification report — 23 October 2026
+
+**Current result: 178 automated tests passed** in 6.13 seconds using `.test-local-final-recovery`; one upstream test-helper deprecation warning remains. TypeScript and the Vite production build passed. The user confirmed the installed **Laptop workspace** dashboard opens with the existing local account.
+
+## Local connection repair
+
+The local application was incorrectly treating brief SQLite write conflicts as a disconnected database, returning 503 for every API route. Capture and daily reconciliation now retry the complete transaction on a fresh Session with bounded backoff. Extended SQLite BUSY/LOCKED codes, including a real WAL snapshot error 517, are tested. Integrity and statement failures remain local to the failed action; genuine connection/storage failures still pause workers. Receipt commit and valuation retry remain separate to prevent receiving a quote twice. Safe diagnostics omit SQL and bound account/session values.
+
+The desktop launcher now requires reported database readiness. The website labels its separate Laptop and Online workspaces and no longer implies a laptop password automatically belongs to the online account.
+
+- The installed backend and Excel companion ran together during a 75-second probe: **74 health checks and 74 session checks passed**, with zero failures and the existing owner retained.
+- An isolated 65-second runtime test exercised 742 successful API reads and saved/reopened compact reports. It exposed additional contention in daily reconciliation; that write now uses the same transaction retry helper.
+- The affected-path repeat after the final fix passed **235 API requests and 34 concurrent reconciliation writes, with zero errors**. A sample BUY trade was opened and closed; two generated compact workbooks were saved, reopened, checksum-verified and acknowledged by an isolated companion. Pending quote receipts and raw quote history remained zero.
+- Temporary test processes were stopped. All runtime test databases, owner credentials and report folders were isolated from the user's actual records. A fresh private SQLite safety backup was retained before applying the repair.
+
+The online workspace still depends on restoring Neon's exhausted allowance. This local SQLite repair does not change the online database plan or quota.
+
+## Prior verification — 22 October 2026
 
 **164 automated tests passed** in 5.46 seconds using `.test-final-summary-drive-verified`. One upstream Starlette/httpx deprecation warning remains. Strict TypeScript compilation and the Vite production build passed. No real broker order was placed and no paid plan was selected.
 

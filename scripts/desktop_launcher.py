@@ -69,7 +69,9 @@ def health():
     try:
         with urllib.request.urlopen(URL + '/api/health', timeout=2) as response:
             data = json.load(response)
-            return response.status == 200 and data.get('mode') == 'PAPER' and data.get('live_orders_supported') is False
+            return (response.status == 200 and data.get('mode') == 'PAPER'
+                    and data.get('live_orders_supported') is False
+                    and data.get('database_ready', True) is True)
     except (OSError, ValueError, urllib.error.URLError):
         return False
 

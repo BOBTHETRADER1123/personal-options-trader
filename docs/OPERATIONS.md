@@ -20,6 +20,12 @@ The companion owns laptop filesystem writes. It must be running on an awake lapt
 
 Use exactly one backend worker/instance for this personal deployment. The application serializes paper actions and quote processing. Running multiple replicas without a distributed feed-owner lease can create duplicate subscriptions and is outside the included deployment configuration.
 
+### Local SQLite write contention
+
+The 23 October repair distinguishes brief SQLite BUSY/LOCKED conflicts (including WAL snapshot code 517) from an unavailable database. Capture and daily reconciliation retry the whole transaction on a fresh Session with bounded backoff. Quote receipt and valuation commits remain separate, so retrying valuation does not receive the same quote twice. Exhausted contention can return a short retry response for that operation; it does not put every route into a minute-long outage. Integrity/statement failures stay local to the failed operation. Real connection/storage failures still pause workers.
+
+Diagnostics include only the exception class and numeric SQLite code, avoiding SQL parameters. The desktop launcher checks reported database readiness. Pages identify **Laptop workspace** or **Online workspace** so the local SQLite service can be distinguished from the Neon-backed deployment.
+
 ## Back up local records
 
 1. Open the main project folder and double-click **Backup-Local.cmd**.
