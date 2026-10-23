@@ -6,8 +6,11 @@ import json
 
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT.parent/'PersonalOptionsTrader-Source.zip'
-TOP={'.gitignore','.env.example','.python-version','pytest.ini','render.yaml','README.md','START-HERE.md','TEST-REPORT.md'}
+TOP={'.gitignore','.gitattributes','.env.example','.python-version','pytest.ini','render.yaml','README.md','START-HERE.md','TEST-REPORT.md'}
 FRONT={'package.json','pnpm-lock.yaml','pnpm-workspace.yaml','tsconfig.json','vite.config.ts','index.html','vercel.json','.env.example'}
+VM={'install.sh','configure.py','Caddyfile.template','app.env.example','personal-options-trader.service',
+    'personal-options-trader-proxy.service','personal-options-trader-backup.service',
+    'personal-options-trader-backup.timer','backup_daily.py','test_vm_deploy.py'}
 
 def allowed(path):
     parts=path.relative_to(ROOT).parts
@@ -20,6 +23,7 @@ def allowed(path):
     if parts[0]=='companion':return len(parts)==2 and (name.endswith(('.py','.bat','.txt')) or name=='.env.example')
     if parts[0]=='docs':return name.endswith(('.md','.txt','.png','.svg'))
     if parts[0]=='scripts':return len(parts)==2 and name.endswith('.py')
+    if parts[0]=='deploy':return len(parts)==3 and parts[1]=='vm' and name in VM
     return False
 
 def main():

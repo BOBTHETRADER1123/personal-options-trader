@@ -12,6 +12,8 @@ Available laptop reports have been backed up and downloaded again for checksum v
 
 **23 October laptop repair:** short SQLite write conflicts now retry on a fresh transaction without disabling the whole workspace. The user confirmed that the local dashboard opens. The installed app identifies itself as **Laptop workspace** at `http://127.0.0.1:8000`; the Vercel address identifies the separate **Online workspace**. The laptop launcher's readiness check now requires a usable database, not merely a running web server.
 
+**Free cloud migration being prepared:** a persistent VM can run both this app and SQLite while the laptop is off. The [free cloud hosting guide](docs/FREE-CLOUD-HOSTING.md) describes the proposed setup and free-tier limits. No replacement server has been provisioned yet; Oracle account signup and free compute availability still need verification. The current Vercel/Render/Neon deployment is unchanged.
+
 ## Included workflows
 
 - Owner login, expiring server sessions, password hashing, optional TOTP, origin/CSRF checks, and a separate companion credential.

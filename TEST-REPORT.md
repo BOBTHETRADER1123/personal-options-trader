@@ -1,6 +1,14 @@
 # Verification report — 23 October 2026
 
-**Current result: 178 automated tests passed** in 6.13 seconds using `.test-local-final-recovery`; one upstream test-helper deprecation warning remains. TypeScript and the Vite production build passed. The user confirmed the installed **Laptop workspace** dashboard opens with the existing local account.
+**Current result: 185 automated tests passed** (178 backend/launcher tests and 7 VM scaffold tests, with 14 subtests) in 6.51 seconds using `.test-vm-mobile-release`; one upstream test-helper deprecation warning remains. TypeScript and the Vite production build passed. The user confirmed the installed **Laptop workspace** dashboard opens with the existing local account.
+
+## Phone controls and persistent VM preparation
+
+Narrow phone confirmation dialogs now stack full-width buttons; option-chain Buy/Sell controls use 44 px touch targets on narrow or coarse-pointer screens. Existing paper-trade create/close flows remain in place. This was verified by source review and the production build; physical-phone trading still requires a working hosted backend and has not been claimed complete.
+
+The Ubuntu 24.04 VM scaffold keeps SQLite outside the release directory, uses an unprivileged single worker behind HTTPS, preserves private configuration and archives, and requires explicit service activation. Seven temporary-file tests cover unsafe hostnames/paths, private-file staging, non-overwriting writes, production settings, backup limits and activation constraints. Python compilation, Bash syntax and diff checks passed. No installer, VM, firewall rule, cloud account or paid resource was created. Real Ubuntu operation, certificates, data migration, restart recovery and phone access remain to be verified on the selected host.
+
+An isolated catalog benchmark used 126,432 synthetic contracts across 434 underlyings with the actual parser/writer: about 339 MiB peak process memory and 158 MiB after selecting bounded chains. It accessed no user database or network. Windows measurements exclude the complete app, Linux and proxy; 1 GB is a plausible starting VM size, not a proven production guarantee.
 
 ## Local connection repair
 

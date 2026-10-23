@@ -1,0 +1,25 @@
+[Unit]
+Description=Create one verified private Personal Options Trader SQLite backup
+After=personal-options-trader.service
+
+[Service]
+Type=oneshot
+User=personal-options-trader
+Group=personal-options-trader
+WorkingDirectory=/opt/personal-options-trader/current
+EnvironmentFile=/etc/personal-options-trader/app.env
+Environment=PYTHON_DOTENV_DISABLED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/personal-options-trader/current/.venv/bin/python /opt/personal-options-trader/current/deploy/vm/backup_daily.py
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/personal-options-trader
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
