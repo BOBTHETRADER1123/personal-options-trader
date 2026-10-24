@@ -7,6 +7,7 @@ resolved by the imported master instead of waiting for symbol acknowledgments.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 
@@ -30,7 +31,7 @@ def parse_sfeed(message, contracts: dict, *, received_at=None, received_ns=None)
                             received_ns=received_ns, bid=bid, ask=ask,
                             volume=row.get("volume_traded_today"), open_interest=row.get("open_interest"),
                             exchange_timestamp=epoch_timestamp(row.get("last_update_time") or row.get("last_trade_time")),
-                            sequence=None, event_kind=f"sfeed_{row['type']}", raw_message=row)
+                            previous_close=row.get("close_price"), sequence=None, event_kind=f"sfeed_{row['type']}", raw_message=row)
 
 
 class KotakFeed(ReadOnlyFeed):
@@ -43,8 +44,15 @@ class KotakFeed(ReadOnlyFeed):
 
     async def stream(self, contracts):
         try:
+            # Raw SDK authentication errors can include response bodies. The
+            # app emits fixed sanitized states instead of SDK request traces.
+            os.environ["NEO_LOG_LEVEL"] = "NOLOG"
+            os.environ["NEO_LOG_FILE_ENABLED"] = "false"
             from neo_api_client import NeoAPI
+            from neo_api_client.logger import setup_logging
             from neo_api_client.websocket.feed import SFeedWebSocket, WsToken
+            from neo_api_client.websocket.feed.exceptions import AuthenticationError, SubscriptionError
+            setup_logging(level="NOLOG", file_enabled=False)
         except ImportError as exc:
             raise FeedProtocolError("Install backend/requirements-brokers.txt to enable Kotak SFeed") from exc
         if len(contracts) > 3000:
@@ -52,7 +60,7 @@ class KotakFeed(ReadOnlyFeed):
         mapping = {(r["segment"], str(r["token"])): r for r in contracts}
         if os.environ.get("KOTAK_SID"):
             ws = SFeedWebSocket(user=os.environ["KOTAK_UCC"], auth=os.environ["KOTAK_SID"],
-                               ack_wait_timeout=0, max_reconnect_attempts=5)
+                               ack_wait_timeout=0, max_reconnect_attempts=0, max_connect_retries=0)
         else:
             totp = os.environ.get("KOTAK_TOTP")
             if os.environ.get("KOTAK_TOTP_SECRET"):
@@ -63,15 +71,30 @@ class KotakFeed(ReadOnlyFeed):
                 await asyncio.to_thread(client.totp_login, mobile_number=os.environ["KOTAK_MOBILE_NUMBER"],
                                         ucc=os.environ["KOTAK_UCC"], totp=totp)
                 await asyncio.to_thread(client.totp_validate, mpin=os.environ["KOTAK_MPIN"])
+                if not getattr(client.configuration, "edit_sid", None):
+                    raise ValueError("Authentication did not establish a valid session")
             except Exception as exc:
                 # SDK exceptions can contain login responses. Surface a fixed
                 # explanation instead of returning secrets to the dashboard.
                 raise FeedAuthenticationError("Kotak TOTP login failed; refresh the daily TOTP/session on the backend") from None
-            ws = client.create_websocket(ack_wait_timeout=0, max_reconnect_attempts=5)
-        async with ws:
-            await ws.subscribe_depth([WsToken(r["segment"], str(r["token"])) for r in contracts])
-            await self.status("connected", f"SFeed subscribed to {len(contracts)} contracts; awaiting actual quotes", subscriptions=len(contracts))
-            async for message in ws:
-                quote = parse_sfeed(message, mapping, received_at=utc_now(), received_ns=time.time_ns())
-                if quote:
-                    await self.on_quote(quote)
+            ws = client.create_websocket(ack_wait_timeout=0, max_reconnect_attempts=0, max_connect_retries=0)
+        tokens = [WsToken(r["segment"], str(r["token"])) for r in contracts]
+        try:
+            async with ws:
+                await ws.subscribe_depth(tokens)
+                await self.status("connected", f"SFeed subscribed to {len(contracts)} contracts; awaiting actual quotes", subscriptions=len(contracts))
+                try:
+                    async for message in ws:
+                        quote = parse_sfeed(message, mapping, received_at=utc_now(), received_ns=time.time_ns())
+                        if quote:
+                            await self.on_quote(quote)
+                finally:
+                    # Best effort unsubscribe on shutdown/reconfiguration. A
+                    # closed socket removes its subscriptions at the broker.
+                    with contextlib.suppress(Exception):
+                        async with asyncio.timeout(2):
+                            await ws.unsubscribe_depth(tokens)
+        except AuthenticationError:
+            raise FeedAuthenticationError("Kotak SFeed session rejected; renew the daily TOTP/session on the backend") from None
+        except SubscriptionError:
+            raise FeedProtocolError("Kotak rejected SFeed subscriptions; verify token master, permissions and 3000-token limit") from None

@@ -19,10 +19,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-BROKERS = ("dhan", "kotak", "fivepaisa")
+BROKERS = ("kotak", "fivepaisa")
+LEGACY_BROKERS = ("dhan",)
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_PATH = Path(__file__).resolve().parents[1] / "data" / "instruments.json"
-DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 FIVEPAISA_MASTER_URL = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/all"
 
 
@@ -74,21 +74,7 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     if broker not in BROKERS:
         raise ValueError("Unknown broker")
     row = {str(key).strip().rstrip(";"): value for key, value in row.items()}
-    if broker == "dhan":
-        raw_segment = _pick(row, "SEGMENT", "SEM_SEGMENT")
-        if raw_segment and raw_segment not in {"D", "M"}:
-            raise ValueError("Unsupported derivative segment")
-        token = _pick(row, "SECURITY_ID", "SEM_SMST_SECURITY_ID", "token")
-        exchange = _pick(row, "EXCH_ID", "SEM_EXM_EXCH_ID", "exchange").upper()
-        segment = {"NSE": "NSE_FNO", "BSE": "BSE_FNO", "MCX": "MCX_COMM"}.get(exchange, "")
-        symbol = _pick(row, "DISPLAY_NAME", "SEM_CUSTOM_SYMBOL", "SEM_TRADING_SYMBOL", "SYMBOL_NAME", "symbol")
-        underlying = _pick(row, "UNDERLYING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME", "underlying")
-        expiry = _pick(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE", "expiry")
-        strike = _pick(row, "STRIKE_PRICE", "SEM_STRIKE_PRICE", "strike")
-        option_type = _pick(row, "OPTION_TYPE", "SEM_OPTION_TYPE", "option_type")
-        lot = _pick(row, "LOT_SIZE", "SEM_LOT_UNITS", "lot_size")
-        tick = _pick(row, "TICK_SIZE", "SEM_TICK_SIZE", "tick_size", default="0.05")
-    elif broker == "fivepaisa":
+    if broker == "fivepaisa":
         token = _pick(row, "ScripCode", "token")
         exchange = {"N": "NSE", "B": "BSE", "M": "MCX"}.get(_pick(row, "Exch"), _pick(row, "exchange"))
         segment = _pick(row, "ExchType", "segment", default="D")
@@ -118,21 +104,27 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
         lot = _pick(row, "lLotSize", "lot_size")
         tick = _pick(row, "dTickSize", "tick_size", default="0.05")
     option_type = option_type.upper()
-    if option_type not in {"CE", "PE"}:
+    # Both official masters use XX for futures in derivative segments. An
+    # explicit FUT in the normalized template is supported as well; cash XX
+    # rows cannot pass the derivative-segment validation below.
+    if option_type in {"XX", "FUT"}:
+        option_type = "FUT"
+    if option_type not in {"CE", "PE", "FUT"}:
         raise ValueError("Not an option contract")
     if not token or not symbol or not underlying or not segment or exchange not in {"NSE", "BSE", "MCX"}:
         raise ValueError("Missing token, symbol, underlying, exchange or segment")
-    allowed_segments = ({"NSE_FNO", "BSE_FNO", "MCX_COMM"} if broker == "dhan" else
-                        {"nse_fo", "bse_fo", "mcx_fo"} if broker == "kotak" else {"D"})
+    allowed_segments = ({"nse_fo", "bse_fo", "mcx_fo"} if broker == "kotak" else {"D"})
     if segment not in allowed_segments:
         raise ValueError("Unsupported derivative segment")
     if not str(token).isdigit():
         raise ValueError("Option token must be a numeric broker-master identifier")
-    parsed_expiry, parsed_strike, parsed_lot = _date(expiry), _positive(strike), _positive(lot, True)
+    parsed_expiry = _date(expiry)
+    parsed_strike = 0.0 if option_type == "FUT" else _positive(strike)
+    parsed_lot = _positive(lot, True)
     # Transformed-v1 strike/expiry schemas can differ across broker releases.
     # Values must be native human-price/ISO fields or explicitly normalized by
     # the operator. Never silently apply an assumed /100 or epoch-origin shift.
-    contract_id = f"{broker}:{segment}:{token}"
+    contract_id = f"{broker}:{exchange}:{segment}:{token}" if broker == "fivepaisa" else f"{broker}:{segment}:{token}"
     # A commodity's broker order quantity may differ from the monetary value
     # of one quoted price point. Only explicitly supplied master information
     # can authorize this conversion; no commodity-specific mapping is guessed.
@@ -141,7 +133,7 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     return {"id": contract_id, "instrument_id": contract_id, "broker": broker,
             "token": str(token), "symbol": symbol, "underlying": _underlying(underlying),
             "exchange": exchange, "segment": segment, "expiry": parsed_expiry,
-            "strike": parsed_strike, "option_type": option_type, "lot_size": parsed_lot,
+            "strike": parsed_strike, "option_type": option_type, "instrument_type": "future" if option_type == "FUT" else "option", "lot_size": parsed_lot,
             "tick_size": _positive(tick), "price_multiplier": price_multiplier,
             "multiplier_verified": price_multiplier is not None,
             "demo": False, "source": "broker_master",
@@ -167,9 +159,7 @@ def demo_contracts(today: date | None = None) -> list[dict]:
                     intrinsic = max(0, (spot - strike) * (1 if option_type == "CE" else -1))
                     price = round(intrinsic + max(step * 0.2, step * 2.8 - abs(offset) * step * 0.18), 2)
                     for broker in BROKERS:
-                        segment = ({"NSE": "NSE_FNO", "BSE": "BSE_FNO", "MCX": "MCX_COMM"}[exchange]
-                                   if broker == "dhan" else
-                                   {"NSE": "nse_fo", "BSE": "bse_fo", "MCX": "mcx_fo"}[exchange]
+                        segment = ({"NSE": "nse_fo", "BSE": "bse_fo", "MCX": "mcx_fo"}[exchange]
                                    if broker == "kotak" else "D")
                         results.append({"id": identifier, "instrument_id": identifier, "broker": broker,
                                         "token": "DEMO", "symbol": f"{underlying} {expiry} {strike} {option_type}",
@@ -179,44 +169,64 @@ def demo_contracts(today: date | None = None) -> list[dict]:
                                         "source": "synthetic_demo", "spot": spot, "base_price": price,
                                         "price_multiplier": 1.0, "multiplier_verified": True,
                                         "ltp": price})
+    for underlying, exchange, spot, step, lot in specs:
+        for expiry in expiries:
+            for broker in BROKERS:
+                identifier = f"DEMO:{underlying}:{expiry}:0:FUT"
+                segment = {"NSE": "nse_fo", "BSE": "bse_fo", "MCX": "mcx_fo"}[exchange] if broker == "kotak" else "D"
+                results.append({"id": identifier, "instrument_id": identifier, "broker": broker, "token": "DEMO",
+                                "symbol": f"{underlying} {expiry} FUT", "underlying": underlying, "exchange": exchange,
+                                "segment": segment, "expiry": expiry, "strike": 0.0, "option_type": "FUT", "instrument_type": "future",
+                                "lot_size": lot, "tick_size": .05, "demo": True, "source": "synthetic_demo", "spot": spot,
+                                "base_price": float(spot), "price_multiplier": 1.0, "multiplier_verified": True, "ltp": float(spot)})
     return results
 
 
 class ContractCatalog:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path or os.environ.get("INSTRUMENT_MASTER_PATH", DEFAULT_PATH))
+        self.revision = 0
         self._live: list[dict] = []
         self.error: str | None = None
         self._demo = demo_contracts()
         self.reload()
 
     def reload(self):
-        self._live = []
+        pending = []
         self.error = None
         if not self.path.exists():
+            self._live = []
+            self.revision += 1
             return
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             rows = payload.get("instruments", []) if isinstance(payload, dict) else payload
             for row in rows:
+                if isinstance(row, dict) and row.get("broker") in LEGACY_BROKERS:
+                    continue  # Saved history remains in SQL; legacy feeds cannot be reactivated.
                 if not isinstance(row, dict) or row.get("demo") or row.get("broker") not in BROKERS:
                     raise ValueError("Invalid master record")
                 for key in ("id", "token", "symbol", "underlying", "exchange", "segment", "expiry", "strike", "option_type", "lot_size"):
                     if key not in row:
                         raise ValueError(f"Master record missing {key}")
                 _positive(row["lot_size"], True)
-                _positive(row["strike"])
+                if row["option_type"] != "FUT":
+                    _positive(row["strike"])
                 _date(row["expiry"])
-                if row["option_type"] not in {"CE", "PE"} or row["exchange"] not in {"NSE", "BSE", "MCX"}:
+                if row["option_type"] not in {"CE", "PE", "FUT"} or row["exchange"] not in {"NSE", "BSE", "MCX"}:
                     raise ValueError("Invalid option type or exchange")
                 if str(row["id"]).startswith("DEMO:"):
                     raise ValueError("Live masters cannot contain demo identifiers")
                 if row.get("price_multiplier") is not None:
                     _positive(row["price_multiplier"])
-                self._live.append(row)
+                pending.append(row)
         except (OSError, ValueError, TypeError, KeyError) as exc:
-            self._live = []
             self.error = f"Instrument master not loaded: {type(exc).__name__}"
+
+        else:
+            self._live = pending
+        finally:
+            self.revision += 1
 
     def restore_demo_contracts(self, trades: list[dict]) -> int:
         """Retain unexpired sample contracts after the startup date changes.
@@ -242,15 +252,14 @@ class ContractCatalog:
                     prefix, underlying, expiry, id_strike, option_type = identifier.split(":")
                     if expiry != _date(leg["expiry"]) or expiry < today:
                         continue
-                    if underlying != leg["underlying"] or option_type != leg["option_type"] or option_type not in {"CE", "PE"}:
+                    if underlying != leg["underlying"] or option_type != leg["option_type"] or option_type not in {"CE", "PE", "FUT"}:
                         continue
-                    strike = _positive(leg["strike"])
+                    strike = 0.0 if option_type == "FUT" and float(leg["strike"]) == 0 else _positive(leg["strike"])
                     if float(id_strike) != strike or leg.get("token", "DEMO") != "DEMO":
                         continue
                     lot_size = _positive(leg["lot_size"], True)
                     exchange = leg["exchange"]
-                    segments = ({"NSE": "NSE_FNO", "BSE": "BSE_FNO", "MCX": "MCX_COMM"} if broker == "dhan" else
-                                {"NSE": "nse_fo", "BSE": "bse_fo", "MCX": "mcx_fo"} if broker == "kotak" else
+                    segments = ({"NSE": "nse_fo", "BSE": "bse_fo", "MCX": "mcx_fo"} if broker == "kotak" else
                                 {"NSE": "D", "BSE": "D", "MCX": "D"})
                     segment = segments[exchange]
                     if leg.get("segment", segment) != segment:
@@ -293,6 +302,7 @@ class ContractCatalog:
                 raise ValueError('Only verified broker-master contracts may enter the live catalog.')
             current[(contract['id'], contract['broker'])] = dict(contract)
         self._live = list(current.values())
+        self.revision += 1
         return len(contracts)
 
     def select_chain_contracts(self, contracts: list[dict], active_ids: set[str]) -> int:
@@ -314,7 +324,7 @@ class ContractCatalog:
         contracts = []
         required = {'id','broker','token','underlying','exchange','segment','symbol','expiry','strike','option_type','lot_size'}
         for trade in trades:
-            if trade.get('demo') is not False or trade.get('status') not in {'open','pending'}:
+            if trade.get('broker') not in BROKERS or trade.get('demo') is not False or trade.get('status') not in {'open','pending'}:
                 continue
             for leg in trade.get('legs', []):
                 if leg.get('status') not in {'open','pending'} or leg.get('demo') is not False:
@@ -353,6 +363,8 @@ def get_contract(instrument_id, broker=None):
 
 
 def import_master(broker: str, csv_text: str, destination: Path, segment: str | None = None) -> dict:
+    if broker not in BROKERS:
+        raise ValueError("Only Kotak Neo and 5paisa masters are supported")
     rows, rejected, non_options = [], [], 0
     for number, raw in enumerate(csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff"))), 2):
         try:
@@ -379,7 +391,7 @@ def import_master(broker: str, csv_text: str, destination: Path, segment: str | 
     return {"imported": len(rows), "ignored_non_options": non_options, "path": str(destination)}
 
 
-def market_session(exchange: str, at: datetime | None = None, commodity_category: str = "non_agri") -> dict:
+def market_session(exchange: str, at: datetime | None = None, commodity_category: str = "non_agri", *, underlying: str | None = None, segment: str | None = None) -> dict:
     """Session calendar from an operator-maintained exchange-calendar JSON.
 
     A weekday schedule alone is not claimed to be an exchange-open signal.
@@ -392,7 +404,15 @@ def market_session(exchange: str, at: datetime | None = None, commodity_category
               "status": "unknown", "source": "calendar_not_configured", "intervals": [],
               "note": "Configure exchange holiday/session calendar; feed freshness is measured separately."}
     if not path:
-        return result
+        from .scheduler import ExchangeCalendar
+        moment = at or datetime.now(timezone.utc)
+        contract = {"exchange": exchange, "segment": segment or {"NSE": "nse_fo", "BSE": "bse_fo", "MCX": "mcx_fo"}.get(exchange, ""),
+                    "underlying": underlying or (commodity_category if commodity_category != "non_agri" else "")}
+        calendar = ExchangeCalendar()
+        state = calendar.state(contract, moment)
+        return {**result, "status": "open" if state["known"] and state["open"] else "closed" if state["known"] else "unknown",
+                "source": "verified_exchange_calendar" if state["known"] else "calendar_not_configured",
+                "note": state["reason"], "sources": state.get("sources", []), "verified_at": state.get("verified_at")}
     try:
         calendar = json.loads(Path(path).read_text(encoding="utf-8"))
         key = f"{exchange}:{commodity_category}" if exchange == "MCX" else exchange
@@ -412,7 +432,7 @@ def main():
     parser = argparse.ArgumentParser(description="Import fresh broker option masters; no trading APIs are called.")
     parser.add_argument("broker", choices=BROKERS)
     parser.add_argument("--csv", type=Path, help="Native broker CSV or normalized CSV")
-    parser.add_argument("--download", action="store_true", help="Download current official Dhan/5paisa master")
+    parser.add_argument("--download", action="store_true", help="Download current official Kotak/5paisa master")
     parser.add_argument("--segment", help="Kotak segment, e.g. nse_fo, bse_fo or mcx_fo")
     parser.add_argument("--output", type=Path, default=Path(os.environ.get("INSTRUMENT_MASTER_PATH", DEFAULT_PATH)))
     args = parser.parse_args()
@@ -429,7 +449,7 @@ def main():
             if not isinstance(url, str) or not url.startswith("https://"):
                 raise ValueError("Broker did not return an HTTPS CSV URL")
         else:
-            url = DHAN_MASTER_URL if args.broker == "dhan" else FIVEPAISA_MASTER_URL
+            url = FIVEPAISA_MASTER_URL
         with urllib.request.urlopen(url, timeout=90) as response:
             text = response.read(50_000_001).decode("utf-8-sig")
             if len(text) > 50_000_000:

@@ -9,21 +9,26 @@ import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select, delete
 from sqlalchemy.exc import SQLAlchemyError
 from .database import (Base, engine as db_engine, SessionLocal, get_db, iso_now,
                        is_database_unavailable, is_sqlite_contention,
                        run_transaction, sqlite_error_code)
-from .models import Owner, UserSession, SocketTicket, Trade, Event, Timeline, QuoteEvent, Setting, SchemaVersion, ActionRecord
+from .models import Owner, UserSession, SocketTicket, Trade, Event, Timeline, QuoteEvent, Setting, SchemaVersion, ActionRecord, PnlSnapshot, RecordingGap
 from .security import require_session, create_session, password_hash, verify_password, verify_totp, digest, rate_limit, validate_origin, session_from_cookie, COOKIE, ALLOWED_ORIGINS
 from .schemas import AuthInput, PasswordInput, TradeInput, ActionInput, SettingsInput, RiskInput
 from . import engine
 from .payoff import strategy_risk
+from .scheduler import CollectorLease, ExchangeCalendar, guard_lease
+from . import cloud_backup, resource_health, maintenance, reporting, daily_reports, sheets_sync
+from pydantic import BaseModel, ConfigDict, Field
 
+from .log_safety import install as install_safe_logs
+install_safe_logs()
 log=logging.getLogger('personal_options_trader')
 write_lock=asyncio.Lock()
 stop_event=asyncio.Event()
@@ -33,6 +38,44 @@ catalog=None
 _feed_contract_ids=None
 database_ready=True
 DATABASE_RETRY_SECONDS=60
+collector_lease=None
+exchange_calendar=None
+cloud_service=None
+resource_monitor=None
+daily_service=None
+sheets_service=None
+_active_positions=[]
+_activity_until=0.0
+_viewers=0
+_started_at=time.monotonic()
+_last_database_write=None
+_recording_status={}
+_runtime_settings={}
+
+def touch_activity():
+    global _activity_until
+    _activity_until=time.monotonic()+30
+
+def update_demand(db):
+    global _active_positions,_runtime_settings
+    _active_positions=[t for t in engine.trade_records(db) if t['status'] in ('open','pending')]
+    _runtime_settings=engine.get_settings(db)
+
+def recording_needed():
+    now=datetime.now(timezone.utc)
+    for trade in _active_positions:
+        if trade.get('demo'):return True
+        if exchange_calendar and any(exchange_calendar.state(leg,now)['open'] for leg in trade.get('legs',[]) if leg.get('status') in ('open','pending')):return True
+    return False
+
+async def ensure_writer(db):
+    # SQLite remains the existing one-process laptop workspace. PostgreSQL
+    # deployments fence mutations as well as capture during a rolling handover.
+    if collector_lease and db.get_bind().dialect.name=='postgresql':
+        if collector_lease.token is None and not await asyncio.to_thread(collector_lease.renew):
+            raise HTTPException(503,'The backend is completing a collector handover. Retry this action shortly.')
+        if not await asyncio.to_thread(guard_lease,db,collector_lease.token):
+            raise HTTPException(503,'Collector ownership changed. Retry this action shortly.')
 
 def database_unavailable():
     global database_ready
@@ -51,15 +94,20 @@ async def wait_for_shutdown(seconds):
 
 def selected_feed_contracts(db):
     wanted={s.strip() for s in os.getenv('FEED_INSTRUMENT_IDS','').split(',') if s.strip()}
+    wanted.update(option_chain.requested_contract_ids())
     for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
         if row.data.get('demo') is False:
             wanted.update(l['instrument_id'] for l in row.data.get('legs',[]) if l.get('status') in {'open','pending'})
-    return [c for c in catalog.all(demo=False) if c['id'] in wanted]
+    return [c for c in catalog.all(demo=False) if c['id'] in wanted and c.get('broker') in engine.BROKERS]
 
 async def refresh_selected_feeds(db,force=False):
     global _feed_contract_ids
     if feed_manager is None:return
-    contracts=selected_feed_contracts(db)
+    if collector_lease and collector_lease.token is None:return
+    contracts=await asyncio.to_thread(selected_feed_contracts,db)
+    if exchange_calendar:
+        now=datetime.now(timezone.utc)
+        contracts=[c for c in contracts if exchange_calendar.state(c,now)['open']]
     identities=frozenset((c['id'],c['broker']) for c in contracts)
     if force or identities!=_feed_contract_ids:
         await feed_manager.stop()
@@ -93,15 +141,15 @@ def seed_demo(db):
     all_contracts=catalog.all(demo=True)
     # Initial marks are synthetic catalog prices, clearly attributed in every row.
     for c in all_contracts:
-        engine.record_quote(db,demo_quote(c,c.get('broker','dhan')))
-    def contracts(underlying,broker='dhan',kind='CE'):
+        engine.record_quote(db,demo_quote(c,c.get('broker','kotak')))
+    def contracts(underlying,broker='kotak',kind='CE'):
         rows=[c for c in all_contracts if c['underlying']==underlying and c.get('broker')==broker and c['option_type']==kind]
         expiries=sorted({c['expiry'] for c in rows})
         return sorted([c for c in rows if c['expiry']==expiries[0]],key=lambda c:c['strike']) if expiries else []
     underlyings=list(dict.fromkeys(c['underlying'] for c in all_contracts))
     nifty=next((u for u in underlyings if u.upper().replace(' ','') in ('NIFTY','NIFTY50')),underlyings[0] if underlyings else None)
     gold=next((u for u in underlyings if 'GOLD' in u.upper()),nifty)
-    configurations=[('NIFTY bull call spread',nifty,'dhan','spread'),('NIFTY iron condor',nifty,'kotak','condor'),('Gold protective spread',gold,'fivepaisa','spread'),('Completed practice trade',nifty,'dhan','closed')]
+    configurations=[('NIFTY bull call spread',nifty,'kotak','spread'),('NIFTY iron condor',nifty,'kotak','condor'),('Gold protective spread',gold,'fivepaisa','spread'),('Completed practice trade',nifty,'fivepaisa','closed')]
     for index,(name,underlying,broker,kind) in enumerate(configurations):
         calls=contracts(underlying,broker,'CE');puts=contracts(underlying,broker,'PE')
         if len(calls)<4:continue
@@ -140,6 +188,12 @@ def process_quote_receipt(quote):
         run_transaction(lambda db:engine.revalue_quote(db,db.get(QuoteEvent,receipt_id)),SessionLocal)
 
 async def quote_received(quote):
+    # A high-frequency feed coalesces in bounded memory. Durable one-second
+    # samples retain the source quote's timestamp; raw ticks are not DB writes.
+    if collector_lease and collector_lease.token is None:return
+    if _runtime_settings.get('logging_mode','full_history')!='every_update':
+        engine.buffer_quote(quote)
+        return
     try:
         async with write_lock:
             await asyncio.to_thread(process_quote_receipt,quote)
@@ -151,28 +205,65 @@ async def quote_received(quote):
 async def status_received(broker,status):
     feed_status[broker]=status
 
-def capture_once():
+def capture_once(lease=None):
+    global _last_database_write,_recording_status
     def capture(db):
+        if lease is not None and not guard_lease(db,lease):return {'lease_lost':True}
         engine.recover_pending_quotes(db)
+        engine.flush_buffered_quotes(db)
         settings=engine.get_settings(db)
         if settings['demo_mode']:
             needed=set()
             for trade in engine.trade_records(db):
                 if trade['status'] in ('open','pending') and trade.get('demo'):
-                    source=trade['broker'] if settings['preferred_feed']=='broker' else settings['preferred_feed']
+                    source=trade['broker']
                     needed.update((source,l['instrument_id']) for l in trade['legs'] if l['status'] in ('open','pending'))
             for broker,instrument_id in needed:
                 contract=engine.contract_for(instrument_id,broker,True)
                 engine.record_quote(db,demo_quote(contract,broker))
-        engine.take_snapshots(db)
-    run_transaction(capture,SessionLocal)
+        result=engine.take_snapshots(db,calendar=exchange_calendar,lease=lease)
+        if result.get('recorded'):
+            day=datetime.fromtimestamp(result['second'],timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo('Asia/Kolkata')).date().isoformat()
+            daily_reports.ensure_day(db,day)
+        update_demand(db)
+        return result
+    result=run_transaction(capture,SessionLocal)
+    _last_database_write=iso_now();_recording_status=result or {}
+    if result and result.get('recorded') and sheets_service:sheets_service.notify_work()
+    return result
 
 async def background_loop():
+    global _feed_contract_ids
+    next_tick=time.monotonic();renewed=0.0;refreshed=0.0
     while not stop_event.is_set() and database_ready:
         try:
             async with write_lock:
-                # Database latency must not prevent HTTP health checks or UI input.
-                await asyncio.to_thread(capture_once)
+                active=recording_needed()
+                demand=active or _viewers>0 or time.monotonic()<_activity_until
+                if collector_lease and not demand:
+                    if collector_lease.token:
+                        await feed_manager.stop();_feed_contract_ids=None
+                        await asyncio.to_thread(collector_lease.release)
+                elif collector_lease:
+                    now=time.monotonic()
+                    if now-renewed>=5 or collector_lease.token is None:
+                        previous=collector_lease.token
+                        owned=await asyncio.to_thread(collector_lease.renew);renewed=now
+                        if not owned:
+                            await feed_manager.stop();_feed_contract_ids=None
+                        elif previous!=collector_lease.token:
+                            await asyncio.to_thread(restore_active_state)
+                            refreshed=0
+                    if collector_lease.token:
+                        if now-refreshed>=5:
+                            with SessionLocal() as db:await refresh_selected_feeds(db)
+                            refreshed=now
+                        if active or _viewers or engine.buffered_quote_status().get('pending',0):
+                            result=await asyncio.to_thread(capture_once,collector_lease.token)
+                            if result.get('lease_lost'):
+                                await feed_manager.stop();collector_lease.token=None
+                else:
+                    await asyncio.to_thread(capture_once)
         except SQLAlchemyError as error:
             log_database_error('Database capture',error)
             if is_database_unavailable(error):
@@ -180,28 +271,36 @@ async def background_loop():
                 return
             # A short local write conflict or one invalid statement must not
             # turn a healthy workspace into a minute-long connection outage.
-        except Exception:
-            log.exception('Background capture failed; journal data retained. Feed/UI should be checked.')
-        try:await asyncio.wait_for(stop_event.wait(),timeout=1)
-        except asyncio.TimeoutError:pass
+        except Exception as error:
+            log.warning('Background capture interrupted (error_type=%s); records retained.',type(error).__name__)
+        next_tick+=1
+        if next_tick<time.monotonic():next_tick=math.ceil(time.monotonic())
+        await wait_for_shutdown(max(.01,next_tick-time.monotonic()))
+
+def restore_active_state():
+    with SessionLocal() as db:
+        active=[row.data for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending'])))]
+        catalog.restore_demo_contracts(active);catalog.restore_live_contracts(active)
+        update_demand(db)
 
 def initialize_database():
     """Run blocking database setup outside the HTTP event loop."""
-    Base.metadata.create_all(db_engine)
+    maintenance.migrate(db_engine)
     with SessionLocal() as db:
         if not db.get(SchemaVersion,1):db.add(SchemaVersion(version=1));db.commit()
         persisted_trades=[row.data for row in db.scalars(select(Trade))]
         catalog.restore_demo_contracts(persisted_trades)
         catalog.restore_live_contracts(persisted_trades)
         while engine.recover_pending_quotes(db):db.commit()
+        if os.getenv('ENVIRONMENT')=='production' and not db.get(Setting,'app'):
+            engine.update_settings(db,{'demo_mode':False});db.commit()
         seed_demo(db)
+        update_demand(db)
 
 async def try_initialize_database():
     global database_ready
     try:
         await asyncio.to_thread(initialize_database)
-        with SessionLocal() as db:
-            await refresh_selected_feeds(db,force=True)
     except SQLAlchemyError as exc:
         if is_database_unavailable(exc):database_unavailable()
         log_database_error('Database initialization',exc)
@@ -219,6 +318,7 @@ async def database_services(reporting_loop):
                 if workers:await asyncio.gather(*workers,return_exceptions=True)
                 workers=[]
                 await feed_manager.stop()
+                if collector_lease:collector_lease.token=None
                 await wait_for_shutdown(DATABASE_RETRY_SECONDS)
                 if stop_event.is_set():break
                 if not await try_initialize_database():continue
@@ -231,33 +331,41 @@ async def database_services(reporting_loop):
 
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event,database_ready
+    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,_started_at,_viewers,_activity_until
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
     from .brokers import FeedManager
-    stop_event=asyncio.Event();database_ready=False
+    stop_event=asyncio.Event();database_ready=False;_viewers=0;_activity_until=0;_started_at=time.monotonic()
     catalog=ContractCatalog();engine.set_catalog(catalog)
-    def delete_archived_rows(db,trade_id):
-        row=db.get(Trade,trade_id)
-        if not row or row.status!='closed':
-            raise ValueError('Only the acknowledged closed trade may be archived.')
-        events=db.execute(delete(Event).where(Event.trade_id==trade_id)).rowcount
-        timeline=db.execute(delete(Timeline).where(Timeline.trade_id==trade_id)).rowcount
-        row.data={**row.data,'archived':True}
-        return {'trade_events':events,'timeline':timeline}
-    reporting.configure_archival(lambda db:engine.get_settings(db).get('delete_after_local_save',False),delete_archived_rows)
+    exchange_calendar=ExchangeCalendar();collector_lease=CollectorLease(SessionLocal)
+    cloud_service=cloud_backup.CloudBackupService(session_factory=SessionLocal)
+    resource_monitor=resource_health.ResourceMonitor()
+    sheets_service=sheets_sync.SheetsSyncService(SessionLocal,cloud_service)
+    daily_service=daily_reports.DailyReportService(SessionLocal,calendar=exchange_calendar,on_finalized=sheets_service.notify_work)
+    # A laptop acknowledgement alone cannot remove the only cloud history.
+    reporting.configure_archival(lambda db:False,None)
+    reporting.configure_report_ready(cloud_service.notify_work)
     feed_manager=FeedManager(on_quote=quote_received,on_status=status_received)
     await try_initialize_database()
     services=asyncio.create_task(database_services(reporting_loop))
+    cloud_task=asyncio.create_task(cloud_service.run(stop_event))
+    resource_task=asyncio.create_task(resource_monitor.run(stop_event))
+    daily_task=asyncio.create_task(daily_service.run(stop_event))
+    sheets_task=asyncio.create_task(sheets_service.run(stop_event))
     try:yield
     finally:
         stop_event.set()
         await feed_manager.stop()
+        if collector_lease and collector_lease.token:
+            with suppress(SQLAlchemyError):await asyncio.to_thread(collector_lease.release)
         try:await asyncio.wait_for(services,timeout=20)
         except (asyncio.TimeoutError,asyncio.CancelledError):
             services.cancel()
             await asyncio.gather(services,return_exceptions=True)
+        for task in (cloud_task,resource_task,daily_task,sheets_task):task.cancel()
+        await asyncio.gather(cloud_task,resource_task,daily_task,sheets_task,return_exceptions=True)
+        collector_lease=None;feed_manager=None
 
 app=FastAPI(title='Personal Options Trader',version='1.0.0',lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=ALLOWED_ORIGINS,allow_credentials=True,allow_methods=['GET','POST','PATCH','DELETE','OPTIONS'],allow_headers=['Content-Type','X-CSRF-Token','Authorization'])
@@ -277,6 +385,7 @@ async def security_headers(request,call_next):
                 response=JSONResponse({'detail':'Another local save is completing. Please retry this action.','database_ready':True},status_code=503,headers={'Retry-After':'1'})
             else:
                 response=JSONResponse({'detail':'This database operation could not be completed. Saved records are retained; please review the action or contact support.'},status_code=500)
+    if request.url.path.startswith('/api/') and request.cookies.get(COOKIE) and response.status_code<400:touch_activity()
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['X-Frame-Options']='DENY'
     response.headers['Referrer-Policy']='no-referrer'
@@ -286,6 +395,68 @@ async def security_headers(request,call_next):
 
 @app.get('/api/health')
 def health():return {'ok':True,'mode':'PAPER','live_orders_supported':False,'database_ready':database_ready,'time':iso_now()}
+
+@app.get('/health/live')
+def process_health():
+    return {'ok':True,'mode':'PAPER','uptime_seconds':round(time.monotonic()-_started_at,1)}
+
+@app.get('/health/ready')
+def readiness():
+    return JSONResponse({'ready':database_ready,'mode':'PAPER','database_ready':database_ready},status_code=200 if database_ready else 503)
+
+@app.get('/api/system/resources',dependencies=[Depends(require_session)])
+def resources():
+    result=resource_monitor.status() if resource_monitor else {'sample':None,'active_alerts':[]}
+    return {**result,'uptime_seconds':round(time.monotonic()-_started_at,1),'database_ready':database_ready,
+            'last_database_write':_last_database_write,'collector_owned':bool(collector_lease and collector_lease.token),
+            'recording':_recording_status,'quote_buffer':engine.buffered_quote_status(),
+            'database':{'engine':db_engine.dialect.name,'type':db_engine.dialect.name,'size_bytes':(resource_monitor.latest or {}).get('storage',{}).get('sqlite_bytes') if resource_monitor else None,'journal_mode':os.getenv('SQLITE_JOURNAL_MODE','WAL'),'external_subscription_required':False,'verified':os.getenv('SQLITE_STORAGE_VERIFIED')=='true','filesystem':os.getenv('SQLITE_FILESYSTEM'),'path':'/app/data/trading.db' if db_engine.dialect.name=='sqlite' else None}}
+
+@app.get('/api/system/health',dependencies=[Depends(require_session)])
+def detailed_health():
+    now=datetime.now(timezone.utc)
+    sessions=[{'trade_id':trade['id'],'broker':trade['broker'],
+               'legs':[{'instrument_id':leg['instrument_id'],**(exchange_calendar.state(leg,now) if exchange_calendar else {'known':False,'open':False,'reason':'Calendar unavailable.'})}
+                       for leg in trade.get('legs',[]) if leg.get('status') in ('open','pending')]}
+              for trade in _active_positions if not trade.get('demo')]
+    return {'mode':'PAPER','live_orders_supported':False,'resources':resources(),
+            'brokers':feed_manager.statuses() if feed_manager else feed_status,'exchange_sessions':sessions,
+            'calendar_error':exchange_calendar.error if exchange_calendar else 'Calendar unavailable.'}
+
+def drive_service():
+    if cloud_service is None:raise HTTPException(503,'Cloud backup service has not started.')
+    return cloud_service
+
+@app.get('/api/cloud/drive/status',dependencies=[Depends(require_session)])
+def drive_status(db=Depends(get_db)):
+    return drive_service().status(db)
+
+@app.post('/api/cloud/drive/connect')
+async def drive_connect(current=Depends(require_session),db=Depends(get_db)):
+    async with write_lock:
+        try:return {'authorization_url':await asyncio.to_thread(cloud_backup.begin_authorization,db,current.token_hash,drive_service().config)}
+        except cloud_backup.BackupError as error:raise HTTPException(409,str(error)) from None
+
+@app.get('/api/cloud/drive/callback')
+async def drive_callback(state:str=Query(min_length=16,max_length=250),code:str|None=Query(default=None,max_length=4096),current=Depends(require_session),db=Depends(get_db)):
+    if not code:raise HTTPException(400,'Google Drive permission was not granted. Reconnect from Data & settings.')
+    async with write_lock:
+        try:await asyncio.to_thread(cloud_backup.complete_authorization,db,current.token_hash,state,code,drive_service().config)
+        except cloud_backup.BackupError as error:raise HTTPException(409,str(error)) from None
+        drive_service().notify_work()
+    return RedirectResponse('/?drive=connected',status_code=303)
+
+@app.post('/api/cloud/drive/queue',dependencies=[Depends(require_session)])
+async def queue_cloud_reports():
+    queued=await asyncio.to_thread(drive_service().enqueue_ready)
+    drive_service().notify_work();reporting.notify_work()
+    return {'queued':queued}
+
+@app.post('/api/cloud/drive/retry/{job_id}',dependencies=[Depends(require_session)])
+async def retry_cloud_report(job_id:str,db=Depends(get_db)):
+    async with write_lock:
+        retried=await asyncio.to_thread(drive_service().retry,db,job_id);drive_service().notify_work()
+        return {'retried':retried}
 
 @app.get('/api/session')
 def session(request:Request,db=Depends(get_db)):
@@ -332,29 +503,55 @@ def logout(response:Response,current=Depends(require_session),db=Depends(get_db)
 def get_dashboard(db=Depends(get_db)):return engine.dashboard(db,feed_manager.statuses() if feed_manager else feed_status)
 
 @app.get('/api/trades',dependencies=[Depends(require_session)])
-def trades(demo:bool|None=None,db=Depends(get_db)):return engine.list_trades(db,demo)
+def trades(demo:bool|None=None,status:str|None=None,offset:int=Query(default=0,ge=0),limit:int=Query(default=100,ge=1,le=200),db=Depends(get_db)):
+    mode=engine.get_settings(db)['demo_mode'] if demo is None else demo
+    query=select(Trade)
+    if status=='closed':query=query.where(Trade.status.in_(['closed','cancelled']))
+    elif status=='active':query=query.where(Trade.status.in_(['open','pending']))
+    # Portable keyset-sized page; the date in each trade is retained rather
+    # than reinterpreting this as a daily-only trade count.
+    rows=sorted([r.data for r in db.scalars(query) if bool(r.data.get('demo'))==bool(mode)],key=lambda t:t.get('created_at',''),reverse=True)
+    return [engine.public_trade(t,engine.get_settings(db)) for t in rows[offset:offset+limit]]
 
 @app.post('/api/trades',dependencies=[Depends(require_session)])
 async def create_trade(payload:TradeInput,db=Depends(get_db)):
     async with write_lock:
-        existing=db.get(ActionRecord,payload.idempotency_key)
-        if not existing:refresh_demo_for_payload(db,payload.model_dump())
-        result=engine.create_trades(db,payload);db.commit()
+        await ensure_writer(db)
+        def persist():
+            existing=db.get(ActionRecord,payload.idempotency_key)
+            if not existing:refresh_demo_for_payload(db,payload.model_dump())
+            result=engine.create_trades(db,payload);db.commit();update_demand(db)
+            return result
+        result=await asyncio.to_thread(persist);touch_activity()
         await refresh_selected_feeds(db)
         return result
 
 @app.get('/api/trades/{trade_id}',dependencies=[Depends(require_session)])
-def get_trade(trade_id:str,include_history:bool=True,db=Depends(get_db)):
+def get_trade(trade_id:str,include_history:bool=True,history_limit:int=Query(default=200,ge=1,le=500),before_second:int|None=None,db=Depends(get_db)):
     row=db.get(Trade,trade_id)
     if not row:raise HTTPException(404,'Trade not found.')
-    return {'trade':engine.public_trade(row.data,engine.get_settings(db)),'events':[{'id':e.id,'kind':e.kind,'timestamp':e.timestamp,**e.data} for e in db.scalars(select(Event).where(Event.trade_id==trade_id).order_by(Event.id))] if include_history else [],'timeline':[s.data for s in db.scalars(select(Timeline).where(Timeline.trade_id==trade_id).order_by(Timeline.id))] if include_history else []}
+    snapshots=[];timeline=[];events=[]
+    if include_history:
+        query=select(PnlSnapshot).where(PnlSnapshot.trade_id==trade_id)
+        if before_second is not None:query=query.where(PnlSnapshot.snapshot_second<before_second)
+        snapshots=list(db.scalars(query.order_by(PnlSnapshot.snapshot_second.desc()).limit(history_limit)))
+        timeline=[s.data for s in reversed(snapshots)] if snapshots else [s.data for s in reversed(list(db.scalars(select(Timeline).where(Timeline.trade_id==trade_id).order_by(Timeline.id.desc()).limit(history_limit))))]
+        events=[{'id':e.id,'kind':e.kind,'timestamp':e.timestamp,**e.data} for e in reversed(list(db.scalars(select(Event).where(Event.trade_id==trade_id).order_by(Event.id.desc()).limit(history_limit))))]
+    return {'trade':engine.public_trade(row.data,engine.get_settings(db)),'events':events,'timeline':timeline,
+            'history_limit':history_limit,'next_before_second':snapshots[-1].snapshot_second if len(snapshots)==history_limit else None,
+            'recording_gaps':[{'start_second':g.start_second,'end_second':g.end_second,'reason':g.reason} for g in db.scalars(select(RecordingGap).where(RecordingGap.trade_id==trade_id).limit(100))] if include_history else []}
 
 @app.post('/api/trades/{trade_id}/actions',dependencies=[Depends(require_session)])
 async def trade_action(trade_id:str,payload:ActionInput,db=Depends(get_db)):
     async with write_lock:
-        row=db.get(Trade,trade_id)
-        if row and not db.get(ActionRecord,payload.idempotency_key):refresh_demo_for_payload(db,{**payload.model_dump(),'trade_id':trade_id},row.broker)
-        result=engine.apply_action(db,trade_id,payload);db.commit()
+        await ensure_writer(db)
+        def persist():
+            row=db.get(Trade,trade_id)
+            if row and not db.get(ActionRecord,payload.idempotency_key):refresh_demo_for_payload(db,{**payload.model_dump(),'trade_id':trade_id},row.broker)
+            result=engine.apply_action(db,trade_id,payload);db.commit();update_demand(db)
+            return result
+        result=await asyncio.to_thread(persist);touch_activity();reporting.notify_work()
+        if cloud_service:cloud_service.notify_work()
         await refresh_selected_feeds(db)
         return result
 
@@ -366,7 +563,7 @@ def recent_events(limit:int=20,db=Depends(get_db)):
 @app.get('/api/instruments',dependencies=[Depends(require_session)])
 def instruments(underlying:str|None=None,broker:str|None=None,db=Depends(get_db)):
     demo=engine.get_settings(db)['demo_mode'];items=catalog.list_contracts(underlying=underlying,broker=broker,demo=demo)
-    return {'instruments':items,'underlyings':sorted({i['underlying'] for i in catalog.all(demo=demo)}),'demo':demo,'source':'Synthetic practice catalog — not exchange-valid contracts' if demo else 'Imported broker instrument master'}
+    return {'instruments':items,'underlyings':sorted({i['underlying'] for i in catalog.all(demo=demo)}),'demo':demo,'source':'Synthetic practice catalog â€” not exchange-valid contracts' if demo else 'Imported broker instrument master'}
 
 @app.post('/api/instruments/reload',dependencies=[Depends(require_session)])
 async def reload_instruments():
@@ -386,7 +583,10 @@ def settings(db=Depends(get_db)):return engine.get_settings(db)
 @app.patch('/api/settings',dependencies=[Depends(require_session)])
 async def patch_settings(payload:SettingsInput,db=Depends(get_db)):
     async with write_lock:
-        result=engine.update_settings(db,payload.model_dump(exclude_none=True));db.commit();return result
+        await ensure_writer(db)
+        def persist():
+            result=engine.update_settings(db,payload.model_dump(exclude_none=True));db.commit();update_demand(db);return result
+        return await asyncio.to_thread(persist)
 
 @app.post('/api/risk',dependencies=[Depends(require_session)])
 def risk(payload:RiskInput):
@@ -398,11 +598,13 @@ def risk(payload:RiskInput):
 @app.post('/api/ws-ticket')
 async def issue_ws_ticket(current=Depends(require_session),db=Depends(get_db)):
     async with write_lock:
-        raw=secrets.token_urlsafe(32)
-        db.execute(delete(SocketTicket).where(SocketTicket.expires_at<time.time()))
-        db.add(SocketTicket(token_hash=digest(raw),session_hash=current.token_hash,expires_at=time.time()+30))
-        db.commit()
-        return {'ticket':raw,'expires_in':30}
+        def save_ticket():
+            raw=secrets.token_urlsafe(32)
+            db.execute(delete(SocketTicket).where(SocketTicket.expires_at<time.time()))
+            db.add(SocketTicket(token_hash=digest(raw),session_hash=current.token_hash,expires_at=time.time()+30))
+            db.commit()
+            return {'ticket':raw,'expires_in':30}
+        return await asyncio.to_thread(save_ticket)
 
 def socket_identity(ticket,request):
     with SessionLocal() as db:
@@ -423,6 +625,7 @@ def socket_dashboard(session_hash,statuses):
 @app.websocket('/ws')
 @app.websocket('/api/ws')
 async def websocket(ws:WebSocket):
+    global _viewers
     origin=ws.headers.get('origin')
     if origin and origin.rstrip('/') not in ALLOWED_ORIGINS:await ws.close(code=4403);return
     async with write_lock:
@@ -430,6 +633,7 @@ async def websocket(ws:WebSocket):
         if not identity:await ws.close(code=4401);return
         expiry,session_hash=identity
     await ws.accept()
+    _viewers+=1;touch_activity()
     try:
         while time.time()<expiry:
             data=await asyncio.to_thread(socket_dashboard,session_hash,feed_manager.statuses() if feed_manager else {})
@@ -442,6 +646,72 @@ async def websocket(ws:WebSocket):
         log_database_error('Workspace stream',error)
         if is_database_unavailable(error):database_unavailable()
         with suppress(RuntimeError):await ws.close(code=1013)
+    finally:_viewers=max(0,_viewers-1)
+
+class DailyPrepareInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    date:str=Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
+
+class LocalBackupInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    sha256:str=Field(pattern=r'^[0-9a-f]{64}$')
+    records:int=Field(ge=0)
+    local_backup_confirmed:bool=False
+    confirmation:str=''
+
+@app.get('/api/daily-reports',dependencies=[Depends(require_session)])
+def daily_list(db=Depends(get_db)):
+    return {'reports':daily_reports.list_reports(db)}
+
+@app.post('/api/daily-reports/prepare',dependencies=[Depends(require_session)])
+async def daily_prepare(payload:DailyPrepareInput,db=Depends(get_db)):
+    async with write_lock:
+        try:result=await asyncio.to_thread(daily_reports.queue_day,db,payload.date)
+        except (ValueError,daily_reports.DailyReportError) as error:raise HTTPException(409,str(error)) from None
+        if daily_service:daily_service.notify_work()
+        return {**result,'message':'Daily export queued. It finalizes after its verified trading sessions end.'}
+
+@app.get('/api/daily-reports/{day}',dependencies=[Depends(require_session)])
+def daily_details(day:str,db=Depends(get_db)):
+    try:return daily_reports.report_manifest(db,day)
+    except (ValueError,daily_reports.DailyReportError) as error:raise HTTPException(404,str(error)) from None
+
+@app.get('/api/daily-reports/{day}/download',dependencies=[Depends(require_session)])
+def daily_download(day:str,kind:str='xlsx',part:int=Query(default=1,ge=0,le=10000),db=Depends(get_db)):
+    if kind not in {'xlsx','csv_gz','index_xlsx'}:raise HTTPException(422,'Unknown export format.')
+    try:item=daily_reports.artifact(db,day,kind,part)
+    except (ValueError,daily_reports.DailyReportError) as error:raise HTTPException(409,str(error)) from None
+    return Response(content=item['file_bytes'],media_type=item['mime_type'],headers={'Content-Disposition':f'attachment; filename="{item["filename"]}"','X-Content-SHA256':item['sha256'],'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'})
+
+@app.post('/api/daily-reports/{day}/verify-local',dependencies=[Depends(require_session)])
+async def daily_verify_local(day:str,payload:LocalBackupInput,db=Depends(get_db)):
+    async with write_lock:
+        try:return await asyncio.to_thread(daily_reports.verify_local_ack,db,day,payload.sha256,payload.local_backup_confirmed,payload.records)
+        except daily_reports.DailyReportError as error:raise HTTPException(409,str(error)) from None
+
+@app.get('/api/sheets/status',dependencies=[Depends(require_session)])
+def sheet_status(db=Depends(get_db)):
+    if not sheets_service:raise HTTPException(503,'Google Sheets worker has not started.')
+    return sheets_service.status(db)
+
+@app.post('/api/sheets/retry',dependencies=[Depends(require_session)])
+async def sheets_retry(db=Depends(get_db)):
+    if not sheets_service:raise HTTPException(503,'Google Sheets worker has not started.')
+    async with write_lock:await asyncio.to_thread(sheets_service.retry,db);sheets_service.notify_work()
+    return {'retry_requested':True}
+
+@app.get('/api/daily-reports/{day}/cloud-cleanup',dependencies=[Depends(require_session)])
+def daily_cleanup_preview(day:str,db=Depends(get_db)):
+    if not sheets_service:raise HTTPException(503,'Google Sheets worker has not started.')
+    try:return sheets_service.cleanup_preview(db,day)
+    except sheets_sync.SheetsError as error:raise HTTPException(409,str(error)) from None
+
+@app.post('/api/daily-reports/{day}/cloud-cleanup',dependencies=[Depends(require_session)])
+async def daily_cleanup(day:str,payload:LocalBackupInput):
+    if not sheets_service:raise HTTPException(503,'Google Sheets worker has not started.')
+    async with write_lock:
+        try:return await asyncio.to_thread(sheets_service.cleanup_confirm,day,payload.sha256,payload.records,payload.local_backup_confirmed,payload.confirmation)
+        except sheets_sync.SheetsError as error:raise HTTPException(409,str(error)) from None
 
 # Reporting tables are imported before lifespan's create_all and share the same journal.
 from .companion_api import router_browser,router_companion
@@ -450,7 +720,7 @@ app.include_router(router_companion)
 
 # Register before the SPA catch-all, with the same owner/session/CSRF rules.
 from . import option_chain
-option_chain.configure(write_lock)
+option_chain.configure(write_lock,refresh_selected_feeds)
 app.include_router(option_chain.router)
 
 # The built PWA can be opened with one Windows backend process. API routes above

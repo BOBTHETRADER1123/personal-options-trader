@@ -12,10 +12,10 @@ from app.database import Base
 from app.models import Trade
 
 
-@pytest.mark.parametrize('watchlist', ['dhan:watched', ''])
+@pytest.mark.parametrize('watchlist', ['kotak:watched', ''])
 def test_active_legs_survive_watchlist_filter_without_subscribing_unselected_catalog(monkeypatch, watchlist):
     monkeypatch.setenv('FEED_INSTRUMENT_IDS', watchlist)
-    contracts = [{'id': 'dhan:' + name, 'broker': 'dhan', 'demo': False}
+    contracts = [{'id': 'kotak:' + name, 'broker': 'kotak', 'demo': False}
                  for name in ('watched', 'active', 'pending', 'closed', 'closed-leg', 'unused')]
     monkeypatch.setattr(main, 'catalog', SimpleNamespace(all=lambda demo=False: contracts))
     database = create_engine('sqlite://')
@@ -24,11 +24,11 @@ def test_active_legs_survive_watchlist_filter_without_subscribing_unselected_cat
         with Session(database) as db:
             for identifier, status, leg_status in [('active', 'open', 'open'), ('pending', 'pending', 'pending'),
                                                    ('closed', 'closed', 'open'), ('closed-leg', 'open', 'closed')]:
-                db.add(Trade(id=identifier, broker='dhan', status=status,
-                             data={'demo': False, 'legs': [{'instrument_id': 'dhan:' + identifier, 'status': leg_status}]}))
+                db.add(Trade(id=identifier, broker='kotak', status=status,
+                             data={'demo': False, 'legs': [{'instrument_id': 'kotak:' + identifier, 'status': leg_status}]}))
             db.commit()
             selected = main.selected_feed_contracts(db)
-        expected = {'dhan:active', 'dhan:pending'} | ({watchlist} if watchlist else set())
+        expected = {'kotak:active', 'kotak:pending'} | ({watchlist} if watchlist else set())
         assert {row['id'] for row in selected} == expected
 
         async def verify():
@@ -36,7 +36,7 @@ def test_active_legs_survive_watchlist_filter_without_subscribing_unselected_cat
             started = asyncio.Event()
 
             class Adapter:
-                broker = 'dhan'
+                broker = 'kotak'
 
                 def configured(self):
                     return True

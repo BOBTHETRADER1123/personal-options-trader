@@ -1,3 +1,17 @@
+# Current update: 25 October 2026
+
+289 automated backend tests passed in 27.31 seconds, with one existing Starlette/httpx deprecation warning. TypeScript and the Vite production build passed. Eight Google Sheets tests use mocked Google responses: batching 20 strategies mirrored into 40 broker executions, durable cursors, replaying interrupted writes into identical ranges, quota backoff, source retention, verified readback mismatch and cleanup refusal. These are not authenticated Google integration results.
+
+Isolated browser preview: dark overview, all-time saved strategy/execution counts, light strategy builder and explicit sample labels inspected. Full app sample database survives local process restart. A rollback-journal read/write lock inversion was found during browser testing and fixed by releasing authentication reads before waiting on async write locks and moving commits to worker threads. Regression test verifies a blocked ticket commit leaves liveness responsive.
+
+RamNaym server 1606: actual DATA_DIR /app/data is a writable local ext4 Docker volume. GUNICORN_WORKERS=1, SQLite3.46.1. A second independent process correctly received database-is-locked while the first held an IMMEDIATE transaction. The earlier disposable compatibility marker survived restart and rebuild. The full app now passes its RamNaym /health/live, /health/ready and /api/health checks with database_ready=true. Root main.py is explicitly selected because automatic detection selected the nested package module incorrectly. Owner workspace transfer, full-app cloud restart and live market-session performance are checked separately; a generic hosting success badge is not treated as proof.
+
+Daily exports cover separate broker-specific trades, linked strategy IDs, carried positions on multiple IST dates, complete captured leg rows, split XLSX/CSV parts, manifest checksums and explicit owner backup acknowledgement. No source records or Neon database were deleted. Google cleanup uses Trash, never automatic permanent deletion.
+
+Remaining live acceptance tests: actual broker credentials and permissions; app-owned Google OAuth on the selected 15GB account; five-second Google writes; real market-session recording with browser closed; cloud app restart; resource and API latency measurements under sustained realistic market load. Expired contracts require explicit owner-confirmed paper cash settlement; official settlement prices are not fetched or invented. MCX physical delivery/devolution is not simulated. Muhurat sessions require verified product-specific overrides before recording. The existing working React/TypeScript frontend is deliberately retained rather than rewritten solely to change framework names.
+
+---
+
 # Verification report — 23 October 2026
 
 **Current result: 187 automated tests passed** (180 backend/launcher tests and 7 VM scaffold tests, with 14 subtests) in 9.98 seconds using `.test-feed-selection-release`; one upstream test-helper deprecation warning remains. TypeScript and the Vite production build previously passed; no frontend source changed in this verification. The user confirmed the installed **Laptop workspace** dashboard opens with the existing local account.

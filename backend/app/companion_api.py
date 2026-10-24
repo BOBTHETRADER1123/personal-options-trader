@@ -6,7 +6,7 @@ import hmac
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
@@ -15,7 +15,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal
-from .reporting import ExportJob, archive_after_verified_save, now_iso, public_job, reconciliation, job_metadata
+from .reporting import ExportArtifact, ExportJob, archive_after_verified_save, now_iso, public_job, reconciliation, job_metadata
 
 router_browser = APIRouter(prefix="/api/exports", tags=["Excel exports"])
 router_companion = APIRouter(prefix="/api/companion", tags=["Local companion"])
@@ -80,9 +80,36 @@ def reconciliation_report(db: Session = Depends(db_session)):
     return reconciliation(db)
 
 
+@router_browser.get("/{job_id}/artifacts")
+def browser_artifacts(job_id: str, db: Session = Depends(db_session)):
+    """Metadata only: listing never fetches XLSX or compressed history bytes."""
+    job = _job(db, job_id)
+    items = []
+    if job.checksum and job.size and job.status in {"ready", "claimed", "saved"}:
+        items.append({"kind": "xlsx", "filename": job.filename, "size": job.size,
+                      "sha256": job.checksum,
+                      "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
+        rows = db.execute(select(ExportArtifact.kind, ExportArtifact.filename, ExportArtifact.size,
+                                 ExportArtifact.sha256, ExportArtifact.mime_type).where(ExportArtifact.job_id == job_id))
+        items.extend(dict(row._mapping) for row in rows)
+    return {"job_id": job_id, "artifacts": items}
+
+
 @router_browser.get("/{job_id}/download")
-def browser_download(job_id: str, db: Session = Depends(db_session)):
-    return _download(_job(db, job_id))
+def browser_download(job_id: str, kind: Literal["xlsx", "csv_gz"] = "xlsx", db: Session = Depends(db_session)):
+    job = _job(db, job_id)
+    if kind == "xlsx":
+        return _download(job)
+    artifact = db.scalar(select(ExportArtifact).where(ExportArtifact.job_id == job_id, ExportArtifact.kind == kind))
+    if not artifact or job.status not in {"ready", "claimed", "saved"}:
+        raise HTTPException(404, "Detailed history archive is unavailable for this report; existing source records are retained")
+    content = bytes(artifact.file_bytes)
+    if len(content) != artifact.size or hashlib.sha256(content).hexdigest() != artifact.sha256:
+        raise HTTPException(409, "Stored archive verification failed; source records are retained")
+    return Response(content=content, media_type=artifact.mime_type,
+                    headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"',
+                             "X-Content-SHA256": artifact.sha256, "X-Export-Job-ID": job.id,
+                             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router_browser.post("/{job_id}/retry")
@@ -97,6 +124,8 @@ def retry_export(job_id: str, db: Session = Depends(db_session)):
     job.automatic_retry = True
     job.updated_at = now_iso()
     db.commit()
+    from .reporting import notify_work
+    notify_work()
     return public_job(job)
 
 

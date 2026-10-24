@@ -1,5 +1,46 @@
 # Personal Options Trader
 
+This is an update to the existing personal paper-trading app. It preserves working features and records. Only **Kotak Neo** and **5paisa** are active broker integrations; legacy Dhan records remain historical. Real broker order placement is disabled.
+
+## Current setup and deployment status
+
+The prepared production design is **Vercel frontend + RamNaym server 1606 backend + SQLite at `/app/data/trading.db`** on the verified persistent volume. One asynchronous application worker owns market recording. The existing React/TypeScript frontend is retained.
+
+**Prepared source is not proof of a completed deployment.** The RamNaym full-app deployment, approved laptop-workspace migration and Vercel connection switch are being completed and checked. Do not treat the public website as ready until its database readiness, owner login and paper workflow have passed. The older Render/Neon deployment remains separate; Neon records are preserved and are not deleted by this update. The last known old cloud database condition was unavailable after its transfer allowance was exhausted.
+
+Website: [personal-options-trader.vercel.app](https://personal-options-trader.vercel.app/). Private source: [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader). `http://127.0.0.1:8011` is an isolated laptop preview, not the public cloud service.
+
+## Start with these guides
+
+- [Current RamNaym deployment and trial checks](docs/RAMNAYM-TRIAL.md)
+- [Broker connection methods and limitations](docs/BROKERS.md)
+- [Daily Excel Downloads and safe cloud cleanup](docs/DAILY-REPORTS.md)
+- [Live Google Sheets and separate Google account setup](docs/GOOGLE-SHEETS-LIVE.md)
+- [Google authorization and completed-trade archives](docs/GOOGLE-DRIVE-CLOUD.md)
+- [Actual automated test results and pending live checks](TEST-REPORT.md)
+
+## Current implemented workflows
+
+- Owner authentication, secure sessions, protected APIs, independent broker prices and simulated fills.
+- Buying/selling options and futures, multi-leg strategies, partial exits, strategy payoff and estimated margin/charges. No real orders.
+- One-second captured P&L history with original quote times, stale/reused status, recording gaps and restart coordination. Production capture follows maintained verified exchange sessions.
+- All-time strategy and broker-execution counts, responsive dashboard, option chain and strategy builder.
+- Daily backend-generated XLSX, separate worksheets per broker trade, continued trade IDs across dates, large-file splitting, CSV.gz supplements and checksums.
+- Durable approximately five-second Google Sheets batches, verification before cursor advancement, upload retries and explicitly confirmed daily cloud cleanup. Google OAuth must be configured and authorized before these uploads work.
+- Container CPU/RAM, persistent-storage and queue monitoring. Dashboard/log alerts do not imply external email/SMS is configured.
+
+Mocked tests are not proof of authenticated broker connectivity or a successful Google account connection. No live broker integration is marked passed until the owner's permitted credentials have actually been tested. Sample mode is explicitly synthetic and must not be mistaken for live prices.
+
+## Development and recovery
+
+Use Python 3.12 and the existing virtual environment. Backend dependencies are in `backend/requirements.txt`, with supported Kotak dependencies in `backend/requirements-brokers.txt`. Frontend scripts are in `frontend/package.json`. Production packaging is in `deploy/ramnaym`; environment templates are in `.env.example`. Never commit private environment files, database copies, OAuth tokens or credentials.
+
+The laptop workspace and old cloud records remain preserved. [START-HERE.md](START-HERE.md), [laptop export/companion recovery](docs/EXPORTS.md) and [existing laptop Drive backups](docs/GOOGLE-DRIVE-BACKUPS.md) describe earlier local workflows. They are separate from the new unattended cloud setup. Do not delete the old database until replacement data and recovery evidence are verified.
+
+## Historical notes from earlier releases
+
+**The following retained notes describe the earlier laptop / Render / Neon release. They are historical recovery context, not current production deployment instructions. References below to Dhan, compact recording, waiting for Neon, old hosting or older UI apply to that earlier release. Use the current guides above for new deployment and recording behavior.**
+
 A responsive personal options paper trading desk for Indian indices and MCX commodities. It includes a React/TypeScript frontend, FastAPI backend, persistent journal, independent read-only broker adapters, strategy payoff engine, durable Excel export queue, and verified Windows local-save companion.
 
 **New to coding? Start with [START-HERE.md](START-HERE.md).**
@@ -14,7 +55,7 @@ Available laptop reports have been backed up and downloaded again for checksum v
 
 **Free cloud migration being prepared:** a persistent VM can run both this app and SQLite while the laptop is off. The [free cloud hosting guide](docs/FREE-CLOUD-HOSTING.md) describes the proposed setup and free-tier limits. No replacement server has been provisioned yet; Oracle account signup and free compute availability still need verification. The current Vercel/Render/Neon deployment is unchanged.
 
-## Included workflows
+### Included workflows
 
 - Owner login, expiring server sessions, password hashing, optional TOTP, origin/CSRF checks, and a separate companion credential.
 - Market and limit paper simulations for Dhan, Kotak Neo and 5paisa, with one action ID and independent broker results.
@@ -29,7 +70,7 @@ Available laptop reports have been backed up and downloaded again for checksum v
 
 Sample mode uses **fictional contracts and synthetic quotes**, generated relative to the current date. It is kept separate from master-derived market-data paper trading. The source contains no real-order submission path or live-trading switch.
 
-## Project map
+### Project map
 
 ```text
 frontend/                React + TypeScript website and installable PWA shell
@@ -50,7 +91,7 @@ render.yaml              Render deployment template (free tier initially)
 frontend/vercel.json     Website deployment proxy template
 ```
 
-## Open the online app
+### Open the online app
 
 Open the hosted website and sign in with the password you already created once Neon database access returns. The online report companion has been stopped during the quota outage. **Personal Options Trader Online** or **Open-Online-Trading-App.cmd** starts it again. Physical-phone synchronization still needs verification.
 
@@ -58,13 +99,13 @@ The online launcher runs the outbound Excel companion in the background and keep
 
 Render Free can sleep or restart, so it cannot guarantee uninterrupted feed capture. A running companion does not make the free backend continuously available.
 
-## Keep using the local practice app
+### Keep using the local practice app
 
 On the configured laptop, double-click the **Personal Options Trader** desktop shortcut or **Open-Trading-App.cmd** in the project folder. It starts the backend and paired Excel companion in the background and opens the app in your browser. Sign in with your existing owner password. Closing the browser leaves the services running while the laptop is awake. Double-click **Stop-Trading-App.cmd** to stop them; saved records remain on disk.
 
 For a fresh installation, install Python and Node.js, run **Setup-Windows.cmd** once, then use **Open-Trading-App.cmd**. The launcher prepares local companion pairing and the default report folder automatically. See [START-HERE.md](START-HERE.md) for first-owner setup and manual companion options.
 
-## Local development
+### Local development
 
 Requires Python 3.12+ and Node.js LTS supporting Vite 7 (Node 20.19+ or 22.12+). Windows users can use the setup and app launchers above.
 
@@ -83,7 +124,7 @@ Open `http://127.0.0.1:8000`. Keep one backend worker: it owns feed subscription
 
 For PostgreSQL set the root `DATABASE_URL` to the private Neon connection string with TLS. SQLite uses WAL and FULL synchronous commits locally. Database tables and the schema-version record are initialized at startup; startup performs the included additive compatibility changes. Do not replace the database to apply an update.
 
-## Operating rules and limits
+### Operating rules and limits
 
 - Observed extrema reflect received quotes and recorded actions, including estimated charges. No intermediate ticks are invented. Unfinished quote processing remains recoverable; successful compact processing retains current state rather than a growing tick history.
 - The short live chart is held in memory and resets on restart. Trade extrema and final results persist. New Excel files contain Trade Summary and Strategy Legs; existing detailed workbooks remain readable.
@@ -94,7 +135,7 @@ For PostgreSQL set the root `DATABASE_URL` to the private Neon connection string
 - Excel is generated on trade completion and can be downloaded from Reports. The journal remains authoritative while a trade is active. Automatic journal compaction retains summary/manifests/cloud workbooks and shared quotes; it is not complete online data erasure.
 - Secrets stay in backend environment variables. SQLite backups include private account/trading data; store them securely. Never upload `.env`, database files, raw masters, generated workbooks, or the companion’s private manifest to GitHub.
 
-## Backups, recovery and tests
+### Backups, recovery and tests
 
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for database backups, exact-match restores, cloud database recovery, reporting recovery, log troubleshooting and the beginner acceptance checklist.
 

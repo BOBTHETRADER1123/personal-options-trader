@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer, Float, JSON, Text, UniqueConstraint
+from sqlalchemy import String, Integer, BigInteger, Float, JSON, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base, iso_now
 
@@ -88,3 +88,44 @@ class SchemaVersion(Base):
     __tablename__ = 'schema_version'
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     applied_at: Mapped[str] = mapped_column(String(50), default=iso_now)
+
+
+class PnlSnapshot(Base):
+    """One captured observation per active trade and UTC second, never backfilled.
+
+    The composite primary key is the only high-volume index. The JSON contains
+    broker-specific contract identities and the original quote timestamps.
+    """
+    __tablename__ = 'pnl_snapshots'
+    trade_id: Mapped[str] = mapped_column(String(60), primary_key=True)
+    snapshot_second: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    timestamp: Mapped[str] = mapped_column(String(50))
+    data: Mapped[dict] = mapped_column(JSON)
+
+
+class RecordingCursor(Base):
+    __tablename__ = 'recording_cursors'
+    trade_id: Mapped[str] = mapped_column(String(60), primary_key=True)
+    last_second: Mapped[int] = mapped_column(BigInteger)
+    last_quote_ids: Mapped[list] = mapped_column(JSON)
+    updated_at: Mapped[str] = mapped_column(String(50))
+
+
+class RecordingGap(Base):
+    """Explicit missing intervals; these rows never stand in for observations."""
+    __tablename__ = 'recording_gaps'
+    trade_id: Mapped[str] = mapped_column(String(60), primary_key=True)
+    start_second: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    end_second: Mapped[int] = mapped_column(BigInteger)
+    detected_at: Mapped[str] = mapped_column(String(50))
+    reason: Mapped[str] = mapped_column(String(100))
+    data: Mapped[dict] = mapped_column(JSON)
+
+
+class SchedulerLease(Base):
+    """Transactional fencing lease; works through transaction-pooled PgBouncer."""
+    __tablename__ = 'scheduler_leases'
+    name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(BigInteger)
+    expires_at: Mapped[float] = mapped_column(Float)

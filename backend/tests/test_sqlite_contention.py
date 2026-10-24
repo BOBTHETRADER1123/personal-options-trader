@@ -102,19 +102,19 @@ def test_capture_replays_real_price_transaction_after_wal_conflict_and_keeps_api
     monkeypatch.setattr(main, 'SessionLocal', journal)
     monkeypatch.setattr(main, 'database_ready', True)
     try:
-        contract = catalog.list_contracts(underlying='NIFTY', broker='dhan', demo=True)[0]
+        contract = catalog.list_contracts(underlying='NIFTY', broker='kotak', demo=True)[0]
         with journal() as db:
             engine.update_settings(db, {'logging_mode': 'summary', 'demo_mode': True,
                                         'fill_basis': 'ltp', 'brokerage_per_order': 0, 'charges_percent': 0})
-            engine.record_quote(db, {**main.demo_quote(contract, 'dhan'), 'received_at': iso_now()})
+            engine.record_quote(db, {**main.demo_quote(contract, 'kotak'), 'received_at': iso_now()})
             result = engine.create_trades(db, {
-                'name': 'WAL recovery paper trade', 'underlying': 'NIFTY', 'brokers': ['dhan'],
+                'name': 'WAL recovery paper trade', 'underlying': 'NIFTY', 'brokers': ['kotak'],
                 'legs': [{'instrument_id': contract['id'], 'side': 'BUY', 'lots': 1,
                           'order_type': 'MARKET', 'enabled': True}],
                 'idempotency_key': 'wal-capture-trade', 'confirmed': True,
             })
             trade_id = result['trades'][0]['id']
-            engine.record_quote(db, main.demo_quote(contract, 'dhan'))
+            engine.record_quote(db, main.demo_quote(contract, 'kotak'))
             db.commit()
             before = db.get(QuoteReceiptCounter, 1).value
 
@@ -219,7 +219,7 @@ def test_received_quote_is_not_inserted_twice_when_valuation_snapshot_retries(jo
     monkeypatch.setattr(main, 'SessionLocal', journal)
     monkeypatch.setattr(engine, 'record_quote', receive)
     monkeypatch.setattr(engine, 'revalue_quote', revalue)
-    main.process_quote_receipt({'broker': 'dhan', 'instrument_id': 'private-test'})
+    main.process_quote_receipt({'broker': 'kotak', 'instrument_id': 'private-test'})
     assert receipt_ids == [42] and len(valuation_sessions) == 2
     with journal() as db:
         assert db.get(Setting, 'probe').value == {'writes': 111}
@@ -227,7 +227,7 @@ def test_received_quote_is_not_inserted_twice_when_valuation_snapshot_retries(jo
 
 def test_daily_reconciliation_retries_fresh_wal_snapshot_and_keeps_current_counts(journal, monkeypatch):
     with journal() as db:
-        db.add(reporting.ExportJob(id='wal-report', trade_id='closed-wal-trade', broker='dhan',
+        db.add(reporting.ExportJob(id='wal-report', trade_id='closed-wal-trade', broker='kotak',
                                    filename='verified-paper-trade.xlsx', relative_path='private-test.xlsx',
                                    payload={'format': 'summary', 'trade': {'demo': True}}, status='pending'))
         db.commit()

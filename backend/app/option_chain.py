@@ -1,46 +1,47 @@
-"""Read-only Dhan option chains and a durable, exchange-derived F&O universe.
+"""Two independent, read-only Kotak Neo and 5paisa option-chain views.
 
-Only public instrument downloads and the two documented option-chain data
-endpoints are called. Sample numbers are deliberately fictional and isolated.
+Live identities come only from the selected broker's official master. Prices
+are that broker's received WebSocket marks; unavailable fields remain null.
+Legacy chain tables remain defined so historical databases load without loss.
 """
 from __future__ import annotations
 
 import asyncio
-import copy
 import csv
+import io
+import json
 import math
 import os
 import time
 import urllib.request
-from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 from weakref import WeakKeyDictionary
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import JSON, String, delete, insert, select
+from sqlalchemy import JSON, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from . import engine
 from .database import Base, get_db, iso_now
-from .instruments import DHAN_MASTER_URL, IST, normalize_row
-from .models import QuoteEvent, Trade
+from .instruments import BROKERS, FIVEPAISA_MASTER_URL, IST, normalize_row
 from .security import require_session
+from .models import LatestQuote
+from .brokers import KotakFeed, FivepaisaFeed
 
 router = APIRouter(prefix='/api/option-chain', tags=['Read-only option chain'], dependencies=[Depends(require_session)])
 _write_lock = asyncio.Lock()
 _master_lock = asyncio.Lock()
-_request_lock = asyncio.Lock()
+_refresh_feeds = None
+_requested: dict[str, tuple[float, set[str]]] = {}
 _attempts: dict[str, float] = {}
-_expiry_cache: dict[str, tuple[float, list[str]]] = {}
-_master_indexes = WeakKeyDictionary()
-_selected_masters = WeakKeyDictionary()
-_snapshots = WeakKeyDictionary()
+_universes = WeakKeyDictionary()
 MIN_INTERVAL = 3.0
 MASTER_REFRESH_SECONDS = 300
-MAX_SELECTED_CHAINS = 8
-SOURCE = 'https://dhanhq.co/docs/v2/option-chain/'
+CHAIN_SUBSCRIPTION_SECONDS = 600
+SOURCES = {'kotak': 'https://github.com/Kotak-Neo/kotak-neo-python/blob/main/docs/guides/websocket.md',
+           'fivepaisa': 'https://xstream.5paisa.com/dev-docs/market-data-system/web-socket'}
 
 
 class ChainMaster(Base):
@@ -61,17 +62,15 @@ class ChainSnapshot(Base):
     updated_at: Mapped[str] = mapped_column(String(50))
 
 
-def configure(write_lock):
-    global _write_lock
-    _write_lock = write_lock
+def configure(write_lock, refresh_selected_feeds=None):
+    global _write_lock, _refresh_feeds
+    _write_lock, _refresh_feeds = write_lock, refresh_selected_feeds
 
 
 def number(value, *, positive=False):
     try:
         result = float(value)
-        if not math.isfinite(result) or (positive and result < 0):
-            return None
-        return result
+        return None if not math.isfinite(result) or (positive and result < 0) else result
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -82,146 +81,173 @@ def percent(change, previous):
 
 def age(value):
     try:
-        return max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(value)).total_seconds())
-    except (TypeError, ValueError):
+        stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
+    except (TypeError, ValueError, AttributeError):
         return float('inf')
 
 
-def configured():
-    return bool(os.getenv('DHAN_ACCESS_TOKEN') and os.getenv('DHAN_CLIENT_ID'))
+def validate_broker(broker):
+    if broker not in BROKERS:
+        raise HTTPException(422, 'Only Kotak Neo and 5paisa are enabled. Historical records remain readable.')
+
+
+def configured(broker='kotak'):
+    validate_broker(broker)
+    return bool((KotakFeed if broker == 'kotak' else FivepaisaFeed)(None, None).configured())
 
 
 def mode_value(db, mode):
     return mode or ('sample' if engine.get_settings(db)['demo_mode'] else 'live')
 
 
-def download_master():
-    # Streaming CSV avoids retaining a second full raw download in memory.
-    with urllib.request.urlopen(DHAN_MASTER_URL, timeout=60) as response:
-        def lines():
-            count = 0
-            for line in response:
-                count += len(line)
-                if count > 100 * 1024 * 1024:
-                    raise ValueError('Official master exceeded the bounded download size.')
-                yield line.decode('utf-8-sig')
-        return parse_master(csv.DictReader(lines()))
+def requested_contract_ids():
+    now = time.monotonic()
+    for key in list(_requested):
+        if _requested[key][0] <= now:
+            _requested.pop(key, None)
+    return set().union(*(value[1] for value in _requested.values())) if _requested else set()
 
 
-def parse_master(rows, today=None):
-    """Use underlying IDs from the native detailed master, never symbol guesses."""
+def parse_master(rows, broker='fivepaisa', today=None, segment=None):
+    validate_broker(broker)
     today = today or datetime.now(IST).date().isoformat()
     groups, seen = {}, set()
     for raw in rows:
-        if raw.get('EXCH_ID') not in {'NSE', 'BSE'} or raw.get('SEGMENT') != 'D' or raw.get('INSTRUMENT') not in {'OPTIDX', 'OPTSTK'}:
-            continue
-        contract = normalize_row('dhan', raw)
-        contract.pop('imported_at', None)
+        try:
+            contract = normalize_row(broker, raw, segment)
+        except ValueError as exc:
+            if str(exc) in {'Not an option contract', 'Unsupported derivative segment'}:
+                continue
+            raise
         if contract['expiry'] < today:
             continue
-        underlying_id = str(raw.get('UNDERLYING_SECURITY_ID', '')).strip()
-        if not underlying_id.isdigit() or int(underlying_id) <= 0:
-            raise ValueError('The official option master is missing an underlying security ID. Existing catalog retained.')
-        kind = 'index' if raw['INSTRUMENT'] == 'OPTIDX' else 'stock'
-        key = f"{contract['exchange']}:{contract['underlying']}"
-        segment = 'IDX_I' if kind == 'index' else f"{contract['exchange']}_EQ"
-        signature = (key, contract['expiry'], contract['strike'], contract['option_type'])
+        # Preserve futures in the downloadable catalog but option-chain groups
+        # contain options only, with their exact master expiry and lot sizes.
+        if contract['option_type'] not in {'CE', 'PE'}:
+            continue
+        signature = (contract['exchange'], contract['underlying'], contract['expiry'], contract['strike'], contract['option_type'])
         if signature in seen:
-            raise ValueError('The official master contains duplicate option identities. Existing catalog retained.')
+            raise ValueError('Duplicate contract identity in broker master; previous master retained.')
         seen.add(signature)
-        contract.update(underlying_security_id=int(underlying_id), underlying_segment=segment, chain_key=key, underlying_kind=kind)
-        group = groups.setdefault(key, {'key': key, 'symbol': contract['underlying'], 'name': str(raw['UNDERLYING_SYMBOL']).strip(),
-                                       'exchange': contract['exchange'], 'kind': kind, 'type': kind,
-                                       'underlying_security_id': int(underlying_id), 'underlying_segment': segment, 'contracts': []})
-        if group['underlying_security_id'] != int(underlying_id) or group['kind'] != kind:
-            raise ValueError('Conflicting underlying identity in broker master. Existing catalog retained.')
+        key = f"{contract['exchange']}:{contract['underlying']}"
+        kind = 'commodity' if contract['exchange'] == 'MCX' else 'index' if contract['underlying'] in {'NIFTY', 'BANKNIFTY', 'SENSEX', 'FINNIFTY', 'MIDCPNIFTY', 'BANKEX', 'NIFTYNXT50'} else 'stock'
+        contract['chain_key'] = key
+        group = groups.setdefault(key, {'key': key, 'broker': broker, 'symbol': contract['underlying'], 'name': contract['underlying'], 'exchange': contract['exchange'], 'kind': kind, 'type': kind, 'contracts': []})
         group['contracts'].append(contract)
-    if not groups:
-        raise ValueError('No current stock or index options were found in the official master. Existing catalog retained.')
     for group in groups.values():
-        contracts = group['contracts']
-        group['expiries'] = sorted({c['expiry'] for c in contracts})
-        group['lot_size'] = next(c['lot_size'] for c in contracts if c['expiry'] == group['expiries'][0])
-        group['contract_count'] = len(contracts)
+        group['expiries'] = sorted({c['expiry'] for c in group['contracts']})
+        group['lot_size'] = next(c['lot_size'] for c in group['contracts'] if c['expiry'] == group['expiries'][0])
+        group['contract_count'] = len(group['contracts'])
     return groups
 
 
-def master_status(db):
-    index = master_index(db)
-    dates, total = index['updated_at'], len(index['rows'])
-    return {'status': 'ready' if total else 'not_loaded', 'updated_at': dates, 'source': DHAN_MASTER_URL,
-            'underlying_count': total, 'stale': bool(dates and age(dates) > 86400), 'read_only': True}
+def live_universe(broker):
+    validate_broker(broker)
+    if engine.catalog is None:
+        return {}
+    today = datetime.now(IST).date().isoformat()
+    cache = _universes.setdefault(engine.catalog, {})
+    identity = (engine.catalog.revision, today)
+    if broker in cache and cache[broker][0] == identity:
+        return cache[broker][1]
+    rows = [c for c in engine.catalog._live if c['broker'] == broker and c['expiry'] >= today]
+    # Existing normalized identities are retained to support open positions.
+    groups = {}
+    indices = {'NIFTY', 'BANKNIFTY', 'SENSEX', 'FINNIFTY', 'MIDCPNIFTY', 'BANKEX', 'NIFTYNXT50'}
+    for c in rows:
+        if c['option_type'] not in {'CE', 'PE'}:
+            continue
+        key = f"{c['exchange']}:{c['underlying']}"
+        kind = 'commodity' if c['exchange'] == 'MCX' else 'index' if c['underlying'] in indices else 'stock'
+        group = groups.setdefault(key, {'key': key, 'broker': broker, 'symbol': c['underlying'], 'name': c['underlying'], 'exchange': c['exchange'], 'kind': kind, 'type': kind, 'contracts': []})
+        group['contracts'].append(c)
+    for group in groups.values():
+        group['expiries'] = sorted({c['expiry'] for c in group['contracts']})
+        group['lot_size'] = next(c['lot_size'] for c in group['contracts'] if c['expiry'] == group['expiries'][0])
+        group['contract_count'] = len(group['contracts'])
+        group['updated_at'] = min((c['imported_at'] for c in group['contracts'] if c.get('imported_at')), default=None)
+    cache[broker] = (identity, groups)
+    return groups
 
 
-def master_index(db):
-    """Read small metadata once; never pull the entire contract universe to list it."""
-    bind = db.get_bind()
-    cached = _master_indexes.get(bind)
-    if cached is None:
-        rows = db.execute(select(ChainMaster.metadata_json, ChainMaster.updated_at)).all()
-        cached = {'rows': [r.metadata_json for r in rows], 'updated_at': min((r.updated_at for r in rows), default=None),
-                  'last_attempt': 0.0, 'last_error': None}
-        _master_indexes[bind] = cached
-    return cached
+def master_status(db=None, broker='kotak'):
+    rows = live_universe(broker)
+    dates = [row['updated_at'] for row in rows.values() if row.get('updated_at')]
+    stamp = min(dates, default=None)
+    return {'status': 'ready' if rows else 'not_loaded', 'broker': broker, 'updated_at': stamp,
+            'source': 'selected_broker_instrument_master', 'underlying_count': len(rows),
+            'stale': bool(stamp and age(stamp) > 86400), 'read_only': True}
 
 
-def selected_master(db, key):
-    cache = _selected_masters.setdefault(db.get_bind(), OrderedDict())
-    if key in cache:
-        cache.move_to_end(key)
-        return cache[key]
-    row = db.execute(select(ChainMaster.metadata_json, ChainMaster.contracts, ChainMaster.updated_at).where(ChainMaster.key == key)).first()
-    if row is None:
-        return None
-    value = (row.metadata_json, row.contracts, row.updated_at)
-    cache[key] = value
-    while len(cache) > MAX_SELECTED_CHAINS:
-        cache.popitem(last=False)
-    return value
+def download_master(broker):
+    validate_broker(broker)
+    segments = ('nse_fo', 'bse_fo', 'mcx_fo') if broker == 'kotak' else (None,)
+    client = None
+    if broker == 'kotak':
+        os.environ['NEO_LOG_LEVEL'] = 'NOLOG'
+        os.environ['NEO_LOG_FILE_ENABLED'] = 'false'
+        from neo_api_client import NeoAPI
+        from neo_api_client.logger import setup_logging
+        setup_logging(level='NOLOG', file_enabled=False)
+        if not os.getenv('KOTAK_CONSUMER_KEY'):
+            raise ValueError('Kotak consumer key required for official instrument master')
+        client = NeoAPI(consumer_key=os.environ['KOTAK_CONSUMER_KEY'], environment='prod', timeout=30)
+    result = []
+    total = 0
+    for segment in segments:
+        url = client.scrip_master(exchange_segment=segment) if client else FIVEPAISA_MASTER_URL
+        if not isinstance(url, str) or not url.startswith('https://'):
+            raise ValueError('Broker did not return an HTTPS master URL')
+        with urllib.request.urlopen(url, timeout=90) as response:
+            raw = response.read(100 * 1024 * 1024 + 1)
+        total += len(raw)
+        if total > 100 * 1024 * 1024:
+            raise ValueError('Broker master exceeds 100 MiB bounded download size')
+        for row in csv.DictReader(io.StringIO(raw.decode('utf-8-sig'))):
+            try:
+                result.append(normalize_row(broker, row, segment))
+            except ValueError as exc:
+                if str(exc) not in {'Not an option contract', 'Unsupported derivative segment'}:
+                    raise
+    if not result:
+        raise ValueError('No validated current derivatives found; previous master retained')
+    return result
 
 
-def write_master(db, values):
-    # Replacing the complete master is atomic. A failed import retains the last
-    # verified universe; no full old contract JSON is selected to perform it.
-    db.execute(delete(ChainMaster))
-    for offset in range(0, len(values), 20):
-        db.execute(insert(ChainMaster), values[offset:offset+20])
-    db.commit()
+def save_master(broker, contracts):
+    path = engine.catalog.path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {'instruments': []}
+    old = previous.get('instruments', []) if isinstance(previous, dict) else previous
+    rows = [r for r in old if r.get('broker') != broker] + contracts
+    encoded = json.dumps({'updated_at': iso_now(), 'instruments': rows}, separators=(',', ':'))
+    if len(encoded.encode('utf-8')) > 256 * 1024 * 1024:
+        raise ValueError('Instrument cache exceeds 256 MiB bound')
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(encoded, encoding='utf-8')
+    temporary.replace(path)
+    engine.catalog.reload()
 
 
-async def refresh_master(db, force=False):
+async def refresh_master(db, force=False, broker='kotak'):
+    validate_broker(broker)
     async with _master_lock:
-        current = master_status(db)
-        index = master_index(db)
-        if current['updated_at'] and age(current['updated_at']) < (MASTER_REFRESH_SECONDS if force else 86400):
-            return current
-        if time.monotonic()-index['last_attempt'] < MASTER_REFRESH_SECONDS and index['last_error']:
-            if current['underlying_count']:
-                return {**current, 'status': 'cached', 'message': index['last_error']}
-            raise HTTPException(503, index['last_error'])
-        index['last_attempt'] = time.monotonic()
-        # Release the read transaction while a public CSV is downloaded.
-        db.rollback()
+        state = master_status(db, broker)
+        if state['updated_at'] and age(state['updated_at']) < (MASTER_REFRESH_SECONDS if force else 86400):
+            return state
+        if time.monotonic() - _attempts.get(broker, -MASTER_REFRESH_SECONDS) < MASTER_REFRESH_SECONDS:
+            return {**state, 'message': 'Refresh is rate limited to one attempt per five minutes.'}
+        _attempts[broker] = time.monotonic()
+        db.rollback()  # Do not hold a Neon transaction during a master download.
         try:
-            groups = await asyncio.to_thread(download_master)
+            contracts = await asyncio.to_thread(download_master, broker)
+            async with _write_lock:
+                await asyncio.to_thread(save_master, broker, contracts)
+            return master_status(db, broker)
         except Exception as exc:
-            index['last_error'] = 'The official instrument catalog could not be downloaded. Try Refresh catalog again in five minutes.'
-            if current['underlying_count']:
-                return {**current, 'status': 'cached', 'message': f'Official master refresh unavailable ({type(exc).__name__}); last verified catalog retained.'}
-            raise HTTPException(503, index['last_error']) from None
-        stamp = iso_now()
-        values = []
-        for key, group in groups.items():
-            metadata = {k: v for k, v in group.items() if k != 'contracts'}
-            values.append({'key': key, 'symbol': group['symbol'], 'exchange': group['exchange'], 'kind': group['kind'],
-                           'metadata_json': metadata, 'contracts': group['contracts'], 'updated_at': stamp})
-        async with _write_lock:
-            await asyncio.to_thread(write_master, db, values)
-        _master_indexes[db.get_bind()] = {'rows': [v['metadata_json'] for v in values], 'updated_at': stamp,
-                                         'last_attempt': time.monotonic(), 'last_error': None}
-        _selected_masters.pop(db.get_bind(), None)
-        _snapshots.pop(db.get_bind(), None)
-        return master_status(db)
+            return {**state, 'status': 'cached' if state['underlying_count'] else 'unavailable',
+                    'message': f'Official {broker} master unavailable ({type(exc).__name__}); existing contracts retained.'}
 
 
 def ensure_sample_stocks(catalog):
@@ -239,22 +265,22 @@ def ensure_sample_stocks(catalog):
                         identifier = f'DEMO:{symbol}:{expiry}:{strike}:{kind}'
                         catalog._demo.append({'id': identifier, 'instrument_id': identifier, 'broker': broker, 'token': 'DEMO',
                             'symbol': f'{symbol} {expiry} {strike} {kind}', 'underlying': symbol, 'exchange': 'NSE',
-                            'segment': 'NSE_FNO' if broker == 'dhan' else 'nse_fo' if broker == 'kotak' else 'D',
+                            'segment': 'nse_fo' if broker == 'kotak' else 'D',
                             'expiry': expiry, 'strike': strike, 'option_type': kind, 'lot_size': lot, 'tick_size': .05,
                             'demo': True, 'source': 'synthetic_demo', 'spot': spot, 'base_price': round(intrinsic + max(step*.2, step*2.8-abs(offset)*step*.18), 2),
                             'price_multiplier': 1.0, 'multiplier_verified': True, 'ltp': intrinsic + step})
 
 
-def sample_universe(catalog, broker='dhan'):
+def sample_universe(catalog, broker='kotak'):
     ensure_sample_stocks(catalog)
     groups = {}
     indices = {'NIFTY', 'BANKNIFTY', 'SENSEX'}
     for c in catalog.all(demo=True) if catalog else []:
-        if c['broker'] != broker or c['exchange'] not in {'NSE', 'BSE'}:
+        if c['broker'] != broker or c['exchange'] not in {'NSE', 'BSE', 'MCX'} or c['option_type'] not in {'CE', 'PE'}:
             continue
         key = f"{c['exchange']}:{c['underlying']}"
         group = groups.setdefault(key, {'key': key, 'symbol': c['underlying'], 'name': c['underlying'], 'exchange': c['exchange'],
-                                       'kind': 'index' if c['underlying'] in indices else 'stock', 'type': 'index' if c['underlying'] in indices else 'stock',
+                                       'kind': 'commodity' if c['exchange'] == 'MCX' else 'index' if c['underlying'] in indices else 'stock', 'type': 'commodity' if c['exchange'] == 'MCX' else 'index' if c['underlying'] in indices else 'stock',
                                        'expiries': [], 'lot_size': c['lot_size'], 'contract_count': 0, 'demo': True})
         group['expiries'].append(c['expiry'])
         group['contract_count'] += 1
@@ -284,7 +310,7 @@ def normalize_leg(raw, contract, stamp):
             'volume_change_percent': percent(volume-previous_volume if volume is not None and previous_volume is not None else None, previous_volume),
             'iv': number(raw.get('implied_volatility'), positive=True), **{g: number(greeks.get(g)) for g in ('delta', 'gamma', 'theta', 'vega')},
             'ltp_change': change, 'ltp_change_percent': percent(change, previous), 'change': change, 'change_percent': percent(change, previous),
-            'buildup': buildup, 'quote_at': stamp if raw else None, 'demo': contract.get('demo', False), 'contract': dict(contract)}
+            'buildup': buildup, 'quote_at': raw.get('received_at', stamp) if raw else None, 'exchange_timestamp': raw.get('exchange_timestamp'), 'stale': raw.get('stale', not bool(raw)), 'demo': contract.get('demo', False), 'contract': dict(contract)}
 
 
 def sample_raw(contract, spot):
@@ -319,8 +345,7 @@ def build_chain(metadata, contracts, expiry, raw=None, stamp=None, demo=False):
         instruments.append(c)
         strike = float(c['strike'])
         row = rows.setdefault(strike, {'strike': strike, 'ce': None, 'pe': None})
-        # Dhan serializes strike keys with six decimals; parsing float avoids
-        # locale/string formatting assumptions and preserves one-sided strikes.
+        # Numeric strike matching is independent of locale/string formatting.
         native = strike_data.get(strike, {})
         fields = sample_raw(c, spot) if demo else (native or {}).get(c['option_type'].lower(), {})
         # Reject a response contract mismatch instead of valuing another token.
@@ -331,8 +356,8 @@ def build_chain(metadata, contracts, expiry, raw=None, stamp=None, demo=False):
         if leg['ltp'] is not None and leg['ltp'] > 0:
             quotes.append({**{k: c.get(k) for k in ('underlying','exchange','segment','symbol','expiry','strike','option_type')},
                            'broker': c['broker'], 'instrument_id': c['id'], 'ltp': leg['ltp'], 'bid': leg['bid'], 'ask': leg['ask'],
-                           'open_interest': leg['oi'], 'volume': leg['volume'], 'received_at': stamp, 'demo': demo,
-                           'source': 'synthetic_option_chain' if demo else 'dhan_option_chain', 'exchange_timestamp': None,
+                           'open_interest': leg['oi'], 'volume': leg['volume'], 'received_at': leg['quote_at'], 'demo': demo,
+                           'source': 'synthetic_option_chain' if demo else c['broker'], 'exchange_timestamp': leg['exchange_timestamp'],
                            'iv': leg['iv'], **{g: leg[g] for g in ('delta','gamma','theta','vega')}})
     values = sorted(rows.values(), key=lambda r: r['strike'])
     atm = min(rows, key=lambda strike: abs(strike-spot)) if rows and spot is not None else None
@@ -349,184 +374,105 @@ def build_chain(metadata, contracts, expiry, raw=None, stamp=None, demo=False):
                'days_to_expiry': max(0, (datetime.fromisoformat(expiry).date()-datetime.now(IST).date()).days),
                'total_call_oi': calls, 'total_put_oi': puts}
     return {'underlying': metadata, 'expiry': expiry, 'expiries': metadata['expiries'], 'mode': 'sample' if demo else 'live', 'demo': demo,
-            'source': 'Fictional sample option chain' if demo else 'Dhan option-chain Data API', 'source_url': SOURCE,
+            'source': 'Fictional sample option chain' if demo else metadata.get('broker', '') + ' independent market feed', 'source_url': SOURCES.get(metadata.get('broker'), ''),
             'quantity_unit': 'units' if demo else 'broker_reported',
             'updated_at': stamp, 'as_of': stamp, 'spot': spot, 'summary': summary, 'metrics': summary, 'lot_size': summary['lot_size'],
             'rows': values, 'instruments': instruments, 'quotes': quotes, 'refresh_after_seconds': MIN_INTERVAL}
 
 
-async def dhan_post(path, body):
-    if path not in {'/optionchain', '/optionchain/expirylist'}:
-        raise ValueError('Only option-chain market-data endpoints are supported')
-    async with httpx.AsyncClient(timeout=25, follow_redirects=False) as client:
-        response = await client.post('https://api.dhan.co/v2'+path, json=body,
-            headers={'access-token': os.environ['DHAN_ACCESS_TOKEN'], 'client-id': os.environ['DHAN_CLIENT_ID']})
-        if response.status_code in {401,403}:
-            raise HTTPException(503, 'Dhan market-data access requires a valid session and Data API permission.')
-        if response.status_code == 429:
-            raise HTTPException(429, 'Dhan option-chain rate limit reached. Wait before refreshing.')
-        if response.status_code != 200:
-            raise HTTPException(503, 'The Dhan market-data service is unavailable. Last received data is retained.')
-        try:
-            payload = response.json()
-        except ValueError:
-            raise HTTPException(503, 'Dhan returned an unreadable market-data response.') from None
-        if not isinstance(payload, dict) or payload.get('status') != 'success':
-            raise HTTPException(503, 'Dhan did not return a successful option-chain data response.')
-        return payload
-
-
-async def active_expiries(metadata):
-    key = metadata['key']
-    cached = _expiry_cache.get(key)
-    if cached and time.monotonic()-cached[0] < 300:
-        return cached[1]
-    payload = await dhan_post('/optionchain/expirylist', {'UnderlyingScrip': metadata['underlying_security_id'], 'UnderlyingSeg': metadata['underlying_segment']})
-    data = payload.get('data')
-    if not isinstance(data, list):
-        raise HTTPException(503, 'Dhan returned an unreadable expiry list.')
-    expiries = sorted({v for v in data if isinstance(v, str) and v in metadata['expiries']})
-    if not expiries:
-        raise HTTPException(503, 'The broker expiry list and current instrument master do not match. Refresh the catalog.')
-    _expiry_cache[key] = (time.monotonic(), expiries)
-    return expiries
-
-
-def install_contracts(db, contracts, revision):
-    if engine.catalog is None:
-        raise HTTPException(503, 'The instrument catalog is not ready.')
-    identity = (contracts[0].get('chain_key'), revision) if contracts else None
-    if identity != getattr(engine.catalog, '_selected_chain_identity', None):
-        active_ids = {leg['instrument_id'] for row in db.scalars(select(Trade).where(Trade.status.in_(['open', 'pending'])))
-                      for leg in row.data.get('legs', []) if leg.get('status') in {'open', 'pending'}}
-        engine.catalog.select_chain_contracts(contracts, active_ids)
-        engine.catalog._selected_chain_identity = identity
-
-
-def journal_chain(db, quotes):
-    """Keep a bounded latest view; durable receipts are only for active trades."""
-    active = [leg for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending'])))
-              if row.data.get('demo') is False for leg in row.data.get('legs', [])]
-    identities = {engine.contract_identity(leg) for leg in active}
-    for quote in quotes:
-        if engine.contract_identity(quote) in identities:
-            engine.record_quote(db, quote, process=False)
-        else:
-            # Browsing hundreds of strikes must not journal hundreds of price
-            # histories. A later paper entry can use this timestamped mark.
-            engine.cache_quote(db, quote, persist=False)
-    db.commit()
-    while engine.recover_pending_quotes(db):
-        db.commit()
-
-
-def persist_snapshot(db, key, result):
-    journal_chain(db, result['quotes'])
-    cache = _snapshots.setdefault(db.get_bind(), OrderedDict())
-    cache[key] = result
-    cache.move_to_end(key)
-    while len(cache) > MAX_SELECTED_CHAINS:
-        cache.popitem(last=False)
-
 
 @router.get('/underlyings')
 async def underlyings(q: str = Query('', max_length=100), mode: Literal['sample','live'] | None = None,
-                      broker: Literal['dhan','kotak','fivepaisa'] = 'dhan', db: Session = Depends(get_db)):
+                      broker: Literal['kotak','fivepaisa'] = 'kotak', db: Session = Depends(get_db)):
+    validate_broker(broker)
     selected_mode = mode_value(db, mode)
-    if selected_mode == 'sample':
-        rows = sample_universe(engine.catalog, broker)
-        status = {**master_status(db), 'sample_notice': 'Sample contracts and stock examples are fictional; choose Market data for the complete official F&O universe.'}
-    else:
-        if broker != 'dhan':
-            return {'underlyings': [], 'total': 0, 'mode': 'live', 'demo': False, 'configured': False,
-                    'master': master_status(db), 'message': 'The full option-chain service currently uses Dhan market data. Other broker feeds remain independent.'}
-        status = await refresh_master(db)
-        rows = master_index(db)['rows']
+    groups = sample_universe(engine.catalog, broker) if selected_mode == 'sample' else [{k:v for k,v in g.items() if k != 'contracts'} for g in live_universe(broker).values()]
     query = q.strip().upper()
-    filtered = [r for r in rows if not query or query in r['symbol'].upper() or query in r['name'].upper()]
-    filtered.sort(key=lambda r: (r['kind'] != 'index', r['exchange'] != 'NSE', r['symbol']))
-    return {'underlyings': filtered, 'total': len(rows), 'filtered_total': len(filtered), 'mode': selected_mode,
-            'demo': selected_mode == 'sample', 'master': status, 'configured': configured() if broker == 'dhan' else False}
+    rows = [r for r in groups if not query or query in r['symbol'].upper() or query in r['name'].upper()]
+    rows.sort(key=lambda r: (r['kind'] != 'index', r['exchange'] != 'NSE', r['symbol']))
+    return {'underlyings': rows, 'total': len(groups), 'filtered_total': len(rows), 'mode': selected_mode,
+            'demo': selected_mode == 'sample', 'master': master_status(db, broker), 'configured': configured(broker),
+            'message': 'Import or refresh this broker’s official master to list every entitled NSE/BSE/MCX option. Missing live fields remain unavailable.'}
 
 
 @router.post('/master/refresh')
-async def reload_master(db: Session = Depends(get_db)):
-    return {'ok': True, 'master': await refresh_master(db, force=True)}
+async def reload_master(broker: Literal['kotak','fivepaisa'] = 'kotak', db: Session = Depends(get_db)):
+    result = await refresh_master(db, force=True, broker=broker)
+    if _refresh_feeds:
+        await _refresh_feeds(db)
+    return {'ok': result['status'] in {'ready', 'cached'}, 'master': result}
+
+
+def cached_live_data(db, contracts, expiry, stale_after):
+    oc, stamps = {}, []
+    active = [c for c in contracts if c['expiry'] == expiry]
+    broker = active[0]['broker'] if active else None
+    # One bounded database lookup, not two queries for every missing strike.
+    state = engine._cache(db)
+    with engine._cache_lock:
+        marks = {key: dict(value) for key, value in state['quotes'].items() if key[0] == broker}
+    missing = [c['id'] for c in active if (broker, c['id']) not in marks]
+    if missing:
+        for row in db.scalars(select(LatestQuote).where(LatestQuote.broker == broker, LatestQuote.instrument_id.in_(missing))):
+            marks[(row.broker, row.instrument_id)] = row.data
+    for contract in active:
+        if contract['expiry'] != expiry:
+            continue
+        quote = marks.get((contract['broker'], contract['id']))
+        if not quote or quote.get('demo') is not False or quote.get('broker') != contract['broker']:
+            continue
+        stamp = quote.get('received_at')
+        stamps.append(stamp)
+        raw = {'security_id': contract['token'], 'last_price': quote.get('ltp'), 'top_bid_price': quote.get('bid'),
+               'top_ask_price': quote.get('ask'), 'oi': quote.get('open_interest'), 'volume': quote.get('volume'),
+               'previous_close_price': quote.get('previous_close'), 'previous_oi': quote.get('previous_open_interest'),
+               'received_at': stamp, 'exchange_timestamp': quote.get('exchange_timestamp'), 'stale': age(stamp) > stale_after}
+        # No Greeks from a different broker and no made-up Black-Scholes values.
+        oc.setdefault(str(contract['strike']), {})[contract['option_type'].lower()] = raw
+    return {'data': {'oc': oc}}, min((s for s in stamps if s), default=None)
 
 
 @router.get('')
 async def option_chain(underlying: str = Query(..., min_length=1, max_length=180), expiry: str | None = None,
-                       mode: Literal['sample','live'] | None = None, broker: Literal['dhan','kotak','fivepaisa'] = 'dhan',
+                       mode: Literal['sample','live'] | None = None, broker: Literal['kotak','fivepaisa'] = 'kotak',
                        db: Session = Depends(get_db)):
+    validate_broker(broker)
     selected_mode = mode_value(db, mode)
     demo = selected_mode == 'sample'
-    workspace_matches = bool(engine.get_settings(db)['demo_mode']) == demo
+    settings = engine.get_settings(db)
+    workspace_matches = bool(settings['demo_mode']) == demo
     if demo:
         choices = sample_universe(engine.catalog, broker)
         metadata = next((r for r in choices if r['key'] == underlying or r['symbol'] == underlying), None)
-        if not metadata:
-            raise HTTPException(404, 'Choose a sample underlying from the catalog.')
-        contracts = [c for c in engine.catalog.all(demo=True) if c['underlying'] == metadata['symbol'] and c['exchange'] == metadata['exchange'] and c['broker'] == broker]
+        contracts = [c for c in engine.catalog.all(demo=True) if metadata and c['broker'] == broker and c['exchange'] == metadata['exchange'] and c['underlying'] == metadata['symbol'] and c['option_type'] in {'CE','PE'}]
     else:
-        if broker != 'dhan':
-            raise HTTPException(422, 'Full live option chains use the Dhan market-data source. No broker order is sent.')
-        await refresh_master(db)
-        master = selected_master(db, underlying)
-        if not master:
-            raise HTTPException(404, 'Choose a stock or index from the current official F&O catalog.')
-        metadata, contracts, revision = master
-        metadata = copy.deepcopy(metadata)
-        install_contracts(db, contracts, revision)
+        group = live_universe(broker).get(underlying)
+        metadata = {k:v for k,v in group.items() if k != 'contracts'} if group else None
+        contracts = group['contracts'] if group else []
+    if not metadata:
+        raise HTTPException(404, 'Choose an underlying from this broker’s instrument catalog. Refresh its master if missing.')
+    metadata = {**metadata, 'broker': broker}
     expiry = expiry or metadata['expiries'][0]
     if expiry not in metadata['expiries']:
         raise HTTPException(422, 'Choose an active expiry from this underlying’s master.')
-    base = build_chain(metadata, contracts, expiry, demo=demo, stamp=iso_now() if demo else None)
-    base.update(status='sample' if demo else 'credentials_required', stale=not demo, mode_matches_workspace=workspace_matches,
-                trading_enabled=demo and workspace_matches, read_only=True)
+    selected = [c for c in contracts if c['expiry'] == expiry]
     if demo:
-        base['message'] = 'Fictional prices, Greeks, lot sizes and stock examples for practice. No market data is implied.'
-        return base
-    if not configured():
-        base['message'] = 'All listed contracts come from the official instrument master. Add Dhan Data API credentials on the backend for live prices, OI and Greeks.'
-        return base
-    key = f'{underlying}:{expiry}'
-    async with _request_lock:
-        cache = _snapshots.setdefault(db.get_bind(), OrderedDict())
-        cached = cache.get(key)
-        if cached and age(cached['updated_at']) < MIN_INTERVAL:
-            cache.move_to_end(key)
-            return {**cached, 'stale': age(cached['updated_at']) > 10, 'cached': True,
-                    'mode_matches_workspace': workspace_matches, 'trading_enabled': workspace_matches}
-        attempt_key = (db.get_bind(), key)
-        if time.monotonic()-_attempts.get(attempt_key, -MIN_INTERVAL) < MIN_INTERVAL:
-            if cached:
-                return {**cached, 'stale': True, 'cached': True, 'trading_enabled': False, 'mode_matches_workspace': workspace_matches,
-                        'message': 'Refresh is rate limited; the timestamp shows the last received broker snapshot.'}
-            raise HTTPException(429, 'Wait three seconds before requesting this option chain again.')
-        _attempts[attempt_key] = time.monotonic()
-        if len(_attempts) > 256:
-            del _attempts[next(iter(_attempts))]
-        try:
-            metadata['expiries'] = await active_expiries(metadata)
-            if expiry not in metadata['expiries']:
-                raise HTTPException(422, 'The broker no longer lists this expiry. Refresh the catalog.')
-            raw = await dhan_post('/optionchain', {'UnderlyingScrip': metadata['underlying_security_id'], 'UnderlyingSeg': metadata['underlying_segment'], 'Expiry': expiry})
-            if not isinstance((raw.get('data') or {}).get('oc'), dict):
-                raise HTTPException(503, 'Dhan returned an option chain without strike data.')
-            stamp = iso_now()
-            result = build_chain(metadata, contracts, expiry, raw, stamp)
-            if not result['quotes']:
-                raise HTTPException(503, 'The broker returned no usable prices for the selected expiry. No values were invented.')
-            result.update(status='connected', stale=False, cached=False, read_only=True, mode_matches_workspace=workspace_matches, trading_enabled=workspace_matches)
-            async with _write_lock:
-                await asyncio.to_thread(persist_snapshot, db, key, result)
-            return result
-        except (httpx.HTTPError, HTTPException) as exc:
-            if cached:
-                return {**cached, 'status': 'stale', 'stale': True, 'cached': True, 'trading_enabled': False,
-                        'mode_matches_workspace': workspace_matches, 'message': 'The broker snapshot could not be refreshed. Last received data is retained.'}
-            if isinstance(exc, HTTPException):
-                base['status'] = 'rate_limited' if exc.status_code == 429 else 'unavailable'
-                base['message'] = exc.detail
-                return base
-            return {**base, 'status': 'unavailable', 'message': 'The broker snapshot is unavailable. No values were invented.'}
+        result = build_chain(metadata, selected, expiry, demo=True, stamp=iso_now())
+        result.update(status='sample', stale=False, trading_enabled=workspace_matches,
+                      message='Fictional prices, Greeks and quantities for practice; no live market data is implied.')
+    else:
+        # Only the most recently viewed chain per broker receives a temporary
+        # subscription. Active positions are retained independently by main.
+        _requested[broker] = (time.monotonic() + CHAIN_SUBSCRIPTION_SECONDS, {c['id'] for c in selected})
+        if _refresh_feeds:
+            await _refresh_feeds(db)
+        raw, stamp = cached_live_data(db, selected, expiry, settings['stale_after_seconds'])
+        result = build_chain(metadata, selected, expiry, raw=raw, stamp=stamp)
+        fresh = [q for row in result['rows'] for q in (row['ce'], row['pe']) if q and q['ltp'] is not None and not q['stale']]
+        result.update(status='connected' if fresh else 'stale' if result['quotes'] else 'awaiting_quotes' if configured(broker) else 'credentials_required',
+                      stale=not bool(fresh), trading_enabled=workspace_matches and bool(fresh),
+                      message='Prices are from the selected broker only. OI, spot and Greeks remain unavailable when its feed does not supply them; stale rows retain their original quote timestamps.',
+                      capabilities={'ltp': True, 'bid_ask': True, 'open_interest': True, 'spot': False, 'greeks': False,
+                                    'greeks_note': '5paisa offers a separate NSE-only Greeks feed; binary wire format/entitlements need broker verification. Kotak depth messages do not carry Greeks.'})
+    result.update(read_only=True, mode_matches_workspace=workspace_matches)
+    return result

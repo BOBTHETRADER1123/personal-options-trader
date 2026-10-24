@@ -1,4 +1,4 @@
 # Optional: install for current Kotak Neo async SFeed and authentication.
-# Dhan and 5paisa direct read-only WebSocket adapters use core dependencies.
+# 5paisa direct read-only WebSocket adapters use core dependencies.
 kotakneoapi==3.0.9
 pyotp>=2.9,<3

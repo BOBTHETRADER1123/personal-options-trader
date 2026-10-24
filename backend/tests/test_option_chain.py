@@ -1,296 +1,186 @@
-"""Read-only chain behavior, current master identity and bounded storage tests."""
+"""Read-only chains use exact identities and independent broker price caches."""
 import asyncio
-import time
+import json
 from datetime import datetime, timedelta, timezone
 
-import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlalchemy.exc import OperationalError
 
 from app import engine, option_chain as chain
-from app.database import Base, configure_sqlite, get_db, iso_now
-from app.instruments import ContractCatalog
-from app.models import QuoteEvent, UserSession
+from app.database import Base, get_db, iso_now
+from app.instruments import ContractCatalog, normalize_row
+from app.models import LatestQuote, UserSession
 from app.security import COOKIE, digest
 
 
-def native(token, kind='CE', *, symbol='NIFTY', exchange='NSE', instrument='OPTIDX', underlying_id='13',
-           strike='25000', expiry='2030-10-31'):
-    return {'EXCH_ID': exchange, 'SEGMENT': 'D', 'INSTRUMENT': instrument, 'SECURITY_ID': str(token),
-            'DISPLAY_NAME': f'{symbol} {expiry} {strike} {kind}', 'UNDERLYING_SYMBOL': symbol,
-            'UNDERLYING_SECURITY_ID': underlying_id, 'SM_EXPIRY_DATE': expiry, 'STRIKE_PRICE': strike,
-            'OPTION_TYPE': kind, 'LOT_SIZE': '50', 'TICK_SIZE': '.05'}
+def native(token, kind='CE', *, symbol='NIFTY', exchange='N', strike='25000', expiry='2030-10-31'):
+    return {'Exch': exchange, 'ExchType': 'D', 'ScripCode': str(token), 'Name': f'{symbol} {expiry} {strike} {kind}',
+            'SymbolRoot': symbol, 'Expiry': expiry, 'StrikeRate': strike, 'ScripType': kind, 'LotSize': '50', 'TickSize': '.05'}
 
 
-def groups():
-    return chain.parse_master([native(101), native(102, 'PE'),
-                               native(201, symbol='RELIANCE', instrument='OPTSTK', underlying_id='2885', strike='1400'),
-                               native(202, 'PE', symbol='RELIANCE', instrument='OPTSTK', underlying_id='2885', strike='1400'),
-                               native(301, exchange='BSE', symbol='SENSEX', underlying_id='51', strike='80000')], today='2026-10-22')
+def contracts(broker='fivepaisa'):
+    rows = [normalize_row('fivepaisa', native(101)), normalize_row('fivepaisa', native(102, 'PE')),
+            normalize_row('fivepaisa', native(201, symbol='RELIANCE', strike='1400')),
+            normalize_row('fivepaisa', native(301, exchange='B', symbol='SENSEX', strike='80000'))]
+    if broker == 'kotak':
+        rows = [{**row, 'broker': 'kotak', 'id': f"kotak:{'nse_fo' if row['exchange']=='NSE' else 'bse_fo'}:{row['token']}",
+                 'instrument_id': f"kotak:{'nse_fo' if row['exchange']=='NSE' else 'bse_fo'}:{row['token']}",
+                 'segment': 'nse_fo' if row['exchange']=='NSE' else 'bse_fo'} for row in rows]
+    return rows
 
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     sql = create_engine('sqlite://', connect_args={'check_same_thread': False}, poolclass=StaticPool)
-    configure_sqlite(sql)
     Base.metadata.create_all(sql)
     old_catalog = engine.catalog
-    engine.set_catalog(ContractCatalog(tmp_path/'absent.json'))
+    catalog = ContractCatalog(tmp_path/'instruments.json')
+    catalog.merge_live_contracts(contracts()+contracts('kotak'))
+    engine.set_catalog(catalog)
     chain.configure(asyncio.Lock())
-    chain._attempts.clear()
-    chain._expiry_cache.clear()
-    monkeypatch.delenv('DHAN_ACCESS_TOKEN', raising=False)
-    monkeypatch.delenv('DHAN_CLIENT_ID', raising=False)
+    chain._attempts.clear();chain._requested.clear()
+    for name in ('KOTAK_CONSUMER_KEY','KOTAK_SID','KOTAK_UCC','KOTAK_TOTP','KOTAK_TOTP_SECRET','FIVEPAISA_CLIENT_CODE','FIVEPAISA_ACCESS_TOKEN'):
+        monkeypatch.delenv(name, raising=False)
     with sessionmaker(sql, expire_on_commit=False)() as session:
         engine.update_settings(session, {'demo_mode': False, 'brokerage_per_order': 0, 'charges_percent': 0, 'fill_basis': 'ltp'})
         session.commit()
         yield session
+        engine.clear_cache(session)
     engine.set_catalog(old_catalog)
-    chain._master_indexes.pop(sql, None)
-    chain._selected_masters.pop(sql, None)
-    chain._snapshots.pop(sql, None)
-    sql.dispose()
+    chain.configure(asyncio.Lock());chain._requested.clear();sql.dispose()
 
 
-def load_master(db, monkeypatch):
-    monkeypatch.setattr(chain, 'download_master', groups)
-    return asyncio.run(chain.refresh_master(db))
+def get(db, broker='fivepaisa', **kwargs):
+    return asyncio.run(chain.option_chain('NSE:NIFTY', mode='live', broker=broker, db=db, **kwargs))
 
 
-def broker_snapshot():
-    return {'status': 'success', 'data': {'last_price': 25010, 'oc': {'25000.000000': {
-        'ce': {'security_id': 101, 'last_price': 110, 'previous_close_price': 100, 'oi': 2000, 'previous_oi': 1000,
-               'volume': 800, 'previous_volume': 400, 'top_bid_price': 109.5, 'top_ask_price': 110.5,
-               'implied_volatility': 12.5, 'greeks': {'delta': .55, 'gamma': .002, 'theta': -4.2, 'vega': 7.8}},
-        'pe': {'security_id': 102, 'last_price': 90, 'previous_close_price': 100, 'oi': 4000, 'previous_oi': 3000,
-               'volume': 600, 'previous_volume': 0, 'implied_volatility': 13.5, 'greeks': {'delta': -.45}}
-    }}}}
+def mark(db, broker='fivepaisa', price=110, stamp=None):
+    c = contracts(broker)[0]
+    value = {**c, 'instrument_id': c['id'], 'ltp': price, 'bid': price-.5, 'ask': price+.5,
+             'demo': False, 'received_at': stamp or iso_now(), 'exchange_timestamp': '2030-01-01T00:00:00+00:00', 'open_interest': 1000}
+    engine.cache_quote(db, value, persist=True)
+    db.commit()
+    return value
 
 
-def test_official_master_uses_all_stock_and_index_identities():
-    result = groups()
-    assert set(result) == {'NSE:NIFTY', 'NSE:RELIANCE', 'BSE:SENSEX'}
-    assert result['NSE:RELIANCE']['underlying_security_id'] == 2885
-    assert result['NSE:RELIANCE']['underlying_segment'] == 'NSE_EQ'
-    assert result['NSE:RELIANCE']['kind'] == 'stock'
-    assert result['BSE:SENSEX']['underlying_segment'] == 'IDX_I'
-    assert result['NSE:NIFTY']['expiries'] == ['2030-10-31']
-    assert result['NSE:NIFTY']['contracts'][0]['id'] == 'dhan:NSE_FNO:101'
-    assert result['NSE:NIFTY']['lot_size'] == 50
+def test_official_native_master_lists_stocks_indices_and_mcx_without_guessing_tokens():
+    groups = chain.parse_master([native(101), native(102,'PE'), native(201,symbol='RELIANCE',strike='1400'),
+                                 native(301,exchange='B',symbol='SENSEX',strike='80000'), native(401,exchange='M',symbol='GOLD',strike='75000')])
+    assert set(groups) == {'NSE:NIFTY','NSE:RELIANCE','BSE:SENSEX','MCX:GOLD'}
+    assert groups['NSE:RELIANCE']['kind']=='stock' and groups['MCX:GOLD']['kind']=='commodity'
+    assert groups['NSE:NIFTY']['contracts'][0]['id']=='fivepaisa:NSE:D:101'
+    assert groups['NSE:NIFTY']['expiries']==['2030-10-31']
+    with pytest.raises(ValueError,match='Duplicate'):
+        chain.parse_master([native(101),native(101)])
 
 
-def test_invalid_or_duplicate_identity_rejected_instead_of_guessing():
-    with pytest.raises(ValueError, match='underlying security ID'):
-        chain.parse_master([native(101, underlying_id='')], today='2026-10-22')
-    with pytest.raises(ValueError, match='duplicate'):
-        chain.parse_master([native(101), native(999)], today='2026-10-22')
-    assert not any(c['expiry'] == '2020-01-01' for g in chain.parse_master(
-        [native(101), native(999, expiry='2020-01-01')], today='2026-10-22').values() for c in g['contracts'])
+def test_broker_removed_from_all_active_chain_entry_points(db):
+    with pytest.raises(HTTPException) as error:get(db,'dhan')
+    assert error.value.status_code==422
+    with pytest.raises(HTTPException):chain.configured('dhan')
 
 
-def test_quote_mapping_preserves_missing_fields_and_derives_ratios():
-    group = groups()['NSE:NIFTY']
-    result = chain.build_chain(group, group['contracts'], '2030-10-31', broker_snapshot(), iso_now())
-    row = result['rows'][0]
-    assert row['atm'] and row['itm_call'] and not row['itm_put']
-    assert row['pcr'] == 2 and result['summary']['pcr'] == 2
-    assert result['summary']['atm_iv'] == 13
-    assert row['ce']['buildup'] == 'Long buildup'
-    assert row['pe']['buildup'] == 'Short buildup'
-    assert row['ce']['oi_change_percent'] == 100
-    assert row['ce']['volume_change_percent'] == 100
-    assert row['pe']['volume_change_percent'] is None
-    assert row['ce']['delta'] == .55 and row['pe']['delta'] == -.45
-    assert row['pe']['theta'] is None and row['pe']['bid'] is None
-    assert result['quotes'][0]['instrument_id'] == 'dhan:NSE_FNO:101'
-    assert result['quantity_unit'] == 'broker_reported'
+def test_missing_credentials_show_master_but_no_fake_live_prices(db):
+    result = get(db)
+    assert result['status']=='credentials_required' and result['stale'] and not result['trading_enabled']
+    assert result['rows'][0]['ce']['ltp'] is None and result['rows'][0]['ce']['delta'] is None
+    assert result['quotes']==[] and result['spot'] is None
+    assert chain.requested_contract_ids()=={c['id'] for c in contracts() if c['underlying']=='NIFTY'}
 
 
-def test_mismatched_token_cannot_price_a_different_contract():
-    raw = broker_snapshot()
-    raw['data']['oc']['25000.000000']['ce']['security_id'] = 999
-    group = groups()['NSE:NIFTY']
-    result = chain.build_chain(group, group['contracts'], '2030-10-31', raw, iso_now())
-    assert result['rows'][0]['ce']['ltp'] is None
-    assert len(result['quotes']) == 1
-    assert result['quotes'][0]['instrument_id'].endswith(':102')
+def test_independent_prices_never_borrow_from_other_broker(db):
+    five=mark(db,price=111)
+    kotak=get(db,'kotak')
+    assert kotak['quotes']==[] and kotak['rows'][0]['ce']['ltp'] is None
+    mark(db,'kotak',price=122)
+    assert get(db,'kotak')['rows'][0]['ce']['ltp']==122
+    result=get(db)
+    assert result['rows'][0]['ce']['ltp']==111
+    assert result['rows'][0]['ce']['quote_at']==five['received_at']
+    assert result['rows'][0]['ce']['exchange_timestamp']==five['exchange_timestamp']
+    assert all(q['broker']=='fivepaisa' for q in result['quotes'])
 
 
-def test_missing_credentials_show_official_contracts_without_invented_prices(db, monkeypatch):
-    load_master(db, monkeypatch)
-    result = asyncio.run(chain.option_chain('NSE:RELIANCE', mode='live', broker='dhan', db=db))
-    assert result['status'] == 'credentials_required'
-    assert result['spot'] is None and not result['trading_enabled']
-    assert result['rows'][0]['ce']['ltp'] is None and result['rows'][0]['pe']['oi'] is None
-    assert result['quotes'] == []
-    assert len(engine.catalog.all(demo=False)) == 2  # selected stock only
-    assert db.scalar(select(func.count()).select_from(QuoteEvent)) == 0
+def test_stale_marks_keep_original_timestamp_and_disable_trade(db):
+    stamp=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+    mark(db,stamp=stamp)
+    result=get(db)
+    assert result['status']=='stale' and result['stale'] and not result['trading_enabled']
+    assert result['rows'][0]['ce']['quote_at']==stamp
+    assert result['rows'][0]['ce']['stale'] and result['rows'][0]['ce']['ltp']==110
 
 
-def test_metadata_and_selected_contracts_are_not_reread_on_each_poll(db, monkeypatch):
-    load_master(db, monkeypatch)
-    asyncio.run(chain.option_chain('NSE:NIFTY', mode='live', broker='dhan', db=db))
-    statements = []
-    def count(_connection, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement.lower())
-    event.listen(db.get_bind(), 'before_cursor_execute', count)
-    try:
-        for _ in range(3):
-            result = asyncio.run(chain.underlyings(q='RELI', mode='live', broker='dhan', db=db))
-            asyncio.run(chain.option_chain('NSE:NIFTY', mode='live', broker='dhan', db=db))
-        assert result['total'] == 3 and result['underlyings'][0]['symbol'] == 'RELIANCE'
-        assert not any('option_chain_masters' in s for s in statements)
-        assert not any('option_chain_snapshots' in s for s in statements)
-    finally:
-        event.remove(db.get_bind(), 'before_cursor_execute', count)
+def test_selected_chain_subscription_requests_refresh_without_browser_dependency(db):
+    calls=[]
+    async def refresh(session):calls.append(chain.requested_contract_ids())
+    chain.configure(asyncio.Lock(),refresh)
+    get(db)
+    assert len(calls)==1 and calls[0]==chain.requested_contract_ids()
+    key=chain._requested['fivepaisa']
+    chain._requested['fivepaisa']=(0,key[1])
+    assert chain.requested_contract_ids()==set()
 
 
-def test_failed_master_download_retains_verified_catalog_and_backs_off(db, monkeypatch):
-    load_master(db, monkeypatch)
-    index = chain.master_index(db)
-    index['updated_at'] = '2020-01-01T00:00:00+00:00'
-    calls = []
-    def fail():
-        calls.append(True)
-        raise OSError('offline')
-    monkeypatch.setattr(chain, 'download_master', fail)
-    first = asyncio.run(chain.refresh_master(db))
-    second = asyncio.run(chain.refresh_master(db))
-    assert first['status'] == second['status'] == 'cached'
-    assert len(calls) == 1
-    assert db.scalar(select(func.count()).select_from(chain.ChainMaster)) == 3
+def test_unavailable_greeks_remain_null_and_are_explained(db):
+    mark(db)
+    result=get(db)
+    leg=result['rows'][0]['ce']
+    assert all(leg[key] is None for key in ('delta','gamma','vega','theta','iv'))
+    assert result['capabilities']['greeks'] is False
+    assert 'NSE-only' in result['capabilities']['greeks_note']
 
 
-def test_live_chain_is_read_only_cached_and_not_written_as_tick_history(db, monkeypatch):
-    load_master(db, monkeypatch)
-    monkeypatch.setenv('DHAN_CLIENT_ID', 'offline-test-client')
-    monkeypatch.setenv('DHAN_ACCESS_TOKEN', 'offline-test-token')
-    posts, marks = [], []
-    async def post(path, body):
-        posts.append((path, body))
-        return {'data': ['2030-10-31'], 'status': 'success'} if path.endswith('expirylist') else broker_snapshot()
-    monkeypatch.setattr(chain, 'dhan_post', post)
-    monkeypatch.setattr(engine, 'cache_quote', lambda _db, quote, persist=False: marks.append((quote, persist)))
-    first = asyncio.run(chain.option_chain('NSE:NIFTY', mode='live', broker='dhan', db=db))
-    second = asyncio.run(chain.option_chain('NSE:NIFTY', mode='live', broker='dhan', db=db))
-    assert first['status'] == 'connected' and second['cached']
-    assert posts == [('/optionchain/expirylist', {'UnderlyingScrip': 13, 'UnderlyingSeg': 'IDX_I'}),
-                     ('/optionchain', {'UnderlyingScrip': 13, 'UnderlyingSeg': 'IDX_I', 'Expiry': '2030-10-31'})]
-    assert len(marks) == 2 and all(persist is False for _, persist in marks)
-    assert db.scalar(select(func.count()).select_from(chain.ChainSnapshot)) == 0
-    assert db.scalar(select(func.count()).select_from(QuoteEvent)) == 0
+def test_live_chain_no_database_writes_or_per_strike_queries(db):
+    mark(db)
+    queries=[]
+    def capture(conn,cursor,statement,params,context,many):queries.append(statement)
+    event.listen(db.get_bind(),'before_cursor_execute',capture)
+    try:get(db)
+    finally:event.remove(db.get_bind(),'before_cursor_execute',capture)
+    assert not any(q.lstrip().upper().startswith(('INSERT','UPDATE','DELETE')) for q in queries)
+    assert len([q for q in queries if 'latest_quotes' in q])<=1
+    assert not any('quote_events' in q for q in queries)
 
 
-def test_failed_live_refresh_keeps_timestamped_data_but_disables_entries(db, monkeypatch):
-    load_master(db, monkeypatch)
-    monkeypatch.setenv('DHAN_CLIENT_ID', 'offline-test-client')
-    monkeypatch.setenv('DHAN_ACCESS_TOKEN', 'offline-test-token')
-    group = groups()['NSE:NIFTY']
-    stamp = (datetime.now(timezone.utc)-timedelta(minutes=2)).isoformat()
-    cached = chain.build_chain(group, group['contracts'], '2030-10-31', broker_snapshot(), stamp)
-    cached.update(status='connected', stale=False)
-    chain._snapshots[db.get_bind()] = {'NSE:NIFTY:2030-10-31': cached}
-    async def fail(*_):
-        raise httpx.ConnectError('offline')
-    monkeypatch.setattr(chain, 'dhan_post', fail)
-    result = asyncio.run(chain.option_chain('NSE:NIFTY', mode='live', broker='dhan', db=db))
-    assert result['status'] == 'stale' and result['stale'] and not result['trading_enabled']
-    assert result['updated_at'] == stamp and result['rows'][0]['ce']['ltp'] == 110
+def test_simulated_chain_only_two_brokers_and_not_live_execution(db):
+    result=asyncio.run(chain.option_chain('NSE:RELIANCE',mode='sample',broker='kotak',db=db))
+    assert result['demo'] and result['status']=='sample' and not result['trading_enabled']
+    assert result['mode_matches_workspace'] is False
+    assert all(q['broker']=='kotak' and q['demo'] for q in result['quotes'])
+    assert 'Fictional' in result['message']
 
 
-def test_snapshot_cache_is_bounded_and_never_persists_chain_payloads(db):
-    for i in range(20):
-        chain.persist_snapshot(db, f'underlying-{i}', {'quotes': [], 'updated_at': iso_now()})
-    assert len(chain._snapshots[db.get_bind()]) == chain.MAX_SELECTED_CHAINS
-    assert db.scalar(select(func.count()).select_from(chain.ChainSnapshot)) == 0
+def test_futures_not_shown_as_option_chain(db):
+    future=normalize_row('fivepaisa',native(999,'XX',strike='0'))
+    engine.catalog.merge_live_contracts([future])
+    result=get(db)
+    assert all(c['option_type'] in {'CE','PE'} for c in result['instruments'])
+    assert engine.catalog.find(future['id'])['option_type']=='FUT'
 
 
-def test_browsing_another_stock_keeps_active_but_discards_previous_untraded_chain(db, monkeypatch):
-    load_master(db, monkeypatch)
-    catalog = engine.catalog
-    nifty = groups()['NSE:NIFTY']['contracts']
-    reliance = groups()['NSE:RELIANCE']['contracts']
-    catalog.select_chain_contracts(nifty, set())
-    catalog.select_chain_contracts(reliance, {nifty[0]['id']})
-    assert {c['id'] for c in catalog.all(demo=False)} == {nifty[0]['id'], reliance[0]['id'], reliance[1]['id']}
-    restored = ContractCatalog(catalog.path)
-    restored.restore_live_contracts([{'demo': False, 'status': 'open', 'legs': [{**nifty[0], 'status': 'open'}]}])
-    assert restored.find(nifty[0]['id'])['token'] == '101'
+def test_refresh_is_broker_scoped_and_failed_download_preserves_file(db,monkeypatch):
+    old=contracts('kotak');path=engine.catalog.path
+    path.write_text(json.dumps({'instruments': old}))
+    monkeypatch.setattr(chain,'download_master',lambda broker:contracts(broker))
+    result=asyncio.run(chain.refresh_master(db,force=True,broker='fivepaisa'))
+    assert result['status']=='ready'
+    assert {c['broker'] for c in engine.catalog.all(False)}=={'kotak','fivepaisa'}
+    before=path.read_bytes()
+    chain._attempts.clear()
+    def fail(broker):raise OSError('credentials must never be echoed')
+    monkeypatch.setattr(chain,'download_master',fail)
+    # Force a stale master so refresh actually attempts the failing download.
+    for c in engine.catalog._live:c['imported_at']='2020-01-01T00:00:00+00:00'
+    engine.catalog.revision += 1
+    result=asyncio.run(chain.refresh_master(db,force=True,broker='fivepaisa'))
+    assert result['status']=='cached' and path.read_bytes()==before
+    assert 'credentials must never' not in result['message']
 
 
-def test_option_chain_router_requires_owner_and_csrf_for_catalog_write(db):
-    app = FastAPI()
-    app.include_router(chain.router)
-    app.dependency_overrides[get_db] = lambda: db
-    with TestClient(app) as client:
-        assert client.get('/api/option-chain/underlyings?mode=sample').status_code == 401
-        db.add(UserSession(token_hash=digest('offline-owner'), csrf_token='offline-csrf', expires_at=time.time()+3600))
-        db.commit()
-        client.cookies.set(COOKIE, 'offline-owner')
-        assert client.get('/api/option-chain/underlyings?mode=sample').status_code == 200
-        assert client.post('/api/option-chain/master/refresh').status_code == 403
-
-
-def test_only_documented_market_data_post_paths_are_allowed():
-    with pytest.raises(ValueError, match='market-data'):
-        asyncio.run(chain.dhan_post('/orders', {}))
-
-
-def test_database_quota_outage_keeps_health_available_and_pauses_sql_workers(monkeypatch, tmp_path):
-    from app import main, brokers, instruments, reporting
-    attempts, work = [], []
-    def unavailable():
-        attempts.append(True)
-        raise OperationalError('offline-test', {}, OSError('Database unavailable'))
-    class OfflineFeeds:
-        def __init__(self, **_):pass
-        async def start(self, *_):work.append('feed')
-        async def stop(self):pass
-    async def capture():work.append('capture')
-    async def reports(_):work.append('reports')
-    monkeypatch.setattr(main, 'database_ready', True)
-    monkeypatch.setattr(main, 'initialize_database', unavailable)
-    monkeypatch.setattr(main, 'background_loop', capture)
-    monkeypatch.setattr(main, 'DATABASE_RETRY_SECONDS', 60)
-    monkeypatch.setattr(reporting, 'reporting_loop', reports)
-    monkeypatch.setattr(brokers, 'FeedManager', OfflineFeeds)
-    monkeypatch.setattr(instruments, 'ContractCatalog', lambda: ContractCatalog(tmp_path/'absent.json'))
-    with TestClient(main.app) as client:
-        health = client.get('/api/health')
-        assert health.status_code == 200 and health.json()['ok']
-        assert health.json()['database_ready'] is False
-        session = client.get('/api/session')
-        assert session.status_code == 503 and session.headers['retry-after'] == '60'
-        assert session.json()['database_ready'] is False
-        assert len(attempts) == 1 and work == []
-
-
-def test_database_supervisor_retries_with_backoff_then_restarts_workers(monkeypatch):
-    from app import main
-    attempts, work = [], []
-    class OfflineFeeds:
-        async def stop(self):pass
-    async def initialize():
-        attempts.append(True)
-        if len(attempts) < 2:return False
-        main.database_ready = True
-        return True
-    async def capture():
-        work.append('capture')
-        main.stop_event.set()
-    async def reports(_):work.append('reports')
-    async def scenario():
-        monkeypatch.setattr(main, 'stop_event', asyncio.Event())
-        await asyncio.wait_for(main.database_services(reports), timeout=1)
-    monkeypatch.setattr(main, 'database_ready', False)
-    monkeypatch.setattr(main, 'DATABASE_RETRY_SECONDS', .01)
-    monkeypatch.setattr(main, 'feed_manager', OfflineFeeds())
-    monkeypatch.setattr(main, 'try_initialize_database', initialize)
-    monkeypatch.setattr(main, 'background_loop', capture)
-    asyncio.run(scenario())
-    assert len(attempts) == 2 and work == ['capture', 'reports']
+def test_invalid_expiry_rejected(db):
+    with pytest.raises(HTTPException) as error:get(db,expiry='2099-01-01')
+    assert error.value.status_code==422

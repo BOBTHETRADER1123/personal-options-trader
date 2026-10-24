@@ -62,7 +62,8 @@ function instrumentId(contract: Row) { return String(contract.instrument_id || c
 
 export default function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { initialMode?: 'sample' | 'live'; onBuildStrategy: (selection: ChainSelection) => void; onNotify: (message: string, error?: boolean) => void }) {
   const [mode, setMode] = useState<'sample' | 'live'>(initialMode);
-  const [broker, setBroker] = useState('dhan');
+  const [broker, setBroker] = useState('kotak');
+  const [exchange, setExchange] = useState('all');
   const [query, setQuery] = useState(''), [searchTerm, setSearchTerm] = useState('');
   const [universe, setUniverse] = useState<Underlying[]>([]), [total, setTotal] = useState(0), [master, setMaster] = useState<Row>({});
   const [selected, setSelected] = useState<Underlying | null>(null), [expiry, setExpiry] = useState('');
@@ -76,7 +77,7 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   const [clock, setClock] = useState(Date.now());
   const searchRef = useRef<HTMLDivElement>(null), settingsRef = useRef<HTMLDivElement>(null), tableRef = useRef<HTMLDivElement>(null), atmRef = useRef<HTMLTableRowElement>(null);
   const selectedRef = useRef<Underlying | null>(null), universeRequest = useRef(0), chainRequest = useRef(0), lastRefresh = useRef(0);
-  const scopeRef = useRef('sample:dhan'), initialScroll = useRef('');
+  const scopeRef = useRef('sample:kotak'), initialScroll = useRef('');
   selectedRef.current = selected;
 
   useEffect(() => { const timer = setTimeout(() => setSearchTerm(query.trim()), 250); return () => clearTimeout(timer); }, [query]);
@@ -102,12 +103,12 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
     const params = new URLSearchParams({ q: searchTerm, mode, broker });
     api(`/api/option-chain/underlyings?${params}`, { signal: controller.signal }).then((result: Row) => {
       if (request !== universeRequest.current) return;
-      const items: Underlying[] = result.underlyings || [];
+      const items: Underlying[] = (result.underlyings || []).filter((item:Underlying)=>exchange==='all'||item.exchange===exchange);
       setUniverse(items); setTotal(result.total ?? items.length); setMaster(result.master || {}); setSearchIndex(0);
       if (!selectedRef.current && !searchTerm && items.length) chooseUnderlying(items.find(i => i.symbol === 'NIFTY') || items.find(i => i.kind === 'index') || items[0]);
     }).catch(error => { if (error.name !== 'AbortError' && request === universeRequest.current) setUniverseError(error.message); }).finally(() => { if (request === universeRequest.current) setUniverseLoading(false); });
     return () => controller.abort();
-  }, [mode, broker, searchTerm, catalogRevision, chooseUnderlying]);
+  }, [mode, broker, exchange, searchTerm, catalogRevision, chooseUnderlying]);
 
   const loadChain = useCallback(async (manual = false) => {
     if (!selected?.key) return;
@@ -159,7 +160,7 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   }
   async function updateMaster() {
     setMasterLoading(true);
-    try { await api('/api/option-chain/master/refresh', { method: 'POST', body: JSON.stringify({ broker }) }); setCatalogRevision(v => v + 1); onNotify('The current contract list has been refreshed.'); }
+    try { const result=await api(`/api/option-chain/master/refresh?broker=${broker}`, { method: 'POST' }); setCatalogRevision(v => v + 1); onNotify(result.master?.message||'The selected broker’s contracts have been refreshed.',result.ok===false); }
     catch (error) { onNotify((error as Error).message, true); }
     finally { setMasterLoading(false); }
   }
@@ -181,6 +182,7 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   function changeLots(key: string, lots: number) { setBasket(previous => previous.map(item => item.key === key ? { ...item, lots: Math.min(1000, Math.max(1, Math.trunc(lots || 1))) } : item)); }
   function build() {
     if (!basketContext || !basket.length) return;
+    if(basketContext.mode==='live'&&basket.some(item=>item.data.stale||!finite(item.data.ltp))){onNotify('Refresh every selected leg with its own broker’s fresh quote before building.',true);return;}
     if (!basketContext.tradingEnabled || (chain && basketContext.key === selected?.key && chain.mode_matches_workspace === false)) { onNotify(`Choose ${basketContext.mode === 'sample' ? 'sample' : 'market-data'} mode in workspace Settings before building from this chain.`, true); return; }
     const contracts = basket.map(item => item.contract);
     const quotes = basket.flatMap(item => item.quote ? [item.quote] : []);
@@ -196,9 +198,9 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   const age = Number.isFinite(updatedMs) ? Math.max(0, Math.floor((clock - updatedMs) / 1000)) : null;
   const stale = Boolean(chain?.stale) || (mode === 'live' && age !== null && age > 15);
   const canNormalize = chain?.quantity_unit === 'units';
-  const premiumKnown = basket.length > 0 && basket.every(item => finite(item.data.ltp));
+  const premiumKnown = basket.length > 0 && basket.every(item => finite(item.data.ltp)&&(!item.contract.demo?Boolean(item.contract.price_multiplier)||item.contract.exchange!=='MCX':true));
   const premium = basket.reduce((sum, item) => sum + (item.side === 'BUY' ? -1 : 1) * Number(item.data.ltp || 0) * item.lots * Number(item.contract.lot_size || 1) * Number(item.contract.price_multiplier || 1), 0);
-  const basketBuildEnabled = Boolean(basketContext?.tradingEnabled) && (!chain || basketContext?.key !== selected?.key || chain.mode_matches_workspace !== false);
+  const basketBuildEnabled = Boolean(basketContext?.tradingEnabled) && (mode==='sample'||basket.every(item=>!item.data.stale&&finite(item.data.ltp))) && (!chain || basketContext?.key !== selected?.key || chain.mode_matches_workspace !== false);
 
   function renderCell(leg: ChainLeg | null | undefined, column: Column, side: 'ce' | 'pe') {
     const raw = leg?.[column.key], value = column.format === 'quantity' && inLots && canNormalize && finite(raw) && finite(leg?.lot_size) ? Number(raw) / Number(leg?.lot_size) : raw;
@@ -211,11 +213,11 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   function actions(leg: ChainLeg | null | undefined, type: 'CE' | 'PE') {
     return <td className="oc-action-cell"><div className="oc-leg-actions">{(['BUY', 'SELL'] as const).map(side => {
       const present = basketContext?.key === selected?.key && basketContext?.mode === mode && basketContext?.broker === broker && basket.some(item => instrumentId(item.contract) === leg?.instrument_id && item.side === side);
-      return <button key={side} className={`${side === 'BUY' ? 'buy' : 'sell'} ${present ? 'selected' : ''}`} disabled={!leg?.instrument_id} aria-label={`Add ${side.toLowerCase()} ${type === 'CE' ? 'call' : 'put'} at strike ${leg?.strike ?? 'unavailable'}`} title={`Add ${side.toLowerCase()} ${type}`} aria-pressed={Boolean(present)} onClick={() => addLeg(leg, side)}>{present ? <Check size={11} /> : side === 'BUY' ? 'B' : 'S'}</button>;
+      return <button key={side} className={`${side === 'BUY' ? 'buy' : 'sell'} ${present ? 'selected' : ''}`} disabled={!leg?.instrument_id||(mode==='live'&&(Boolean(leg?.stale)||!finite(leg?.ltp)))} aria-label={`Add ${side.toLowerCase()} ${type === 'CE' ? 'call' : 'put'} at strike ${leg?.strike ?? 'unavailable'}`} title={`Add ${side.toLowerCase()} ${type}`} aria-pressed={Boolean(present)} onClick={() => addLeg(leg, side)}>{present ? <Check size={11} /> : side === 'BUY' ? 'B' : 'S'}</button>;
     })}</div></td>;
   }
   function ltpCell(leg: ChainLeg | null | undefined) {
-    return <td className="oc-ltp-cell"><strong>{valueText(leg?.ltp)}</strong><small className={changeTone(leg?.ltp_change_percent)}>{percentText(leg?.ltp_change_percent)}</small></td>;
+    return <td className="oc-ltp-cell" title={leg?.quote_at?`Received ${time(leg.quote_at,true)} IST`:"No quote received"}><strong>{valueText(leg?.ltp)}</strong>{mode==='live'&&leg?.stale&&<small className="oc-negative">Stale</small>}<small className={changeTone(leg?.ltp_change_percent)}>{percentText(leg?.ltp_change_percent)}</small></td>;
   }
 
   return <div className="option-chain-page">
@@ -231,11 +233,11 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
         {universeLoading ? <Loader2 className="oc-spin" size={15} /> : <button aria-label="Show underlying list" onClick={() => { setSearchOpen(!searchOpen); setQuery(''); }}><ChevronDown size={16} /></button>}
         {searchOpen && <div className="oc-search-results" id="oc-underlying-results" role="listbox" aria-label="F&O underlyings">
           <div className="oc-search-heading"><span>{mode === 'sample' ? 'Fictional practice contracts' : 'Current instrument master'}</span><small>{total} matches</small></div>
-          {universeLoading && !universe.length ? <p className="oc-list-message"><Loader2 className="oc-spin" size={16} />Loading contracts…</p> : universe.length ? universe.map((item, index) => <button id={`oc-result-${index}`} role="option" aria-selected={item.key === selected?.key} className={index === searchIndex ? 'highlighted' : ''} key={item.key} onMouseEnter={() => setSearchIndex(index)} onClick={() => chooseUnderlying(item)}><span><strong>{item.symbol}</strong><small>{item.name || item.symbol}</small></span><span><i>{item.kind === 'index' ? 'INDEX' : 'STOCK'}</i><small>{item.exchange}</small></span></button>) : <p className="oc-list-message">{universeError || 'No matching option contracts. Try the symbol or company name.'}</p>}
+          {universeLoading && !universe.length ? <p className="oc-list-message"><Loader2 className="oc-spin" size={16} />Loading contracts…</p> : universe.length ? universe.map((item, index) => <button id={`oc-result-${index}`} role="option" aria-selected={item.key === selected?.key} className={index === searchIndex ? 'highlighted' : ''} key={item.key} onMouseEnter={() => setSearchIndex(index)} onClick={() => chooseUnderlying(item)}><span><strong>{item.symbol}</strong><small>{item.name || item.symbol}</small></span><span><i>{item.kind === 'index' ? 'INDEX' : item.kind === 'commodity'?'COMMODITY':'STOCK'}</i><small>{item.exchange}</small></span></button>) : <p className="oc-list-message">{universeError || 'No matching option contracts. Try the symbol or company name.'}</p>}
         </div>}
       </div>
       <div className="oc-mode-switch" aria-label="Chain data mode"><button aria-pressed={mode === 'sample'} className={mode === 'sample' ? 'active' : ''} onClick={() => changeScope('sample')}>Sample chain</button><button aria-pressed={mode === 'live'} className={mode === 'live' ? 'active' : ''} onClick={() => changeScope('live')}>Market chain</button></div>
-      <label className="oc-source-select"><span>Source</span><select aria-label="Option chain source" value={broker} onChange={e => changeScope(mode, e.target.value)}><option value="dhan">Dhan</option><option value="kotak">Kotak Neo</option><option value="fivepaisa">5paisa</option></select></label>
+      <label className="oc-source-select"><span>Exchange</span><select aria-label="Option chain exchange" value={exchange} onChange={e=>{setExchange(e.target.value);changeScope(mode,broker);}}><option value="all">All exchanges</option><option value="NSE">NSE</option><option value="BSE">BSE</option><option value="MCX">MCX</option></select></label><label className="oc-source-select"><span>Source</span><select aria-label="Option chain source" value={broker} onChange={e => changeScope(mode, e.target.value)}><option value="kotak">Kotak Neo</option><option value="fivepaisa">5paisa</option></select></label>
       {mode === 'live' && <button className="oc-master-button" onClick={updateMaster} disabled={masterLoading} title="Refresh the official instrument master">{masterLoading ? <Loader2 className="oc-spin" size={15} /> : <DownloadCloud size={15} />}<span>Update contracts</span></button>}
     </section>
 

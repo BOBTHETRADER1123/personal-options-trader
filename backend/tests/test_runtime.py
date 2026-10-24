@@ -18,6 +18,8 @@ def test_quote_processing_keeps_event_loop_responsive_and_serializes_writes(monk
             assert release.wait(3)
         monkeypatch.setattr(main, "write_lock", asyncio.Lock())
         monkeypatch.setattr(main, "process_quote_receipt", slow_quote)
+        monkeypatch.setattr(main, "collector_lease", None)
+        monkeypatch.setattr(main, "_runtime_settings", {"logging_mode":"every_update"})
         one = asyncio.create_task(main.quote_received({"id": 1}))
         two = asyncio.create_task(main.quote_received({"id": 2}))
         for _ in range(100):
@@ -64,4 +66,22 @@ def test_socket_dashboard_work_does_not_block_event_loop(monkeypatch):
         finally:
             release.set()
             await asyncio.wait_for(task, 3)
+    asyncio.run(run())
+
+
+def test_socket_ticket_commit_does_not_block_other_http_work(monkeypatch):
+    from types import SimpleNamespace
+    async def run():
+        release=threading.Event();started=threading.Event()
+        def commit():started.set();assert release.wait(3)
+        fake=SimpleNamespace(execute=lambda *a:None,add=lambda *a:None,commit=commit)
+        monkeypatch.setattr(main,'write_lock',asyncio.Lock())
+        task=asyncio.create_task(main.issue_ws_ticket(SimpleNamespace(token_hash='test-session'),fake))
+        try:
+            for _ in range(100):
+                if started.is_set():break
+                await asyncio.sleep(.005)
+            assert started.is_set() and not task.done()
+            assert main.process_health()['ok']
+        finally:release.set();await asyncio.wait_for(task,3)
     asyncio.run(run())

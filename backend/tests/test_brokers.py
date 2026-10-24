@@ -1,7 +1,6 @@
 """Offline protocol/contract tests. These do not certify broker account access."""
 import asyncio
 import json
-import struct
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -9,53 +8,15 @@ import pytest
 
 from app.brokers import FeedManager
 from app.brokers.base import FeedAuthenticationError, FeedProtocolError
-from app.brokers.dhan import parse_frame, parse_packet
 from app.brokers.fivepaisa import parse_message, tick_timestamp
 from app.brokers.kotak import parse_sfeed
 from app.instruments import ContractCatalog, demo_contracts, import_master, market_session, normalize_row
 
 
-def contract(broker="dhan", token="123", segment=None):
+def contract(broker="kotak", token="123", segment=None):
     return {"id": f"{broker}:123", "broker": broker, "token": token, "underlying": "NIFTY", "exchange": "NSE",
-            "segment": segment or {"dhan": "NSE_FNO", "kotak": "nse_fo", "fivepaisa": "D"}[broker],
+            "segment": segment or {"kotak": "nse_fo", "fivepaisa": "D"}[broker],
             "symbol": "EXAMPLE OPTION", "expiry": "2030-10-29", "strike": 25000.0, "option_type": "CE", "lot_size": 50, "demo": False}
-
-
-def test_dhan_ticker_uses_protocol_timestamp_and_received_precision():
-    row = contract()
-    packet = struct.pack("<BHBIfI", 2, 16, 2, 123, 105.5, 1792464000)
-    result = parse_packet(packet, {("NSE_FNO", "123"): row}, received_at="2026-10-20T06:00:00.123456+00:00", received_ns=1000000001)
-    assert result["ltp"] == 105.5
-    assert result["broker"] == "dhan" and result["demo"] is False
-    assert result["exchange_timestamp"] == datetime.fromtimestamp(1792464000, timezone.utc).isoformat(timespec="microseconds")
-    assert result["received_ns"] == 1000000001
-    assert result["raw_packet_hex"] == packet.hex()
-
-
-def test_dhan_full_depth_volume_and_oi():
-    row = contract()
-    body = struct.pack("<fHIfIIIIIIffff", 100.5, 50, 1792464000, 99, 1500, 10, 20, 300, 400, 200, 95, 94, 110, 90)
-    depth = struct.pack("<IIHHff", 5, 7, 1, 2, 100.0, 101.0) * 5
-    packet = struct.pack("<BHBI", 8, 162, 2, 123) + body + depth
-    result = parse_packet(packet, {("NSE_FNO", "123"): row})
-    assert (result["bid"], result["ask"], result["volume"], result["open_interest"]) == (100, 101, 1500, 300)
-
-
-def test_dhan_concatenated_events_are_not_coalesced():
-    packet = struct.pack("<BHBIfI", 2, 16, 2, 123, 105.5, 1792464000)
-    rows = parse_frame(packet + packet, {("NSE_FNO", "123"): contract()})
-    assert len(rows) == 2
-
-
-@pytest.mark.parametrize("packet", [b"", b"123", struct.pack("<BHBI", 2, 100, 2, 123)])
-def test_dhan_invalid_packets_fail_visibly(packet):
-    with pytest.raises(FeedProtocolError):
-        parse_frame(packet, {("NSE_FNO", "123"): contract()}) if packet else parse_packet(packet, {})
-
-
-def test_dhan_expired_token_is_authentication_error():
-    with pytest.raises(FeedAuthenticationError, match="expired"):
-        parse_packet(struct.pack("<BHBIH", 50, 10, 2, 123, 807), {})
 
 
 def test_fivepaisa_preserves_actual_fields_and_null_missing_timestamp():
@@ -100,7 +61,7 @@ def test_demo_contracts_are_never_live_and_have_dynamic_expiry():
     assert all(row["demo"] and row["token"] == "DEMO" and row["source"] == "synthetic_demo" for row in rows)
     assert {row["expiry"] for row in rows} == {"2030-01-08", "2030-01-15"}
     identifier = rows[0]["id"]
-    assert {r["broker"] for r in rows if r["id"] == identifier} == {"dhan", "kotak", "fivepaisa"}
+    assert {r["broker"] for r in rows if r["id"] == identifier} == {"kotak", "fivepaisa"}
     assert {r["exchange"] for r in rows} == {"NSE", "BSE", "MCX"}
 
 
@@ -126,13 +87,6 @@ def test_demo_contract_restored_after_startup_date_rollover(tmp_path):
     assert catalog.all(demo=False) == []
     # A non-demo trade or a broker-token row cannot enter the recovery catalog.
     assert catalog.restore_demo_contracts([{**trade, "demo": False}, {**trade, "broker": "dhan", "legs": [{**trade["legs"][0], "token": "123"}]}]) == 0
-
-
-def test_dhan_native_master_normalization():
-    row = normalize_row("dhan", {"SECURITY_ID": "123", "EXCH_ID": "MCX", "DISPLAY_NAME": "GOLD 2030 CE", "UNDERLYING_SYMBOL": "GOLD",
-                                  "SM_EXPIRY_DATE": "2030-10-29 00:00:00", "STRIKE_PRICE": "75000", "OPTION_TYPE": "CE", "LOT_SIZE": "100", "TICK_SIZE": "0.5"})
-    assert row["exchange"] == "MCX" and row["segment"] == "MCX_COMM" and row["lot_size"] == 100
-    assert row["expiry"] == "2030-10-29"
 
 
 def test_kotak_documented_nse_epoch_offset_and_header_cleanup():
@@ -176,20 +130,20 @@ def test_equity_multiplier_is_one_and_demo_mcx_explicitly_fictional():
 def test_master_import_preserves_other_brokers_and_is_atomic(tmp_path):
     path = tmp_path / "master.json"
     path.write_text(json.dumps({"instruments": [contract("kotak")]}))
-    text = "SECURITY_ID,EXCH_ID,DISPLAY_NAME,UNDERLYING_SYMBOL,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,LOT_SIZE\n123,NSE,NIFTY CE,NIFTY,2030-10-29,25000,CE,50\n"
-    result = import_master("dhan", text, path)
+    text = "ScripCode,Exch,ExchType,Name,SymbolRoot,Expiry,StrikeRate,ScripType,LotSize\n123,N,D,NIFTY CE,NIFTY,2030-10-29,25000,CE,50\n"
+    result = import_master("fivepaisa", text, path)
     assert result["imported"] == 1
-    assert {r["broker"] for r in json.loads(path.read_text())["instruments"]} == {"dhan", "kotak"}
+    assert {r["broker"] for r in json.loads(path.read_text())["instruments"]} == {"fivepaisa", "kotak"}
     before = path.read_bytes()
     with pytest.raises(ValueError):
-        import_master("dhan", text.replace(",50\n", ",0\n"), path)
+        import_master("fivepaisa", text.replace(",50\n", ",0\n"), path)
     assert before == path.read_bytes()
 
 
 def test_all_segment_master_ignores_currency_without_relabeling_as_index(tmp_path):
-    text = "SECURITY_ID,EXCH_ID,SEGMENT,DISPLAY_NAME,UNDERLYING_SYMBOL,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,LOT_SIZE\n123,NSE,D,NIFTY CE,NIFTY,2030-10-29,25000,CE,50\n456,NSE,C,USDINR CE,USDINR,2030-10-29,85,CE,1000\n"
+    text = "ScripCode,Exch,ExchType,Name,SymbolRoot,Expiry,StrikeRate,ScripType,LotSize\n123,N,D,NIFTY CE,NIFTY,2030-10-29,25000,CE,50\n456,N,U,USDINR CE,USDINR,2030-10-29,85,CE,1000\n"
     path = tmp_path / "master.json"
-    result = import_master("dhan", text, path)
+    result = import_master("fivepaisa", text, path)
     assert result["imported"] == 1 and result["ignored_non_options"] == 1
     assert json.loads(path.read_text())["instruments"][0]["underlying"] == "NIFTY"
 
@@ -227,3 +181,141 @@ def test_adapter_sources_contain_no_live_order_methods():
     forbidden = (".place_order(", ".modify_order(", ".cancel_order(", "/orders", "PlaceOrderRequest")
     for path in folder.glob("*.py"):
         assert all(value not in path.read_text(encoding="utf-8") for value in forbidden), path.name
+
+
+def test_only_two_runtime_adapters_even_with_legacy_environment(monkeypatch):
+    monkeypatch.setenv('DHAN_CLIENT_ID','historical-only')
+    monkeypatch.setenv('DHAN_ACCESS_TOKEN','must-not-create-an-adapter')
+    manager=FeedManager(None)
+    assert set(manager.statuses())=={'kotak','fivepaisa'}
+    assert {adapter.broker for adapter in manager._adapters}=={'kotak','fivepaisa'}
+
+
+def test_legacy_master_does_not_block_current_broker_and_cannot_be_imported(tmp_path):
+    path=tmp_path/'instruments.json'
+    path.write_text(json.dumps({'instruments':[{'broker':'dhan'},contract('kotak')]}))
+    catalog=ContractCatalog(path)
+    assert catalog.error is None
+    assert {c['broker'] for c in catalog.all(False)}=={'kotak'}
+    with pytest.raises(ValueError,match='Only Kotak'):
+        import_master('dhan','',path)
+
+
+def test_fivepaisa_tokens_are_scoped_to_exchange():
+    data={'ScripCode':'123','Exch':'N','ExchType':'D','Name':'EXAMPLE','SymbolRoot':'NIFTY','Expiry':'20301029','StrikeRate':'25000','ScripType':'CE','LotSize':'50'}
+    assert normalize_row('fivepaisa',data)['id']!=normalize_row('fivepaisa',{**data,'Exch':'B'})['id']
+
+
+@pytest.mark.parametrize('broker,raw',[
+    ('fivepaisa',{'ScripCode':'123','Exch':'N','ExchType':'D','Name':'NIFTY FUT','SymbolRoot':'NIFTY','Expiry':'20301029','StrikeRate':'0','ScripType':'XX','LotSize':'50'}),
+    ('kotak',{'pSymbol':'123','pExchSeg':'nse_fo','pTrdSymbol':'NIFTY FUT','pSymbolName':'NIFTY','expiry':'2030-10-29','dStrikePrice':'0','pOptionType':'XX','lLotSize':'50'}),
+])
+def test_native_future_master_not_mislabelled_as_call(broker,raw):
+    result=normalize_row(broker,raw)
+    assert result['option_type']=='FUT' and result['instrument_type']=='future' and result['strike']==0
+
+
+def test_fivepaisa_oi_updates_do_not_fabricate_new_price_timestamp():
+    mapping={('N','D','123'):contract('fivepaisa')};oi={}
+    received='2026-10-24T01:00:00+00:00'
+    assert parse_message({'Exch':'N','ExchType':'D','Token':123,'OpenInterest':1000},mapping,received_at=received,open_interest=oi)==[]
+    quote=parse_message({'Exch':'N','ExchType':'D','Token':123,'LastRate':100},mapping,received_at='2026-10-24T01:00:01+00:00',open_interest=oi)[0]
+    assert quote['open_interest']==1000 and quote['open_interest_received_at']==received
+    assert quote['received_at']=='2026-10-24T01:00:01+00:00'
+
+
+def test_fivepaisa_stream_subscribes_and_unsubscribes_read_only_channels(monkeypatch):
+    from app.brokers.fivepaisa import FivepaisaFeed
+    import websockets.asyncio.client
+    monkeypatch.setenv('FIVEPAISA_CLIENT_CODE','test-client');monkeypatch.setenv('FIVEPAISA_ACCESS_TOKEN','not-real-test-token')
+    class Socket:
+        def __init__(self):self.sent=[];self.values=iter([json.dumps([{'Exch':'N','ExchType':'D','Token':123,'LastRate':101}])])
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def send(self,value):self.sent.append(json.loads(value))
+        def __aiter__(self):return self
+        async def __anext__(self):
+            try:return next(self.values)
+            except StopIteration:raise StopAsyncIteration
+    socket=Socket()
+    monkeypatch.setattr(websockets.asyncio.client,'connect',lambda *args,**kwargs:socket)
+    received=[]
+    async def quote(value):received.append(value)
+    async def status(*args):pass
+    asyncio.run(FivepaisaFeed(quote,status).stream([contract('fivepaisa')]))
+    assert len(received)==1 and received[0]['broker']=='fivepaisa'
+    assert [(m['Method'],m['Operation']) for m in socket.sent]==[('MarketFeedV3','Subscribe'),('GetScripInfoForFuture','Subscribe'),('MarketFeedV3','Unsubscribe'),('GetScripInfoForFuture','Unsubscribe')]
+
+
+def test_feed_manager_retries_transport_but_stops_expired_session(monkeypatch):
+    import app.brokers as module
+    delays=[]
+    async def pause(delay):delays.append(delay)
+    monkeypatch.setattr(module.asyncio,'sleep',pause);monkeypatch.setattr(module.random,'uniform',lambda *a:0)
+    class Adapter:
+        broker='kotak'
+        calls=0
+        async def stream(self,contracts):
+            self.calls+=1
+            if self.calls==1:raise ConnectionError('private URL must never be shown')
+            raise FeedAuthenticationError('Renew the daily session')
+    async def run():
+        manager=FeedManager(None);adapter=Adapter()
+        await manager._run(adapter,[])
+        state=manager.statuses()['kotak']
+        assert state['status']=='authentication_required' and state['reconnect_count']==1 and adapter.calls==2
+        assert 'private URL' not in json.dumps(state)
+    asyncio.run(run())
+    assert delays==[2]
+
+
+def test_kotak_uses_sfeed_current_sdk_and_sanitizes_auth(monkeypatch):
+    import sys
+    from types import ModuleType
+    from app.brokers.kotak import KotakFeed
+    class AuthenticationError(Exception):pass
+    class SubscriptionError(Exception):pass
+    instances=[]
+    class Socket:
+        fail=False
+        def __init__(self,**kwargs):self.kwargs=kwargs;self.calls=[];self.values=iter([{'type':'scrip','exchange_segment':'nse_fo','instrument_token':'123','last_traded_price':99}]);instances.append(self)
+        async def __aenter__(self):
+            if self.fail:raise AuthenticationError('PRIVATE SID must not escape')
+            return self
+        async def __aexit__(self,*args):pass
+        async def subscribe_depth(self,tokens):self.calls.append(('subscribe',tokens))
+        async def unsubscribe_depth(self,tokens):self.calls.append(('unsubscribe',tokens))
+        def __aiter__(self):return self
+        async def __anext__(self):
+            try:return next(self.values)
+            except StopIteration:raise StopAsyncIteration
+    modules={name:ModuleType(name) for name in ['neo_api_client','neo_api_client.logger','neo_api_client.websocket','neo_api_client.websocket.feed','neo_api_client.websocket.feed.exceptions']}
+    modules['neo_api_client'].NeoAPI=object
+    modules['neo_api_client.logger'].setup_logging=lambda **kwargs:None
+    modules['neo_api_client.websocket.feed'].SFeedWebSocket=Socket
+    modules['neo_api_client.websocket.feed'].WsToken=lambda segment,token:(segment,token)
+    modules['neo_api_client.websocket.feed.exceptions'].AuthenticationError=AuthenticationError
+    modules['neo_api_client.websocket.feed.exceptions'].SubscriptionError=SubscriptionError
+    for name,module in modules.items():monkeypatch.setitem(sys.modules,name,module)
+    monkeypatch.setenv('KOTAK_UCC','mock-user');monkeypatch.setenv('KOTAK_SID','mock-sid')
+    received=[]
+    async def quote(value):received.append(value)
+    async def status(*args):pass
+    asyncio.run(KotakFeed(quote,status).stream([contract('kotak')]))
+    assert received[0]['broker']=='kotak'
+    assert instances[0].kwargs['ack_wait_timeout']==0
+    assert instances[0].kwargs['max_reconnect_attempts']==0
+    assert [v[0] for v in instances[0].calls]==['subscribe','unsubscribe']
+    Socket.fail=True
+    with pytest.raises(FeedAuthenticationError) as error:asyncio.run(KotakFeed(quote,status).stream([contract('kotak')]))
+    assert 'PRIVATE SID' not in str(error.value)
+
+
+def test_fivepaisa_sdk_routing_hint_uses_only_official_allowlisted_hosts():
+    import base64
+    from app.brokers.fivepaisa import feed_url
+    def token(value):return 'header.'+base64.urlsafe_b64encode(json.dumps({'RedirectServer':value}).encode()).decode().rstrip('=')+'.signature'
+    assert feed_url(token('A'),'123').startswith('wss://aopenfeed.5paisa.com/')
+    assert feed_url(token('B'),'123').startswith('wss://bopenfeed.5paisa.com/')
+    assert feed_url(token('https://evil.invalid'),'123').startswith('wss://openfeed.5paisa.com/')
+    assert feed_url('malformed-token','123').startswith('wss://openfeed.5paisa.com/')

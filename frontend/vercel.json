@@ -6,7 +6,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://personal-options-trader-api.onrender.com/api/:path*"
+      "destination": "https://libzw8xd976f.ramnaymcloud.com/api/:path*"
     },
     { "source": "/((?!api/).*)", "destination": "/index.html" }
   ],

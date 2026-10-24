@@ -1,0 +1,254 @@
+{
+  "version": 1,
+  "timezone": "Asia/Kolkata",
+  "verified_at": "2026-10-24",
+  "notice": "Maintained official-calendar rules. Dates outside a verified range and unsupported commodity schedules fail closed. The 8 November Muhurat session requires a separately verified session override before recording. Intraday exchange halts are not inferred from a regular-session calendar.",
+  "rules": [
+    {
+      "exchange": "NSE",
+      "segments": [
+        "nse_fo",
+        "D",
+        "NFO"
+      ],
+      "valid_from": "2026-08-03",
+      "valid_through": "2026-12-06",
+      "sources": [
+        "https://www.nseindia.com/static/market-data/market-timings",
+        "https://www.nseindia.com/api/holiday-master?type=trading"
+      ],
+      "verified_at": "2026-10-24",
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "sessions": [
+        [
+          "09:15",
+          "15:40"
+        ]
+      ],
+      "holidays": [
+        "2026-01-15",
+        "2026-01-26",
+        "2026-02-15",
+        "2026-03-03",
+        "2026-03-21",
+        "2026-03-26",
+        "2026-03-31",
+        "2026-04-03",
+        "2026-04-14",
+        "2026-05-01",
+        "2026-05-28",
+        "2026-06-26",
+        "2026-08-15",
+        "2026-09-14",
+        "2026-10-02",
+        "2026-10-20",
+        "2026-11-08",
+        "2026-11-10",
+        "2026-11-24",
+        "2026-12-25"
+      ],
+      "overrides": {}
+    },
+    {
+      "exchange": "NSE",
+      "segments": [
+        "nse_fo",
+        "D",
+        "NFO"
+      ],
+      "valid_from": "2026-12-07",
+      "valid_through": "2026-12-31",
+      "sources": [
+        "https://www.sebi.gov.in/sebi_data/attachdocs/oct-2026/1792079571420.pdf",
+        "https://www.nseindia.com/api/holiday-master?type=trading"
+      ],
+      "verified_at": "2026-10-24",
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "sessions": [
+        [
+          "09:15",
+          "15:45"
+        ]
+      ],
+      "expiry_day_index_close": "15:30",
+      "index_underlyings": [
+        "NIFTY",
+        "BANKNIFTY",
+        "FINNIFTY",
+        "MIDCPNIFTY",
+        "NIFTYNXT50"
+      ],
+      "holidays": [
+        "2026-12-25"
+      ],
+      "overrides": {},
+      "notice": "Effective-dated SEBI close: expiring index derivatives retain the 15:30 close on their expiry date. Future exchange circular changes must be reviewed before extending this verified range."
+    },
+    {
+      "exchange": "NSE",
+      "segments": [
+        "nse_cm",
+        "C",
+        "CM"
+      ],
+      "valid_from": "2026-01-01",
+      "valid_through": "2026-12-31",
+      "sources": [
+        "https://www.nseindia.com/static/market-data/market-timings",
+        "https://www.nseindia.com/api/holiday-master?type=trading"
+      ],
+      "verified_at": "2026-10-24",
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "sessions": [
+        [
+          "09:15",
+          "15:30"
+        ]
+      ],
+      "holidays": [
+        "2026-01-15",
+        "2026-01-26",
+        "2026-02-15",
+        "2026-03-03",
+        "2026-03-21",
+        "2026-03-26",
+        "2026-03-31",
+        "2026-04-03",
+        "2026-04-14",
+        "2026-05-01",
+        "2026-05-28",
+        "2026-06-26",
+        "2026-08-15",
+        "2026-09-14",
+        "2026-10-02",
+        "2026-10-20",
+        "2026-11-08",
+        "2026-11-10",
+        "2026-11-24",
+        "2026-12-25"
+      ],
+      "overrides": {}
+    },
+    {
+      "exchange": "BSE",
+      "segments": [
+        "bse_fo",
+        "BFO",
+        "D"
+      ],
+      "valid_from": "2026-10-24",
+      "valid_through": "2026-12-06",
+      "sources": [
+        "https://www.bseindia.com/markets/MarketInfo/DispNewNoticesCirculars.aspx?page=20260801-2",
+        "https://www.bseindia.com/markets/MarketInfo/DispNewNoticesCirculars.aspx?page=20251212-8"
+      ],
+      "verified_at": "2026-10-24",
+      "sessions": [
+        [
+          "09:15",
+          "15:40"
+        ]
+      ],
+      "holidays": [
+        "2026-11-08",
+        "2026-11-10",
+        "2026-11-24",
+        "2026-12-25"
+      ],
+      "overrides": {},
+      "verification_note": "Exchange notices inspected through copies of original exchange text; source host blocked automated retrieval."
+    },
+    {
+      "exchange": "BSE",
+      "segments": [
+        "bse_fo",
+        "BFO",
+        "D"
+      ],
+      "valid_from": "2026-12-07",
+      "valid_through": "2026-12-31",
+      "sources": [
+        "https://www.sebi.gov.in/sebi_data/attachdocs/oct-2026/1792079571420.pdf"
+      ],
+      "verified_at": "2026-10-24",
+      "sessions": [
+        [
+          "09:15",
+          "15:45"
+        ]
+      ],
+      "expiry_day_index_close": "15:30",
+      "index_underlyings": [
+        "SENSEX",
+        "BANKEX",
+        "SENSEX50"
+      ],
+      "holidays": [
+        "2026-12-25"
+      ],
+      "overrides": {}
+    },
+    {
+      "exchange": "MCX",
+      "underlyings": [
+        "NATURALGAS",
+        "NATURAL GAS",
+        "NATURALGASMINI",
+        "CRUDEOIL",
+        "CRUDE OIL",
+        "CRUDEOILM"
+      ],
+      "valid_from": "2026-10-24",
+      "valid_through": "2026-12-31",
+      "sources": [
+        "https://www.mcxindia.com/faq/market-operations",
+        "https://beta.mcxindia.com/market-operations/trading-surveillance/trading-holidays"
+      ],
+      "verified_at": "2026-10-24",
+      "sessions": [
+        [
+          "09:00",
+          "23:55"
+        ]
+      ],
+      "us_daylight_close": "23:30",
+      "holidays": [
+        "2026-11-08",
+        "2026-12-25"
+      ],
+      "overrides": {
+        "2026-11-10": [
+          [
+            "17:00",
+            "23:55"
+          ]
+        ],
+        "2026-11-24": [
+          [
+            "17:00",
+            "23:55"
+          ]
+        ]
+      },
+      "notice": "Energy non-agricultural schedule follows official US daylight-saving distinction. Muhurat override awaits verified product-specific circular; no guessed hours."
+    }
+  ]
+}

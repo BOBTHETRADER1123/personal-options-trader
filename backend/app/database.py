@@ -19,15 +19,22 @@ if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql+psycopg://', 1)
 elif DATABASE_URL.startswith('postgresql://'):
     DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+psycopg://', 1)
-engine = create_engine(DATABASE_URL, pool_pre_ping=True,
+_pool_options = ({'pool_size': max(1, int(os.getenv('DB_POOL_SIZE', '2'))),
+                  'max_overflow': max(0, int(os.getenv('DB_MAX_OVERFLOW', '1'))),
+                  'pool_timeout': 10, 'pool_recycle': 300, 'pool_use_lifo': True}
+                 if not DATABASE_URL.startswith('sqlite') else {})
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, **_pool_options,
     connect_args=({'check_same_thread': False, 'timeout': 30} if DATABASE_URL.startswith('sqlite') else
                   {'connect_timeout': 10, 'options': '-c statement_timeout=15000 -c lock_timeout=10000'}))
-def configure_sqlite(target):
+def configure_sqlite(target, journal_mode=None):
     """Disable sqlite3 legacy transactions so SAVEPOINT release cannot commit early."""
+    mode=(journal_mode or os.getenv('SQLITE_JOURNAL_MODE','WAL')).upper()
+    if mode not in {'WAL','DELETE'}:raise ValueError('Unsupported SQLite journal mode.')
     @event.listens_for(target, 'connect')
     def sqlite_pragmas(connection, _):
         connection.isolation_level=None
-        connection.execute('PRAGMA journal_mode=WAL')
+        connection.execute('PRAGMA journal_mode='+mode)
+        connection.execute('PRAGMA busy_timeout=30000')
         connection.execute('PRAGMA synchronous=FULL')
         connection.execute('PRAGMA foreign_keys=ON')
     @event.listens_for(target, 'begin')
@@ -86,7 +93,10 @@ def run_transaction(operation, session_factory=None, attempts=4):
                 # Invalidate the engine's in-memory marks as well as SQLite's
                 # stale read snapshot before creating the replacement Session.
                 db.rollback()
-                if not is_sqlite_contention(error) or attempt + 1 == attempts:
+                state = getattr(getattr(error, 'orig', None), 'sqlstate', '') or ''
+                retryable = (is_sqlite_contention(error) or state in {'40001', '40P01'} or
+                             (db.get_bind().dialect.name == 'postgresql' and is_database_unavailable(error)))
+                if not retryable or attempt + 1 == attempts:
                     raise
         time.sleep(.025 * (2 ** attempt))
 

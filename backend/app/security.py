@@ -81,6 +81,10 @@ def require_session(request: Request, db=Depends(get_db)):
         validate_origin(request)
         if not hmac.compare_digest(request.headers.get('x-csrf-token', ''), session.csrf_token):
             raise HTTPException(403, 'Your security token expired. Refresh and sign in again.')
+    # Authentication must release its read transaction before an async route
+    # waits for the app write lock, otherwise a rollback-journal writer can
+    # wait for the very reader which is waiting for that writer.
+    if db.get_bind().dialect.name=='sqlite':db.commit()
     return session
 
 def create_session(db, response: Response):

@@ -34,3 +34,6 @@ frontend/*.tsbuildinfo
 *.zip
 .DS_Store
 Thumbs.db
+
+# Owner-approved workspace imports must never enter source releases
+private_workspace/

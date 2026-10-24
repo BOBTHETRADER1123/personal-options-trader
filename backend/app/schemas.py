@@ -27,13 +27,19 @@ class LegInput(StrictModel):
 class TradeInput(StrictModel):
     name: str = Field(min_length=1, max_length=100)
     underlying: str = Field(min_length=1, max_length=60)
-    brokers: list[Literal['dhan','kotak','fivepaisa']] = Field(min_length=1, max_length=3)
+    brokers: list[Literal['kotak','fivepaisa']] = Field(min_length=1, max_length=2)
     legs: list[LegInput] = Field(min_length=1, max_length=20)
     idempotency_key: str = Field(min_length=8, max_length=150)
     confirmed: bool = False
 
+    @model_validator(mode='after')
+    def independent_brokers(self):
+        if len(set(self.brokers)) != len(self.brokers):
+            raise ValueError('Choose each broker once for separate simulations.')
+        return self
+
 class ActionInput(StrictModel):
-    action: Literal['add_lots','add_leg','partial_exit','exit_leg','exit_strategy','duplicate','edit','cancel_pending']
+    action: Literal['add_lots','add_leg','partial_exit','exit_leg','exit_strategy','duplicate','edit','replace_leg','cancel_pending','settle_expiry']
     idempotency_key: str = Field(min_length=8, max_length=150)
     confirmed: bool
     leg_id: str | None = None
@@ -45,16 +51,18 @@ class ActionInput(StrictModel):
     target: float | None = Field(default=None, gt=0)
 
 class SettingsInput(StrictModel):
+    trade_count_definition: Literal['strategies','executions'] | None = None
     brokerage_per_order: float | None = Field(default=None,ge=0,le=10000)
     charges_percent: float | None = Field(default=None,ge=0,le=10)
     slippage_bps: float | None = Field(default=None,ge=0,le=10000)
     fill_basis: Literal['ltp','bid_ask'] | None = None
-    logging_mode: Literal['summary','every_update','one_second'] | None = None
-    preferred_feed: Literal['broker','dhan','kotak','fivepaisa'] | None = None
+    logging_mode: Literal['summary','every_update','one_second','full_history'] | None = None
+    preferred_feed: Literal['broker','kotak','fivepaisa'] | None = None
     stale_after_seconds: int | None = Field(default=None,ge=2,le=3600)
     demo_mode: bool | None = None
     delete_after_local_save: bool | None = None
     auto_delete_online: bool | None = None
+    unlimited_paper_buying_power: bool | None = None
     paper_capital: float | None = Field(default=None,ge=0,le=1e12)
 
 class RiskLegInput(BaseModel):
@@ -62,7 +70,7 @@ class RiskLegInput(BaseModel):
     underlying: str = Field(min_length=1)
     expiry: str = Field(min_length=1)
     side: Literal['BUY','SELL']
-    option_type: Literal['CE','PE']
+    option_type: Literal['CE','PE','FUT']
     strike: float = Field(ge=0)
     lot_size: int = Field(ge=1)
     lots: int = Field(default=1,ge=0)

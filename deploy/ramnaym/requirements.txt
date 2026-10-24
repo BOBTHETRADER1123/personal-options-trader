@@ -1,0 +1,3 @@
+# package_trial.py creates a flattened root manifest for RamNaym's uploader.
+-r backend/requirements.txt
+-r backend/requirements-brokers.txt

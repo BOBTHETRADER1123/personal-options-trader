@@ -5,7 +5,6 @@ import asyncio
 import random
 
 from .base import FeedAuthenticationError, FeedProtocolError, utc_now
-from .dhan import DhanFeed
 from .fivepaisa import FivepaisaFeed
 from .kotak import KotakFeed
 
@@ -17,10 +16,10 @@ class FeedManager:
         self._tasks: list[asyncio.Task] = []
         self._states: dict[str, dict] = {}
         self._stopping = False
-        self._adapters = [DhanFeed(self._quote, self._status), KotakFeed(self._quote, self._status), FivepaisaFeed(self._quote, self._status)]
+        self._adapters = [KotakFeed(self._quote, self._status), FivepaisaFeed(self._quote, self._status)]
         for adapter in self._adapters:
             self._states[adapter.broker] = {"broker": adapter.broker, "status": "not_configured", "configured": bool(adapter.configured()),
-                                           "detail": "Add backend market-data credentials", "last_quote_at": None, "source": "live", "received_events": 0}
+                                           "detail": "Add backend market-data credentials", "last_quote_at": None, "source": "live", "received_events": 0, "reconnect_count": 0}
 
     def statuses(self) -> dict[str, dict]:
         return {key: dict(value) for key, value in self._states.items()}
@@ -31,8 +30,8 @@ class FeedManager:
             await self.on_status(broker, dict(self._states[broker]))
 
     async def _quote(self, quote):
-        # Await persistence. No sampling, dropping or latest-only in-memory
-        # queue is introduced between the received quote and durable journal.
+        # The selected recording policy owns persistence/buffering; never send
+        # this broker's receipt through another broker's price cache.
         await self.on_quote(quote)
         state = self._states[quote["broker"]]
         state.update({"last_quote_at": quote["received_at"], "status": "connected", "received_events": state["received_events"] + 1})
@@ -45,7 +44,9 @@ class FeedManager:
         # trade legs. Filtering by the watchlist again would drop an unattended
         # position as soon as its option-chain page is closed.
         for adapter in self._adapters:
-            if not adapter.configured():
+            available = bool(adapter.configured())
+            self._states[adapter.broker]['configured'] = available
+            if not available:
                 await self._status(adapter.broker, {"status": "not_configured", "detail": "Backend credentials required"})
                 continue
             contracts = [r for r in instruments if r.get("broker") == adapter.broker and not r.get("demo")]
@@ -73,6 +74,7 @@ class FeedManager:
                 return
             except Exception as exc:
                 attempt += 1
+                self._states[adapter.broker]["reconnect_count"] += 1
                 delay = min(60, 2 ** min(attempt, 6)) + random.uniform(0, 1)
                 await self._status(adapter.broker, {"status": "reconnecting", "detail": f"Connection interrupted ({type(exc).__name__}); retrying", "retry_in_seconds": round(delay, 1)})
                 await asyncio.sleep(delay)
@@ -84,6 +86,9 @@ class FeedManager:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        for broker, state in self._states.items():
+            if state["configured"] and state["status"] not in {"authentication_required", "error"}:
+                await self._status(broker, {"status": "disconnected", "detail": "Market-data connection stopped"})
 
 
-__all__ = ["FeedManager", "DhanFeed", "KotakFeed", "FivepaisaFeed"]
+__all__ = ["FeedManager", "KotakFeed", "FivepaisaFeed"]

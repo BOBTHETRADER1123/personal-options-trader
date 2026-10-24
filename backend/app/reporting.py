@@ -7,6 +7,8 @@ No workbook write or network request happens inside the closing-trade transactio
 from __future__ import annotations
 
 import asyncio
+import csv
+import gzip
 import hashlib
 import io
 import json
@@ -14,6 +16,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -25,10 +28,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import JSON, Boolean, Integer, LargeBinary, String, Text, func, or_, select, update
+from sqlalchemy import JSON, Boolean, Integer, LargeBinary, String, Text, func, or_, select, update, delete, event as sqlalchemy_event
 from sqlalchemy.orm import Mapped, Session, mapped_column, defer
 
 from .database import Base, SessionLocal, run_transaction
+from .models import PnlSnapshot, RecordingGap, Event, Timeline
 
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -37,6 +41,33 @@ SUMMARY_SHEETS = {"Trade Summary", "Strategy Legs"}
 MAX_EXCEL_ROWS = 1_048_576
 _delete_enabled: Callable[[Session], bool] = lambda db: False
 _delete_handler: Callable[[Session, str], dict[str, int]] | None = None
+_report_waiters = set()
+_report_waiter_lock = threading.Lock()
+_report_ready_callback: Callable[[],None] | None = None
+
+
+def configure_report_ready(callback: Callable[[],None] | None) -> None:
+    """Root wires cloudservice.notify_work; callback never runs inside SQL tx."""
+    global _report_ready_callback
+    _report_ready_callback=callback
+
+
+def notify_work() -> None:
+    """Wake idle workers safely from API/event-loop or transaction threads."""
+    with _report_waiter_lock:
+        waiters=list(_report_waiters)
+    for loop,wake in waiters:
+        if not loop.is_closed():loop.call_soon_threadsafe(wake.set)
+
+
+@sqlalchemy_event.listens_for(Session,'after_commit')
+def _notify_committed_report(db):
+    if not db.in_nested_transaction() and db.info.pop('pot_report_notify',False):notify_work()
+
+
+@sqlalchemy_event.listens_for(Session,'after_rollback')
+def _discard_report_notification(db):
+    if not db.in_nested_transaction():db.info.pop('pot_report_notify',None)
 
 
 def now_iso() -> str:
@@ -120,6 +151,118 @@ class DailyExportReconciliation(Base):
     data: Mapped[dict] = mapped_column(JSON)
 
 
+class ExportArtifact(Base):
+    """Immutable detailed export bytes, independently verifiable in Drive."""
+    __tablename__ = 'export_artifacts'
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    filename: Mapped[str] = mapped_column(String(255))
+    mime_type: Mapped[str] = mapped_column(String(100))
+    file_bytes: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    sha256: Mapped[str] = mapped_column(String(64))
+    md5: Mapped[str] = mapped_column(String(32))
+    size: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(String(40), default=now_iso)
+
+
+HISTORY_COLUMNS = [
+    'record_type','timestamp_utc','timestamp_ist','broker','trade_id','strategy_id','exchange',
+    'underlying','instrument_id','symbol','strike','expiry','option_type','side','lots','open_lots',
+    'lot_size','price_multiplier','entry_price','latest_price','bid','ask','quote_at','exchange_quote_at','quote_received_at','quote_age_seconds','quote_age_basis',
+    'quote_reused','data_freshness','stale','unrealized_pnl','realized_pnl','gross_pnl','charges','net_pnl',
+    'strategy_net_pnl','demo','record_json',
+]
+
+
+def iter_history_records(db: Session, trade_id: str):
+    """Stream source rows using one bounded cursor per table; never load all JSON."""
+    snapshot_query=select(PnlSnapshot).where(PnlSnapshot.trade_id==trade_id).order_by(PnlSnapshot.snapshot_second)
+    for row in db.scalars(snapshot_query.execution_options(yield_per=200)):
+        record=row.data
+        for leg in record.get('legs',[]) or [{}]:
+            yield {**record,**leg,'record_type':'one_second','strategy_net_pnl':record.get('net_pnl'),
+                   'record_json':{'snapshot':{key:value for key,value in record.items() if key!='legs'},'leg':leg}}
+    for model,label,column in ((Event,'trade_event',Event.id),(Timeline,'trade_action_mark',Timeline.id)):
+        query=select(model).where(model.trade_id==trade_id).order_by(column)
+        for row in db.scalars(query.execution_options(yield_per=200)):
+            record={**row.data,'timestamp_utc':row.timestamp,'trade_id':trade_id}
+            try:record['timestamp_ist']=parse_time(row.timestamp).astimezone(IST).isoformat()
+            except (ValueError,TypeError):pass
+            yield {**record,'record_type':label,'record_json':{'id':row.id,'kind':getattr(row,'kind',record.get('kind')),**record}}
+    query=select(RecordingGap).where(RecordingGap.trade_id==trade_id).order_by(RecordingGap.start_second)
+    for row in db.scalars(query.execution_options(yield_per=200)):
+        yield {'record_type':'recording_gap','trade_id':trade_id,'timestamp_utc':row.detected_at,
+               'record_json':{'start_utc':datetime.fromtimestamp(row.start_second,timezone.utc).isoformat(),
+                              'end_utc':datetime.fromtimestamp(row.end_second,timezone.utc).isoformat(),
+                              'reason':row.reason,**row.data}}
+
+
+def build_history_csv_gz(db: Session, trade_id: str) -> bytes:
+    """Bound compressed output and memory. If full, keep the source for retry.
+
+    CSV carries the detailed history; Excel remains the requested compact
+    extrema/summary workbook. Gzip's fixed header time makes retries stable.
+    """
+    maximum=max(1024,int(os.getenv('MAX_HISTORY_EXPORT_BYTES',str(64*1024*1024))))
+    with tempfile.SpooledTemporaryFile(max_size=min(maximum,4*1024*1024),mode='w+b') as spool:
+        with gzip.GzipFile(fileobj=spool,mode='wb',mtime=0) as compressed:
+            wrapper=io.TextIOWrapper(compressed,encoding='utf-8',newline='')
+            writer=csv.DictWriter(wrapper,fieldnames=HISTORY_COLUMNS,extrasaction='ignore')
+            writer.writeheader()
+            count=0
+            for record in iter_history_records(db,trade_id):
+                values={key:safe_cell(record.get(key)) for key in HISTORY_COLUMNS}
+                writer.writerow(values)
+                count+=1
+                if count%200==0:
+                    wrapper.flush()
+                    if spool.tell()>maximum:raise ValueError('Detailed export exceeds the configured byte bound; source retained.')
+            wrapper.flush()
+            wrapper.detach()
+        if spool.tell()>maximum:raise ValueError('Detailed export exceeds the configured byte bound; source retained.')
+        spool.seek(0)
+        content=spool.read(maximum+1)
+    # Read all compressed members, so a corrupt or truncated archive is rejected.
+    with gzip.GzipFile(fileobj=io.BytesIO(content)) as checked:
+        while checked.read(1024*1024):pass
+    return content
+
+
+def _ensure_history_artifact(db: Session, job: ExportJob) -> None:
+    if not job.payload.get('trade',{}).get('history_available') and not db.scalar(
+            select(PnlSnapshot.trade_id).where(PnlSnapshot.trade_id==job.trade_id).limit(1)):
+        return
+    identity=str(uuid.uuid5(uuid.NAMESPACE_URL,f'personal-options-trader:csv-gz:{job.id}'))
+    if db.get(ExportArtifact,identity):return
+    content=build_history_csv_gz(db,job.trade_id)
+    db.add(ExportArtifact(id=identity,job_id=job.id,kind='csv_gz',
+        filename=job.filename.removesuffix('.xlsx')+'_history.csv.gz',mime_type='application/gzip',
+        file_bytes=content,sha256=hashlib.sha256(content).hexdigest(),md5=hashlib.md5(content).hexdigest(),size=len(content)))
+
+
+def get_export_artifacts(db: Session, job_id: str) -> list[dict[str,Any]]:
+    """Drive service contract; return only generated immutable checked bytes."""
+    job=db.get(ExportJob,job_id)
+    if not job or job.status not in {'ready','claimed','saved'} or not job.file_bytes or not job.checksum:
+        return []
+    xlsx=bytes(job.file_bytes)
+    if len(xlsx)!=job.size or hashlib.sha256(xlsx).hexdigest()!=job.checksum:
+        raise ValueError('Stored Excel archive checksum mismatch; source retained.')
+    result=[{'kind':'xlsx','filename':job.filename,
+        'mime_type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'file_bytes':xlsx,'sha256':job.checksum,'md5':hashlib.md5(xlsx).hexdigest(),'size':job.size}]
+    for artifact in db.scalars(select(ExportArtifact).where(ExportArtifact.job_id==job_id).order_by(ExportArtifact.kind)):
+        content=bytes(artifact.file_bytes)
+        if len(content)!=artifact.size or hashlib.sha256(content).hexdigest()!=artifact.sha256 or hashlib.md5(content).hexdigest()!=artifact.md5:
+            raise ValueError('Stored history archive checksum mismatch; source retained.')
+        result.append({'kind':artifact.kind,'filename':artifact.filename,'mime_type':artifact.mime_type,
+            'file_bytes':content,'sha256':artifact.sha256,'md5':artifact.md5,'size':artifact.size})
+    if job.payload.get('trade',{}).get('history_available') and not any(a['kind']=='csv_gz' for a in result):
+        raise ValueError('Detailed history archive has not been generated; source retained.')
+    return result
+
+
 def configure_archival(
     enabled_checker: Callable[[Session], bool],
     delete_handler: Callable[[Session, str], dict[str, int]] | None = None,
@@ -164,6 +307,7 @@ def enqueue_export(
     )
     db.add(job)
     db.flush()
+    db.info['pot_report_notify']=True
     return job
 
 
@@ -523,6 +667,7 @@ def process_pending_once(session_factory=SessionLocal, limit: int = 3) -> int:
                 job.status = "ready"
                 job.lease_until = None
                 job.error = None
+                _ensure_history_artifact(db,job)
                 # A locked optional convenience copy must not lose the durable
                 # database archive; the companion can still download the bytes.
                 try:
@@ -531,6 +676,10 @@ def process_pending_once(session_factory=SessionLocal, limit: int = 3) -> int:
                     log.warning("Optional report folder unavailable for job %s; database copy retained", job.id)
                 db.commit()
                 processed += 1
+                if _report_ready_callback:
+                    try:_report_ready_callback()
+                    except Exception as error:
+                        log.warning('Report-ready wakeup failed (%s); durable archive retained.',type(error).__name__)
             except Exception as exc:
                 db.rollback()
                 job = db.get(ExportJob, job_id)
@@ -544,21 +693,45 @@ def process_pending_once(session_factory=SessionLocal, limit: int = 3) -> int:
     return processed
 
 
+def next_work_delay(session_factory=SessionLocal) -> float:
+    """No queued work means no frequent database keep-alive polling."""
+    with session_factory() as db:
+        rows=db.execute(select(ExportJob.status,ExportJob.lease_until).where(or_(
+            ExportJob.status=='pending',ExportJob.status=='generating',
+            (ExportJob.status=='failed') & (ExportJob.automatic_retry==True),
+        )).limit(200)).all()
+    if not rows:return max(600,float(os.getenv('REPORT_IDLE_RECONCILE_SECONDS','3600')))
+    now=datetime.now(timezone.utc)
+    delays=[]
+    for status,lease_until in rows:
+        if status=='pending':return 0.1
+        try:delays.append(max(.1,(parse_time(lease_until)-now).total_seconds()))
+        except (ValueError,TypeError):delays.append(60)
+    return min(3600,min(delays or [60]))
+
+
 async def reporting_loop(stop_event: asyncio.Event | None = None) -> None:
     stop_event = stop_event or asyncio.Event()
-    last_reconciled = 0.0
-    while not stop_event.is_set():
-        try:
-            await asyncio.to_thread(process_pending_once)
-            if time.monotonic() - last_reconciled > 60:
-                await asyncio.to_thread(save_daily_reconciliation)
-                last_reconciled = time.monotonic()
-        except Exception:
-            log.exception("Report worker iteration failed; durable jobs remain queued")
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            pass
+    wake=asyncio.Event();loop=asyncio.get_running_loop()
+    with _report_waiter_lock:_report_waiters.add((loop,wake))
+    try:
+        while not stop_event.is_set():
+            wake.clear()
+            try:
+                processed=await asyncio.to_thread(process_pending_once)
+                if processed:await asyncio.to_thread(save_daily_reconciliation)
+                delay=await asyncio.to_thread(next_work_delay)
+            except Exception as error:
+                # Driver exception reprs may include SQL and parameter values.
+                log.warning('Report worker unavailable (%s); durable jobs remain queued.',type(error).__name__)
+                delay=60
+            waiting=[asyncio.create_task(stop_event.wait()),asyncio.create_task(wake.wait())]
+            try:await asyncio.wait(waiting,timeout=delay,return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in waiting:task.cancel()
+                await asyncio.gather(*waiting,return_exceptions=True)
+    finally:
+        with _report_waiter_lock:_report_waiters.discard((loop,wake))
 
 
 def archive_after_verified_save(db: Session, job: ExportJob) -> None:
@@ -566,6 +739,11 @@ def archive_after_verified_save(db: Session, job: ExportJob) -> None:
     if job.status != "saved" or job.verification_status != "verified" or not job.checksum or not job.saved_at:
         raise ValueError("Local Excel verification is required before archival")
     if job.deletion_status == "archived":
+        return
+    # A laptop XLSX acknowledgement cannot authorize deleting per-second
+    # history. All full-history artifacts need verified remote Drive evidence.
+    if job.payload.get('trade',{}).get('history_available') or db.scalar(select(PnlSnapshot.trade_id).where(PnlSnapshot.trade_id==job.trade_id).limit(1)):
+        job.deletion_status='retained_until_drive_verified'
         return
     if not _delete_enabled(db):
         job.deletion_status = "retained"
@@ -580,6 +758,30 @@ def archive_after_verified_save(db: Session, job: ExportJob) -> None:
     # Keep the complete verified XLSX and a small permanent manifest. This does
     # not remove shared quotes, active trades, settings, or any other trade.
     job.payload = {"trade": job.payload.get("trade", {}), "archived": True}
+
+
+def prune_verified_snapshots(db: Session, job_id: str) -> dict[str,int]:
+    """Explicitly invoked cleanup; no scheduler calls this without owner policy.
+
+    All immutable export artifacts must match independently verified Drive
+    manifests. Only second-level observations of a completed trade are eligible.
+    Actions, summaries, recovery gaps and every archive/verification manifest
+    remain available. A retry after commit cannot delete anything else.
+    """
+    from .models import Trade
+    from .cloud_backup import verified_archive_matches
+    job=db.scalar(select(ExportJob).where(ExportJob.id==job_id).with_for_update())
+    trade=db.get(Trade,job.trade_id) if job else None
+    if not job or not trade or trade.status!='closed':
+        raise ValueError('Only a completed trade with a verified Drive archive is eligible.')
+    artifacts=get_export_artifacts(db,job_id)
+    if not any(a['kind']=='csv_gz' for a in artifacts) or not verified_archive_matches(db,job_id,artifacts):
+        raise ValueError('Every source artifact must match the verified Drive manifest; records retained.')
+    if job.deletion_status=='history_archived':return {'pnl_snapshots':0}
+    count=db.execute(delete(PnlSnapshot).where(PnlSnapshot.trade_id==job.trade_id)).rowcount or 0
+    job.deletion_status='history_archived'
+    job.deleted_at=now_iso();job.deleted_counts={'pnl_snapshots':count}
+    return {'pnl_snapshots':count}
 
 
 def reconciliation(db: Session) -> dict[str, Any]:
@@ -604,6 +806,8 @@ def save_daily_reconciliation(session_factory=SessionLocal) -> dict[str, Any]:
             db.add(DailyExportReconciliation(date=report["date"], generated_at=report["generated_at"], data=report))
         else:
             row.generated_at, row.data = report["generated_at"], report
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(row,"data")
         return report
     # Report generation and companion acknowledgements can commit between the
     # summary read and its daily-row write. A new WAL snapshot must recompute

@@ -30,18 +30,18 @@ def db(tmp_path):
         session.commit();yield session
     sql.dispose()
 
-def contract(broker='dhan',kind='CE',offset=0):
+def contract(broker='kotak',kind='CE',offset=0):
     items=engine.catalog.list_contracts(underlying='NIFTY',broker=broker,demo=True)
     expiry=min(c['expiry'] for c in items)
     rows=sorted([c for c in items if c['option_type']==kind and c['expiry']==expiry],key=lambda c:c['strike'])
     return rows[len(rows)//2+offset]
 
-def quote(db,c=None,price=100,broker='dhan',**kw):
+def quote(db,c=None,price=100,broker='kotak',**kw):
     c=c or contract(broker)
     return engine.record_quote(db,{'broker':broker,'instrument_id':c['id'],'ltp':price,'bid':price-.1,'ask':price+.1,'received_at':iso_now(),'demo':True,**kw})
 
 def enter(db,side='BUY',lots=2,brokers=None,order_type='MARKET',price=None,key=None):
-    brokers=brokers or ['dhan'];c=contract()
+    brokers=brokers or ['kotak'];c=contract()
     for b in brokers:quote(db,c,100,b)
     result=engine.create_trades(db,{'name':'Test strategy','underlying':'NIFTY','brokers':brokers,'legs':[{'instrument_id':c['id'],'side':side,'lots':lots,'order_type':order_type,'price':price,'enabled':True}],'idempotency_key':key or f'test-{uuid.uuid4()}','confirmed':True})
     db.commit();return result
@@ -68,10 +68,10 @@ def test_add_lots_weighted_average_and_partial_exit(db):
     assert result['unrealized_pnl']==pytest.approx(2333.33,abs=.01)
 
 def test_idempotent_multibroker_and_key_mismatch(db):
-    key='multi-broker-001';first=enter(db,brokers=['dhan','kotak','fivepaisa'],key=key)
-    second=enter(db,brokers=['dhan','kotak','fivepaisa'],key=key)
+    key='multi-broker-001';first=enter(db,brokers=['kotak','fivepaisa'],key=key)
+    second=enter(db,brokers=['kotak','fivepaisa'],key=key)
     assert first['action_id']==second['action_id']
-    assert db.scalar(select(func.count()).select_from(Trade))==3
+    assert db.scalar(select(func.count()).select_from(Trade))==2
     with pytest.raises(HTTPException):enter(db,lots=1,key=key)
 
 def test_limit_waits_then_fills_at_limit_or_better(db):
@@ -187,7 +187,7 @@ def test_auth_csrf_origin_and_api_flow(db,monkeypatch):
         assert client.post('/api/risk',json={'legs':[{**valid_risk,'side':'INVALID'}]},headers=headers).status_code==422
         assert client.post('/api/risk',json={'legs':[{**valid_risk,'lots':-1}]},headers=headers).status_code==422
         assert client.post('/api/risk',json={'legs':[{**valid_risk,'entry_price':'Infinity'}]},headers=headers).status_code==422
-        c=contract();payload={'name':'Browser trade','underlying':'NIFTY','brokers':['dhan'],'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1}],'idempotency_key':'browser-flow-001','confirmed':True}
+        c=contract();payload={'name':'Browser trade','underlying':'NIFTY','brokers':['kotak'],'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1}],'idempotency_key':'browser-flow-001','confirmed':True}
         created=client.post('/api/trades',json=payload,headers=headers)
         assert created.status_code==200 and len(created.json()['trades'])==1
         trade=created.json()['trades'][0]
@@ -199,7 +199,7 @@ def test_auth_csrf_origin_and_api_flow(db,monkeypatch):
 
 def test_outer_rollback_removes_trade_and_idempotency_record(db):
     c=contract();quote(db,c);db.commit()
-    payload={'name':'Atomic','underlying':'NIFTY','brokers':['dhan'],'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1,'enabled':True}],'idempotency_key':'rollback-atomic-test','confirmed':True}
+    payload={'name':'Atomic','underlying':'NIFTY','brokers':['kotak'],'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1,'enabled':True}],'idempotency_key':'rollback-atomic-test','confirmed':True}
     engine.create_trades(db,payload)
     db.rollback()
     assert db.scalar(select(func.count()).select_from(Trade))==0
@@ -215,7 +215,7 @@ def test_stale_crossed_limit_receipt_survives_without_fill(db):
 
 def test_durable_receipt_recovers_after_processing_restart(db):
     trade=enter(db)['trades'][0];c=contract()
-    event_id=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':120,'received_at':iso_now(),'demo':True},process=False)
+    event_id=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':120,'received_at':iso_now(),'demo':True},process=False)
     db.commit();db.expire_all()
     assert db.get(PendingQuote,event_id)
     assert engine.recover_pending_quotes(db)==1
@@ -232,8 +232,8 @@ def test_queued_limit_replay_uses_trigger_receipt_and_respects_limit(db,side,lim
     assert trade['status']=='pending'
     engine.update_settings(db,{'slippage_bps':slippage})
     at=iso_now()
-    first=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':trigger,'received_at':at,'demo':True},process=False)
-    second=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':100,'received_at':iso_now(),'demo':True},process=False)
+    first=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':trigger,'received_at':at,'demo':True},process=False)
+    second=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':100,'received_at':iso_now(),'demo':True},process=False)
     db.commit();db.expire_all()  # Simulate restart after durable receipts, before processing.
     assert engine.recover_pending_quotes(db)==2
     db.commit();result=db.get(Trade,trade['id']).data;leg=result['legs'][0]
@@ -253,8 +253,8 @@ def test_queued_stop_and_target_replay_fill_from_trigger_bid_ask(db,side,kind,th
     action(db,trade,'edit',leg_id=leg_id,**{kind:threshold})
     engine.update_settings(db,{'fill_basis':'bid_ask','slippage_bps':100})
     at=iso_now()
-    first=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':trigger,'bid':trigger-.5,'ask':trigger+.5,'received_at':at,'demo':True},process=False)
-    second=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':100,'bid':99.5,'ask':100.5,'received_at':iso_now(),'demo':True},process=False)
+    first=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':trigger,'bid':trigger-.5,'ask':trigger+.5,'received_at':at,'demo':True},process=False)
+    second=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':100,'bid':99.5,'ask':100.5,'received_at':iso_now(),'demo':True},process=False)
     db.commit();db.expire_all()
     assert engine.recover_pending_quotes(db)==2
     db.commit();result=db.get(Trade,trade['id']).data;leg=result['legs'][0]
@@ -376,11 +376,11 @@ def test_real_lifespan_seeds_and_websocket_ticket_is_single_use(tmp_path,monkeyp
         first_leg=closed['legs'][0]
         next_catalog=ContractCatalog(tmp_path/'next-startup.json')
         next_catalog._demo=demo_contracts(datetime.now(IST).date()+timedelta(days=1))
-        assert next_catalog.find(first_leg['instrument_id'],'dhan') is None
+        assert next_catalog.find(first_leg['instrument_id'],'kotak') is None
         monkeypatch.setattr(instruments,'ContractCatalog',lambda:next_catalog)
         with TestClient(main.app) as client:
             assert client.get('/api/health').status_code==200
-            recovered=next_catalog.find(first_leg['instrument_id'],'dhan')
+            recovered=next_catalog.find(first_leg['instrument_id'],'kotak')
             assert recovered and recovered['demo'] is True and recovered['restored_from_trade'] is True
             assert recovered['lot_size']==first_leg['lot_size']
             assert next_catalog.all(demo=False)==[]
@@ -410,7 +410,7 @@ def test_compact_policy_updates_legacy_default_without_deleting_records(db):
     historical=db.scalar(select(func.count()).select_from(QuoteEvent))
     row=db.get(Setting,'app');row.value={'logging_mode':'every_update','demo_mode':True}
     db.commit();engine.clear_cache(db)
-    assert engine.get_settings(db)['logging_mode']=='summary'
+    assert engine.get_settings(db)['logging_mode']=='full_history'
     assert db.scalar(select(func.count()).select_from(QuoteEvent))==historical
 
 
@@ -440,8 +440,8 @@ def test_compact_receipt_replay_and_current_mark_survive_restart(db):
     engine.update_settings(db,{'logging_mode':'summary'})
     trade=enter(db,lots=1,order_type='LIMIT',price=90)['trades'][0];c=contract()
     at=iso_now()
-    first=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':80,'received_at':at,'demo':True},process=False)
-    second=engine.record_quote(db,{'broker':'dhan','instrument_id':c['id'],'ltp':100,'received_at':iso_now(),'demo':True},process=False)
+    first=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':80,'received_at':at,'demo':True},process=False)
+    second=engine.record_quote(db,{'broker':'kotak','instrument_id':c['id'],'ltp':100,'received_at':iso_now(),'demo':True},process=False)
     db.commit();db.expire_all();engine.clear_cache(db)
     assert engine.recover_pending_quotes(db)==2
     db.commit();engine.clear_cache(db)
@@ -449,7 +449,7 @@ def test_compact_receipt_replay_and_current_mark_survive_restart(db):
     assert result['legs'][0]['entry_price']==80 and result['legs'][0]['entry_at']==at
     assert result['legs'][0]['current_price']==100
     assert db.get(QuoteEvent,first) is None and db.get(QuoteEvent,second) is None
-    latest=engine.latest_quote(db,c['id'],'dhan')
+    latest=engine.latest_quote(db,c['id'],'kotak')
     assert latest['ltp']==100 and latest['event_id']==second
     third=quote(db,c,110);db.commit()
     assert third>second>first
@@ -503,7 +503,7 @@ def test_compact_quote_rollback_restores_cache_to_committed_values(db):
     quote(db,price=110);db.commit()
     quote(db,price=80);db.rollback()
     assert engine.dashboard(db)['summary']['net_pnl']==500
-    assert engine.latest_quote(db,contract()['id'],'dhan')['ltp']==110
+    assert engine.latest_quote(db,contract()['id'],'kotak')['ltp']==110
     result=db.get(Trade,trade['id']).data
     assert result['mfe']==500 and result['mae']==0
 
@@ -523,3 +523,48 @@ def test_compact_day_rollover_uses_last_observed_mark_without_timelines(db):
     data=engine.dashboard(db)
     assert data['summary']['today_pnl']==500 and data['summary']['today_pnl_complete']
     assert db.scalar(select(func.count()).select_from(Timeline))==0
+
+
+def test_removed_broker_history_remains_readable_but_new_trade_schema_rejects_it(db):
+    from app.schemas import TradeInput
+    from pydantic import ValidationError
+    result=enter(db)['trades'][0]
+    closed=action(db,result,'exit_strategy')['trade']
+    row=db.get(Trade,closed['id'])
+    row.broker='dhan';row.data={**row.data,'broker':'dhan'};db.commit()
+    history=engine.list_trades(db)
+    assert any(t['id']==closed['id'] and t['broker']=='dhan' and t['status']=='closed' for t in history)
+    c=contract()
+    with pytest.raises(ValidationError):
+        TradeInput(name='Disabled broker',underlying='NIFTY',brokers=['dhan'],
+                   legs=[{'instrument_id':c['id'],'side':'BUY','lots':1}],idempotency_key='legacy-broker-guard',confirmed=True)
+
+
+def test_two_broker_paper_strategy_uses_each_actual_quote(db):
+    c=contract('kotak');other=contract('fivepaisa')
+    quote(db,c,100,'kotak');quote(db,other,123,'fivepaisa')
+    result=engine.create_trades(db,{'name':'Independent comparison','underlying':'NIFTY','brokers':['kotak','fivepaisa'],
+        'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1,'order_type':'MARKET','enabled':True}],
+        'idempotency_key':'independent-feed-comparison','confirmed':True})
+    db.commit()
+    entries={t['broker']:t['legs'][0]['entry_price'] for t in result['trades']}
+    assert entries=={'kotak':100,'fivepaisa':123}
+
+
+def test_expired_option_owner_settlement_can_close_at_zero_intrinsic(db):
+    original=enter(db,lots=1)['trades'][0]
+    stored=copy.deepcopy(db.get(Trade,original['id']).data)
+    stored['legs'][0]['expiry']='2026-01-01'
+    engine.store_trade(db,stored);db.commit()
+    closed=action(db,stored,'settle_expiry',leg_id=stored['legs'][0]['id'],price=stored['legs'][0]['strike']-1)['trade']
+    assert closed['status']=='closed' and closed['legs'][0]['exit_price']==0
+    assert closed['realized_pnl']==-100*closed['legs'][0]['lot_size']
+    assert closed['legs'][0]['settlement_verified_by_broker'] is False
+
+
+def test_expiry_action_rejects_a_contract_that_has_not_expired(db):
+    original=enter(db)['trades'][0]
+    stored=copy.deepcopy(db.get(Trade,original['id']).data)
+    stored['legs'][0]['expiry']='2099-12-31'
+    engine.store_trade(db,stored);db.commit()
+    with pytest.raises(HTTPException):action(db,stored,'settle_expiry',leg_id=stored['legs'][0]['id'],price=25000)

@@ -38,13 +38,18 @@ def epoch_timestamp(value, milliseconds=False) -> str | None:
 def optional_price(value) -> float | None:
     if value is None:
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise FeedProtocolError("Invalid market-feed price") from None
     if not math.isfinite(number) or number < 0:
         raise FeedProtocolError("Non-finite or negative feed price")
     return number if number > 0 else None
 
 
 def normalized_quote(broker: str, contract: dict, ltp, *, received_at=None, received_ns=None, **fields) -> dict:
+    if contract.get("broker") != broker:
+        raise FeedProtocolError("Quote broker does not match its instrument master")
     price = optional_price(ltp)
     if price is None:
         raise FeedProtocolError("Quote has no valid last price")
