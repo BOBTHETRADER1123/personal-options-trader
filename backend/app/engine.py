@@ -791,7 +791,9 @@ def take_snapshots(db,now=None,calendar=None,lease=None):
     if settings['logging_mode']!='full_history':
         count=0
         for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
-            trade=copy.deepcopy(row.data);snapshot(db,trade,'one_second');store_trade(db,trade);count+=1
+            trade=copy.deepcopy(row.data)
+            if trade.get('demo') and not settings['demo_mode']:continue
+            snapshot(db,trade,'one_second');store_trade(db,trade);count+=1
         return {'recorded':count,'calendar_unknown':0,'closed_session':0}
     from .scheduler import ExchangeCalendar, database_seconds
     moment=now or datetime.fromtimestamp(database_seconds(db),timezone.utc)
@@ -805,6 +807,7 @@ def take_snapshots(db,now=None,calendar=None,lease=None):
         from sqlalchemy.dialects.sqlite import insert
     # Only active positions are sampled; pending-only orders have no P&L yet.
     active=[trade for trade in trade_records(db) if trade['status']=='open' and
+            (not trade.get('demo') or settings['demo_mode']) and
             any((leg.get('open_lots') or 0)>0 for leg in trade.get('legs',[]))]
     for trade in active:
         legs=[leg for leg in trade['legs'] if (leg.get('open_lots') or 0)>0]

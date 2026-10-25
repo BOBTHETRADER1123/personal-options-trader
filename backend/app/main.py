@@ -24,7 +24,7 @@ from .schemas import AuthInput, PasswordInput, TradeInput, ActionInput, Settings
 from . import engine
 from .payoff import strategy_risk
 from .scheduler import CollectorLease, ExchangeCalendar, guard_lease
-from . import cloud_backup, resource_health, maintenance, reporting, daily_reports, sheets_sync
+from . import cloud_backup, resource_health, maintenance, reporting, daily_reports, sheets_sync, archival
 from pydantic import BaseModel, ConfigDict, Field
 
 from .log_safety import install as install_safe_logs
@@ -44,6 +44,7 @@ cloud_service=None
 resource_monitor=None
 daily_service=None
 sheets_service=None
+storage_archiver=None
 _active_positions=[]
 _activity_until=0.0
 _viewers=0
@@ -64,7 +65,11 @@ def update_demand(db):
 def recording_needed():
     now=datetime.now(timezone.utc)
     for trade in _active_positions:
-        if trade.get('demo'):return True
+        if trade.get('demo'):
+            if _runtime_settings.get('demo_mode',False):return True
+            continue
+        # Genuine paper positions keep recording through their own market
+        # sessions, independently of whether the UI is showing sample trades.
         if exchange_calendar and any(exchange_calendar.state(leg,now)['open'] for leg in trade.get('legs',[]) if leg.get('status') in ('open','pending')):return True
     return False
 
@@ -223,7 +228,7 @@ def capture_once(lease=None):
                 engine.record_quote(db,demo_quote(contract,broker))
         result=engine.take_snapshots(db,calendar=exchange_calendar,lease=lease)
         if result.get('recorded'):
-            day=datetime.fromtimestamp(result['second'],timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo('Asia/Kolkata')).date().isoformat()
+            day=datetime.fromtimestamp(result.get('second',int(time.time())),timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo('Asia/Kolkata')).date().isoformat()
             daily_reports.ensure_day(db,day)
         update_demand(db)
         return result
@@ -331,7 +336,7 @@ async def database_services(reporting_loop):
 
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,_started_at,_viewers,_activity_until
+    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
@@ -343,6 +348,7 @@ async def lifespan(app):
     resource_monitor=resource_health.ResourceMonitor()
     sheets_service=sheets_sync.SheetsSyncService(SessionLocal,cloud_service)
     daily_service=daily_reports.DailyReportService(SessionLocal,calendar=exchange_calendar,on_finalized=sheets_service.notify_work)
+    storage_archiver=archival.AutomaticArchiver(cloud_service,sheets_service,daily_service,lambda:resource_monitor.latest,write_lock,ready_provider=lambda:database_ready,can_prune=lambda:not recording_needed())
     # A laptop acknowledgement alone cannot remove the only cloud history.
     reporting.configure_archival(lambda db:False,None)
     reporting.configure_report_ready(cloud_service.notify_work)
@@ -353,6 +359,7 @@ async def lifespan(app):
     resource_task=asyncio.create_task(resource_monitor.run(stop_event))
     daily_task=asyncio.create_task(daily_service.run(stop_event))
     sheets_task=asyncio.create_task(sheets_service.run(stop_event))
+    archive_task=asyncio.create_task(storage_archiver.run(stop_event))
     try:yield
     finally:
         stop_event.set()
@@ -363,8 +370,8 @@ async def lifespan(app):
         except (asyncio.TimeoutError,asyncio.CancelledError):
             services.cancel()
             await asyncio.gather(services,return_exceptions=True)
-        for task in (cloud_task,resource_task,daily_task,sheets_task):task.cancel()
-        await asyncio.gather(cloud_task,resource_task,daily_task,sheets_task,return_exceptions=True)
+        for task in (cloud_task,resource_task,daily_task,sheets_task,archive_task):task.cancel()
+        await asyncio.gather(cloud_task,resource_task,daily_task,sheets_task,archive_task,return_exceptions=True)
         collector_lease=None;feed_manager=None
 
 app=FastAPI(title='Personal Options Trader',version='1.0.0',lifespan=lifespan)
@@ -407,7 +414,7 @@ def readiness():
 @app.get('/api/system/resources',dependencies=[Depends(require_session)])
 def resources():
     result=resource_monitor.status() if resource_monitor else {'sample':None,'active_alerts':[]}
-    return {**result,'uptime_seconds':round(time.monotonic()-_started_at,1),'database_ready':database_ready,
+    return {**result,'archival':storage_archiver.status() if storage_archiver else None,'uptime_seconds':round(time.monotonic()-_started_at,1),'database_ready':database_ready,
             'last_database_write':_last_database_write,'collector_owned':bool(collector_lease and collector_lease.token),
             'recording':_recording_status,'quote_buffer':engine.buffered_quote_status(),
             'database':{'engine':db_engine.dialect.name,'type':db_engine.dialect.name,'size_bytes':(resource_monitor.latest or {}).get('storage',{}).get('sqlite_bytes') if resource_monitor else None,'journal_mode':os.getenv('SQLITE_JOURNAL_MODE','WAL'),'external_subscription_required':False,'verified':os.getenv('SQLITE_STORAGE_VERIFIED')=='true','filesystem':os.getenv('SQLITE_FILESYSTEM'),'path':'/app/data/trading.db' if db_engine.dialect.name=='sqlite' else None}}
@@ -440,10 +447,21 @@ async def drive_connect(current=Depends(require_session),db=Depends(get_db)):
 @app.get('/api/cloud/drive/callback')
 async def drive_callback(state:str=Query(min_length=16,max_length=250),code:str|None=Query(default=None,max_length=4096),current=Depends(require_session),db=Depends(get_db)):
     if not code:raise HTTPException(400,'Google Drive permission was not granted. Reconnect from Data & settings.')
-    async with write_lock:
-        try:await asyncio.to_thread(cloud_backup.complete_authorization,db,current.token_hash,state,code,drive_service().config)
-        except cloud_backup.BackupError as error:raise HTTPException(409,str(error)) from None
-        drive_service().notify_work()
+    service=drive_service()
+    def authorize():
+        # This lock coordinates only Google workers. Broker capture keeps running
+        # while the OAuth token exchange waits on Google's network response.
+        with service.operation_lock:
+            service.complete_authorization(current.token_hash,state,code)
+            if sheets_service:
+                sheets_service._quota_at=0
+                with service.factory() as retry_db:sheets_service.retry(retry_db)
+            if storage_archiver:
+                storage_archiver.state={**storage_archiver.state,'next_attempt':0,'attempts':0}
+                storage_archiver.notify_work()
+            service.notify_work()
+    try:await asyncio.to_thread(authorize)
+    except cloud_backup.BackupError as error:raise HTTPException(409,str(error)) from None
     return RedirectResponse('/?drive=connected',status_code=303)
 
 @app.post('/api/cloud/drive/queue',dependencies=[Depends(require_session)])
@@ -709,9 +727,11 @@ def daily_cleanup_preview(day:str,db=Depends(get_db)):
 @app.post('/api/daily-reports/{day}/cloud-cleanup',dependencies=[Depends(require_session)])
 async def daily_cleanup(day:str,payload:LocalBackupInput):
     if not sheets_service:raise HTTPException(503,'Google Sheets worker has not started.')
-    async with write_lock:
-        try:return await asyncio.to_thread(sheets_service.cleanup_confirm,day,payload.sha256,payload.records,payload.local_backup_confirmed,payload.confirmation)
-        except sheets_sync.SheetsError as error:raise HTTPException(409,str(error)) from None
+    # Google cleanup coordinates with account switches, uploads and archival
+    # through the service's operation_lock. Do not hold the recorder's lock
+    # while waiting for quota, Trash or verification HTTP requests.
+    try:return await asyncio.to_thread(sheets_service.cleanup_confirm,day,payload.sha256,payload.records,payload.local_backup_confirmed,payload.confirmation)
+    except sheets_sync.SheetsError as error:raise HTTPException(409,str(error)) from None
 
 # Reporting tables are imported before lifespan's create_all and share the same journal.
 from .companion_api import router_browser,router_companion

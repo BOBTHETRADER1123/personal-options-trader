@@ -28,6 +28,8 @@ Website: [personal-options-trader.vercel.app](https://personal-options-trader.ve
 - Daily backend-generated XLSX, separate worksheets per broker trade, continued trade IDs across dates, large-file splitting, CSV.gz supplements and checksums.
 - Durable approximately five-second Google Sheets batches, verification before cursor advancement, upload retries and explicitly confirmed daily cloud cleanup. Google OAuth must be configured and authorized before these uploads work.
 - Container CPU/RAM, persistent-storage and queue monitoring. Dashboard/log alerts do not imply external email/SMS is configured.
+- Optional automatic archiving at 12 GiB: fresh verification of complete older daily Google archives before bounded local snapshot cleanup, with continuity anchors, active state and retained export files preserved. SQLite freed pages are reused; this does not clear the database.
+- Google account changes retain old remote files and previous synchronization metadata, then use new account-bound destinations. Google consent and live upload verification remain required.
 
 Mocked tests are not proof of authenticated broker connectivity or a successful Google account connection. No live broker integration is marked passed until the owner's permitted credentials have actually been tested. Sample mode is explicitly synthetic and must not be mistaken for live prices.
 
@@ -53,7 +55,7 @@ Available laptop reports have been backed up and downloaded again for checksum v
 
 **23 October laptop repair:** short SQLite write conflicts now retry on a fresh transaction without disabling the whole workspace. The user confirmed that the local dashboard opens. The installed app identifies itself as **Laptop workspace** at `http://127.0.0.1:8000`; the Vercel address identifies the separate **Online workspace**. The laptop launcher's readiness check now requires a usable database, not merely a running web server.
 
-**Free cloud migration being prepared:** a persistent VM can run both this app and SQLite while the laptop is off. The [free cloud hosting guide](docs/FREE-CLOUD-HOSTING.md) describes the proposed setup and free-tier limits. No replacement server has been provisioned yet; Oracle account signup and free compute availability still need verification. The current Vercel/Render/Neon deployment is unchanged.
+The unused Oracle/DigitalOcean VM deployment scaffold was removed after selecting RamNaym. Git history retains the earlier proposal; current deployment instructions are in docs/RAMNAYM-TRIAL.md.
 
 ### Included workflows
 

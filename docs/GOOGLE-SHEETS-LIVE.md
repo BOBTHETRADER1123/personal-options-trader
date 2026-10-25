@@ -30,17 +30,19 @@ A developer or administrator must configure the application's own Google OAuth c
    Keep the token-encryption key in a separate private recovery store. Replacing it without migrating encrypted tokens requires renewed authorization. Generate it only in a trusted private terminal; see [cloud authorization setup](GOOGLE-DRIVE-CLOUD.md).
 6. Restart the backend to apply settings. `GOOGLE_DRIVE_BACKUP_ENABLED=true` separately enables the completed individual-trade backup worker; it is distinct from `GOOGLE_SHEETS_SYNC_ENABLED`, which controls live sheets and finalized daily archive uploads.
 
-The current consent request includes both `https://www.googleapis.com/auth/drive.file` and `https://www.googleapis.com/auth/spreadsheets`. Drive file access is restricted to files this app creates or is granted access to; the Sheets scope is broader. Read the actual Google permission screen before accepting.
+The current consent request uses only `https://www.googleapis.com/auth/drive.file`. It covers app-created or explicitly selected files, including the app's Sheets; Google's [batch-write method accepts this scope](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate#authorization-scopes). The broader `spreadsheets` scope is not requested. Read the actual Google permission screen before accepting.
 
 ## Choose your separate 15 GB account
 
 1. Sign in to the paper-trading website and open **Data & settings**.
-2. Under **Cloud backups & server health**, choose **Connect Google Drive** (or **Reconnect Google Drive**).
+2. Under **Cloud backups & server health**, choose **Connect Google Drive** (or **Change or reconnect Google account**).
 3. Google displays an account chooser. Select the separate free-storage account you intend to use; it can differ from your hosting accounts.
 4. Enter Google passwords or verification codes only on Google's page. Review and accept the consent yourself.
 5. Return to the app in the same session. Check connection status, then open **Daily Excel Downloads**. Its **Live Google Sheets** panel shows the account email when Google account metadata is available and links to created daily sheets.
 
-Offline authorization allows token refresh on the server while your devices are off, subject to Google's token lifetime, revocation and app publishing rules. The app stores refresh tokens encrypted; it cannot guarantee that Google will never require renewed consent. If the wrong account was chosen before any uploads, reconnect and choose the correct one. If files already exist in another account, pause and review migration rather than expecting those file IDs to transfer automatically.
+Offline authorization allows token refresh on the server while your devices are off, subject to Google's token lifetime, revocation and app publishing rules. An External consent app in Testing has a seven-day refresh-token lifetime for this access, so testing mode is not a month-long unattended configuration. The app stores refresh tokens encrypted; Google may still require renewed consent after publishing. See [Google's expiration rules](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+You can change the backup email through the same account chooser. Same-account reauthorization retains existing destinations and cursors. A verified different account starts new account-bound destinations; the previous metadata is retained separately and old remote files stay in their original account. This does not transfer files or reconstruct already archived one-second detail in a new live sheet. Trades, active state and verified export files are preserved. Google uploads and account changes are serialized to prevent mixed-account destinations.
 
 ## How recording and upload differ
 
@@ -62,7 +64,7 @@ In **Daily Excel Downloads**, inspect pending records, last synchronization/erro
 
 If authorization expires, reconnect the same intended account. If storage is full, download and verify completed daily files, then use **Delete Verified Cloud Copies** only after the explicit local-backup confirmation. See the [daily report guide](DAILY-REPORTS.md). Emptying Google Drive Trash is a separate permanent action. Do not delete source database files to resolve a Google quota problem.
 
-Never manually delete unsynchronized rows, pending batches or credentials from SQLite to make a warning disappear. Keep enough local storage for the backlog, respond to resource warnings, and check that pending records decrease after recovery. No external email/SMS alerts are configured merely by enabling this worker.
+Never manually delete unsynchronized rows, pending batches or credentials from SQLite to make a warning disappear. Keep enough local storage for the backlog, respond to resource warnings, and check that pending records decrease after recovery. No external email/SMS alerts are configured merely by enabling this worker. The separate [12 GB automatic local-history policy](GOOGLE-DRIVE-CLOUD.md#automatic-local-history-archiving-at-12-gb) can prune only older verified snapshot detail, with continuity anchors retained; this Google Sheets worker itself never clears source history.
 
 ## Live acceptance checks
 

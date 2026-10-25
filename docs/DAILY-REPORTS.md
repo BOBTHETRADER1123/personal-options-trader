@@ -54,9 +54,15 @@ These limits control report size, not how many source records may be silently di
 4. Tick the statement confirming that all completed files were saved, reopened and checked, then choose **Verify local backup**.
 5. Review the warning and separately choose **Delete Verified Cloud Copies** only if you intend cleanup.
 
-The server refuses cleanup if the export is not finalized, its checksum/count changed, snapshots or Google write batches remain unsynchronized, required cloud archives are unverified, or duplicate cloud files need review. It only moves app-owned copies to **Google Drive Trash**. It does not delete active positions or SQLite history. Trash is recoverable until you separately empty it in Google Drive; emptying Trash is permanent. Account storage includes Gmail, Photos and other files, so deleting these reports does not imply zero account usage.
+The server refuses cleanup if the export is not finalized, its checksum/count changed, snapshots or Google write batches remain unsynchronized, required cloud archives are unverified, or duplicate cloud files need review. It only moves app-owned copies to **Google Drive Trash**. This button does not delete active positions or SQLite history. Trash is recoverable until you separately empty it in Google Drive; emptying Trash is permanent. Account storage includes Gmail, Photos and other files, so deleting these reports does not imply zero account usage.
 
 A download click is never treated as proof of a saved local backup. A laptop copy alone does not protect against laptop loss or failure. Daily trade reports also do not replace a private, consistent database recovery backup containing settings and pending trading state.
+
+## Automatic server-history retention
+
+The separately configured [12 GB archival worker](GOOGLE-DRIVE-CLOUD.md#automatic-local-history-archiving-at-12-gb) can remove eligible older one-second snapshot detail only after the complete finalized XLSX/CSV exports and Google copies have been verified. It keeps each trade/date's last snapshot, all active position state, trade summaries and export bytes. Downloading or cloud-file cleanup alone does not trigger this policy. Partial local pruning has a durable receipt and must complete before cloud-copy cleanup is allowed.
+
+Archived daily files remain the complete history even after source detail is pruned. The website does not manufacture the removed seconds from the continuity anchor. Keep all export parts and their checksums in independent storage before separately trashing cloud copies.
 
 ## Live sheets and recovery
 

@@ -21,7 +21,7 @@ from sqlalchemy.orm import Mapped,mapped_column
 from .database import Base,SessionLocal,iso_now,run_transaction
 from .models import PnlSnapshot,Trade
 from .scheduler import CollectorLease
-from .cloud_backup import AccessTokenExpired,BackupError,CloudBackupService,CloudDriveCredential,DRIVE,DriveClient,file_key,verify_remote
+from .cloud_backup import AccessTokenExpired,BackupError,CloudBackupService,CloudDriveCredential,DRIVE,DriveClient,file_key,verify_remote,serialized_google_operation
 
 IST=ZoneInfo('Asia/Kolkata')
 SHEETS='https://sheets.googleapis.com/v4/spreadsheets'
@@ -339,41 +339,45 @@ class SheetsSyncService:
             DailyReport.status=='finalized',~select(DailyCloudCopy.key).where(DailyCloudCopy.trading_date==DailyReportPart.trading_date,
                 DailyCloudCopy.source_sha256==DailyReportPart.sha256,DailyCloudCopy.status.in_(['verified','trashed'])).exists()
         ).order_by(DailyReportPart.trading_date,DailyReportPart.part_number).limit(1))
+    @serialized_google_operation
     def upload_daily_artifacts(self,token,date,max_files=1):
         """Reserve IDs before media upload; verify hashes before acknowledging."""
-        from .daily_reports import cloud_artifacts
+        from .daily_reports import artifact, DailyReport
         client=self.drive_factory(token);uploaded=0
         try:
             date_value=datetime.strptime(date,'%Y-%m-%d');parent=None;path=''
             for name in ('Paper Trading Records',str(date_value.year),date_value.strftime('%B'),'Daily Reports'):
                 path+='/'+name;parent=self.cloud._folder(client,path,name,parent)
+            # Release SQLite reads before network calls or nested writer commits.
             with self.factory() as db:
-                for artifact in cloud_artifacts(db,date):
-                    key=file_key(f'daily:{date}',artifact)
-                    with self.factory() as state_db:
-                        copy_row=state_db.get(DailyCloudCopy,key)
-                        if copy_row and copy_row.status in ('verified','trashed'):continue
-                        identifier=copy_row.drive_id if copy_row else None
-                    if artifact['size']>self.cloud.config.max_file_bytes:raise SheetsError('Daily export exceeds upload file limit; local export remains available. Split it before cloud upload.')
-                    if not identifier:
-                        found=client.find(parent,key)
-                        if len(found)>1:raise SheetsError('Duplicate daily archives require review before cleanup; local records retained.')
-                        identifier=found[0]['id'] if found else client.generate_id()
-                        def reserve(state_db):
-                            row=state_db.get(DailyCloudCopy,key)
-                            if not row:state_db.add(DailyCloudCopy(key=key,trading_date=date,kind=artifact['kind'],
-                                part=artifact.get('part_number',1),drive_id=identifier,source_sha256=artifact['sha256'],status='reserved',metadata_json={}))
-                        run_transaction(reserve,self.factory)
-                        with self.factory() as state_db:identifier=state_db.get(DailyCloudCopy,key).drive_id
-                    remote=client.metadata(identifier)
-                    if remote is None:remote=client.upload(identifier,artifact['filename'],parent,artifact['mime_type'],key,artifact['file_bytes'])
-                    verified=verify_remote(remote,artifact,parent,client)
-                    def acknowledge(state_db):
-                        row=state_db.get(DailyCloudCopy,key);row.status,row.verified_at,row.metadata_json='verified',iso_now(),verified
-                    run_transaction(acknowledge,self.factory);uploaded+=1
-                    if uploaded>=max_files:break
+                report=db.get(DailyReport,date)
+                specs=copy.deepcopy(report.manifest.get('artifacts',[])) if report and report.status=='finalized' else []
+            for spec in specs:
+                with self.factory() as db:item=artifact(db,date,spec['kind'],spec['part_number'])
+                key=file_key(f'daily:{date}',item)
+                with self.factory() as db:
+                    copy_row=db.get(DailyCloudCopy,key)
+                    if copy_row and copy_row.status in ('verified','trashed'):continue
+                    identifier=copy_row.drive_id if copy_row else None
+                if item['size']>self.cloud.config.max_file_bytes:raise SheetsError('Daily export exceeds upload file limit; split the local export before upload.')
+                if not identifier:
+                    found=client.find(parent,key)
+                    if len(found)>1:raise SheetsError('Duplicate daily archives require review before cleanup; local records retained.')
+                    identifier=found[0]['id'] if found else client.generate_id()
+                    def reserve(db):
+                        if not db.get(DailyCloudCopy,key):db.add(DailyCloudCopy(key=key,trading_date=date,kind=item['kind'],part=item.get('part_number',1),drive_id=identifier,source_sha256=item['sha256'],status='reserved',metadata_json={}))
+                    run_transaction(reserve,self.factory)
+                    with self.factory() as db:identifier=db.get(DailyCloudCopy,key).drive_id
+                remote=client.metadata(identifier)
+                if remote is None:remote=client.upload(identifier,item['filename'],parent,item['mime_type'],key,item['file_bytes'])
+                verified=verify_remote(remote,item,parent,client)
+                def acknowledge(db):
+                    row=db.get(DailyCloudCopy,key);row.status,row.verified_at,row.metadata_json='verified',iso_now(),verified
+                run_transaction(acknowledge,self.factory);uploaded+=1
+                if uploaded>=max_files:break
             return uploaded
         finally:client.close()
+    @serialized_google_operation
     def sync_once(self):
         if not self.config.enabled:return {'enabled':False,'synced_rows':0}
         if self._next_attempt>time.time():return {'enabled':True,'backoff':True,'next_attempt':self._next_attempt,'synced_rows':0}
@@ -469,12 +473,14 @@ class SheetsSyncService:
         complete=bool(artifacts) and all(any(c.source_sha256==a.sha256 and c.status in ('verified','trashed') and c.verified_at for c in copies) for a in artifacts)
         docs=list(db.scalars(select(SheetsDocument).where(SheetsDocument.trading_date==date)))
         captured=db.scalar(select(func.count()).select_from(PnlSnapshot).where(PnlSnapshot.snapshot_second>=start,PnlSnapshot.snapshot_second<end)) or 0
-        source_unchanged=captured==report.snapshot_count
+        from .archival import source_matches
+        source_unchanged=source_matches(db,report,captured)
         eligible=report.status=='finalized' and acknowledged and not unsent and not plans and complete and source_unchanged and not any(d.duplicate_file_ids for d in docs)
         return {'trading_date':date,'eligible':eligible,'finalized':report.status=='finalized','manifest_checksum':report.manifest_checksum,
             'record_count':report.record_count,'local_backup_acknowledged':acknowledged,'unsynchronized_snapshots':unsent,'pending_batches':plans,
             'all_archives_verified':complete,'source_snapshot_count_matches':source_unchanged,'files':[d.drive_id for d in docs if d.drive_id and d.status!='trashed']+[c.drive_id for c in copies if c.status!='trashed'],
             'warning':'Cloud copies move to Google Drive Trash. Emptying Trash permanently deletes them. A laptop copy alone does not protect against laptop failure.'}
+    @serialized_google_operation
     def cleanup_confirm(self,date,manifest_checksum,confirmed_record_count,confirmed=False,confirmation=''):
         if not confirmed or confirmation!='DELETE VERIFIED CLOUD COPIES':raise SheetsError('Explicit local-backup confirmation and the displayed phrase are required.')
         with self.factory() as db:

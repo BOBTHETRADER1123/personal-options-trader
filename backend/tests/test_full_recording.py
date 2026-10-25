@@ -394,3 +394,92 @@ def test_additive_alembic_transaction_rolls_back_without_touching_old_rows(tmp_p
             assert connection.scalar(select(Trade.data))=={'net_pnl':123}
             assert 'pnl_snapshots' not in inspect(connection).get_table_names()
     finally:sql.dispose()
+
+
+@pytest.mark.parametrize('demo_enabled,include_real,market_open,expected', [
+    (False,False,False,False),
+    (True,False,False,True),
+    (False,True,True,True),
+    (True,True,True,True),
+    (False,True,False,False),
+])
+def test_recording_demand_ignores_disabled_samples_and_keeps_real_sessions(monkeypatch,demo_enabled,include_real,market_open,expected):
+    from app import main
+    sample=trade(identifier='sample-demand',demo=True)
+    real=trade(identifier='real-demand')
+    calls=[]
+    class DemandCalendar:
+        def state(self,leg,now):
+            calls.append(leg)
+            return {'open':market_open,'known':True}
+    monkeypatch.setattr(main,'_runtime_settings',{'demo_mode':demo_enabled})
+    monkeypatch.setattr(main,'_active_positions',([real] if include_real else [])+[sample])
+    monkeypatch.setattr(main,'exchange_calendar',DemandCalendar())
+    assert main.recording_needed() is expected
+    # Synthetic contracts must never keep a genuine-mode collector alive by
+    # falling through to the real exchange calendar.
+    assert len(calls)==(1 if include_real else 0)
+
+
+def test_sample_off_stops_new_snapshots_without_erasing_cursor_and_resumes_with_gap(journal):
+    with journal() as db:
+        sample=trade(identifier='sample-pause',demo=True)
+        engine.update_settings(db,{'demo_mode':True});put(db,sample)
+        assert engine.take_snapshots(db,now=MOMENT,calendar=calendar())['recorded']==1
+        db.commit()
+        engine.update_settings(db,{'demo_mode':False});db.commit()
+        original=db.get(Trade,sample['id']).data.copy()
+        statements=[]
+        def writes(connection,cursor,statement,params,context,many):
+            if statement.lstrip().split(None,1)[0].upper() in {'INSERT','UPDATE','DELETE','REPLACE'}:statements.append(statement)
+        sqlalchemy_event.listen(db.get_bind(),'before_cursor_execute',writes)
+        try:
+            assert engine.take_snapshots(db,now=MOMENT+timedelta(seconds=5),calendar=calendar())['recorded']==0
+            db.commit()
+            assert statements==[]
+        finally:sqlalchemy_event.remove(db.get_bind(),'before_cursor_execute',writes)
+        assert db.scalar(select(func.count()).select_from(PnlSnapshot))==1
+        assert db.get(RecordingCursor,sample['id']).last_second==int(MOMENT.timestamp())
+        assert db.get(Trade,sample['id']).data==original
+        engine.update_settings(db,{'demo_mode':True});db.commit()
+        assert engine.take_snapshots(db,now=MOMENT+timedelta(seconds=10),calendar=calendar())['recorded']==1
+        db.commit()
+        assert db.scalar(select(func.count()).select_from(PnlSnapshot))==2
+        gap=db.scalar(select(RecordingGap).where(RecordingGap.trade_id==sample['id']))
+        assert gap.start_second==int(MOMENT.timestamp())+1 and gap.end_second==int(MOMENT.timestamp())+9
+        assert gap.reason=='recording_interrupted' and 'reconstructed' in gap.data['note']
+
+
+@pytest.mark.parametrize('mode',['full_history','every_update'])
+@pytest.mark.parametrize('demo_enabled',[False,True])
+def test_real_positions_record_independently_of_sample_view_in_both_recording_modes(journal,mode,demo_enabled):
+    from app.models import Timeline
+    with journal() as db:
+        engine.update_settings(db,{'logging_mode':mode,'demo_mode':demo_enabled});db.commit()
+        put(db,trade(identifier='sample',demo=True))
+        put(db,trade(identifier='genuine',demo=False))
+        result=engine.take_snapshots(db,now=MOMENT,calendar=calendar());db.commit()
+        assert result['recorded']==(2 if demo_enabled else 1)
+        model=PnlSnapshot if mode=='full_history' else Timeline
+        identifiers=set(db.scalars(select(model.trade_id)))
+        assert identifiers==({'genuine','sample'} if demo_enabled else {'genuine'})
+        assert db.get(Trade,'sample') is not None
+
+
+def test_legacy_sample_only_disabled_creates_no_writes(journal):
+    from app.models import Timeline
+    with journal() as db:
+        engine.update_settings(db,{'logging_mode':'every_update','demo_mode':False});db.commit()
+        put(db,trade(identifier='disabled-legacy',demo=True))
+        statements=[]
+        def writes(connection,cursor,statement,params,context,many):
+            if statement.lstrip().split(None,1)[0].upper() in {'INSERT','UPDATE','DELETE','REPLACE'}:statements.append(statement)
+        sqlalchemy_event.listen(db.get_bind(),'before_cursor_execute',writes)
+        try:
+            assert engine.take_snapshots(db,now=MOMENT,calendar=calendar())['recorded']==0
+            db.commit();assert statements==[]
+        finally:sqlalchemy_event.remove(db.get_bind(),'before_cursor_execute',writes)
+        assert db.scalar(select(func.count()).select_from(Timeline))==0
+        assert db.scalar(select(func.count()).select_from(PnlSnapshot))==0
+        assert db.scalar(select(func.count()).select_from(RecordingCursor))==0
+        assert db.get(Trade,'disabled-legacy') is not None

@@ -115,18 +115,19 @@ def test_oauth_callback_encrypts_refresh_token_and_state_cannot_be_replayed(fact
     requests = []
     def token(request):
         requests.append(request)
+        if request.method=='GET':return httpx.Response(200,json={'user':{'permissionId':'mock-account-one','emailAddress':'owner@example.test'}})
         return httpx.Response(200, json={"access_token": "access-only", "refresh_token": "secret-refresh", "scope": backup.SCOPE})
     with httpx.Client(transport=httpx.MockTransport(token)) as client, factory() as db:
         state = parse_qs(urlparse(backup.begin_authorization(db, "session", config)).query)["state"][0]
         result = backup.complete_authorization(db, "session", state, "sensitive-code", config, client)
-        assert result == {"connected": True, "offline_access": True}
+        assert result == {"connected": True, "offline_access": True,"account_email":"owner@example.test","account_changed":False}
         row = db.get(backup.CloudDriveCredential, 1)
         assert "secret-refresh" not in row.encrypted_refresh_token
         assert config.decrypt(row.encrypted_refresh_token) == "secret-refresh"
         assert b"code_verifier" in requests[0].content
         with pytest.raises(backup.AuthorizationRequired):
             backup.complete_authorization(db, "session", state, "sensitive-code", config, client)
-        assert len(requests) == 1
+        assert len(requests) == 2
 
 
 def test_oauth_expired_state_and_missing_offline_access_are_rejected(factory, config):

@@ -6,13 +6,15 @@ import './CloudServices.css';
 
 type Artifact = {kind:string; filename:string; size:number; drive_id?:string; verification?:string};
 type BackupJob = {id:string; trade_id:string; status:string; attempts:number; verified_at?:string|null; last_error?:string|null; artifacts:Artifact[]};
-type DriveStatus = {enabled:boolean; configured:boolean; connected:boolean; authorization_required:boolean; last_error?:string|null;
+type DriveStatus = {account_email?:string|null; enabled:boolean; configured:boolean; connected:boolean; authorization_required:boolean; last_error?:string|null;
   counts:Record<string,number>; jobs:BackupJob[]; retention:string; last_success?:string|null};
 type ResourceSample = {sampled_at:string; uptime_seconds:number;
   cpu:{percent:number|null; capacity_vcpu:number; source:string};
   ram:{used_bytes:number|null; limit_bytes:number|null; percent:number|null; source:string};
   storage?:{application_bytes:number|null; plan_limit_bytes:number|null; percent:number|null; warning_thresholds:number[]; sqlite_bytes:number|null}};
-type Resources = {sample:ResourceSample|null; active_alerts:{metric:string; severity:string; message:string; sample_unavailable?:boolean}[];
+type ArchivalStatus = {enabled:boolean; threshold_bytes:number; status:string; message?:string;
+  last_run_at?:string|null; last_success_at?:string|null; last_pruned_snapshots?:number; reusable_bytes?:number; google_required?:boolean};
+type Resources = {archival?:ArchivalStatus; sample:ResourceSample|null; active_alerts:{metric:string; severity:string; message:string; sample_unavailable?:boolean}[];
   notifications:{metric:string; severity:string; timestamp:string; message:string}[];
   thresholds:Record<string,{warning:number; critical:number}>};
 const bytes = (value:number|null|undefined) => value == null ? 'Unavailable' : value >= 1024**3 ? `${(value/1024**3).toFixed(2)} GB` : `${(value/1024**2).toFixed(1)} MB`;
@@ -68,6 +70,7 @@ export function CloudServicesPanel({notify}:{notify:(message:string,error?:boole
     finally { setBusy(''); }
   }
   const sample = resources?.sample;
+  const archival = resources?.archival;
   const pendingCount = drive ? Object.entries(drive.counts).reduce((total,[status,count]) => total + (status === 'verified' ? 0 : count),0) : null;
   return <div className="cloud-services">
     <div className="cloud-services-toolbar"><div><strong>Cloud backups & server health</strong><p>Recording and backups run on the backend, independently of this page.</p></div>
@@ -79,7 +82,8 @@ export function CloudServicesPanel({notify}:{notify:(message:string,error?:boole
           {drive.authorization_required?'Reconnect Google Drive':drive.connected&&drive.enabled?'Cloud backups enabled':drive.connected?'Connected · backups paused':drive.configured?'Not connected':'Server setup required'}</Badge>
           <p>{drive.configured ? 'Choose your separate 15 GB Google account. Offline authorization is stored securely on the server; your laptop may be off.' : 'The server needs its Google OAuth configuration before you can connect your Drive.'}</p></div>
           <button className="btn secondary" disabled={Boolean(busy)||!drive.configured} onClick={()=>void connect()}>
-            {busy==='connect'?<Loader2 size={15} className="spin"/>:<ShieldCheck size={15}/>} {drive.connected?'Renew Drive permission':'Connect Google Drive'}</button></div>
+            {busy==='connect'?<Loader2 size={15} className="spin"/>:<ShieldCheck size={15}/>} {drive.connected?'Change or reconnect Google account':'Connect Google Drive'}</button></div>
+        {drive.account_email&&<small className="cell-note">Connected Google account: {drive.account_email}. Changing accounts keeps existing backups in the previous account.</small>}
         {!drive.enabled && <Help>Automatic cloud backups are disabled in this server’s configuration. Existing files and trading records are retained.</Help>}
         {drive.last_error && <div className="inline-error" role="alert">{drive.last_error}</div>}
         <div className="cloud-summary"><div><span>Verified backups</span><strong>{drive.counts.verified||0}</strong></div><div><span>Queued / retrying</span><strong>{pendingCount}</strong></div><div><span>Latest verified upload</span><strong>{time(drive.last_success||drive.jobs.find(j=>j.verified_at)?.verified_at,true)}</strong></div></div>
@@ -94,6 +98,16 @@ export function CloudServicesPanel({notify}:{notify:(message:string,error?:boole
         </tr>)}</tbody></table></div> : <Empty title="No cloud backups yet" description="Completed reports will enter the cloud queue after Drive is connected and server backups are enabled."/>}
         <Help>{drive.retention} Excel stays compact; a separate compressed CSV contains available recorded history. Upload verification checks file size, type, folder and checksums.</Help>
       </>}
+    </Panel>
+    <Panel title="Automatic storage archiving" subtitle="Export verified older history before the 15 GB plan fills up">
+      <div className="cloud-connection"><div><Badge tone={archival?.status==='completed'||archival?.status==='ready'?'green':'amber'}>
+        {archival ? (archival.enabled ? archival.status.replaceAll('_',' ') : 'Not enabled') : 'Server update pending'}</Badge>
+        <p>Trigger: {bytes(archival?.threshold_bytes??12*1024**3)} of persistent storage. The server exports eligible completed days to Google Drive, verifies every required file, then removes only that archived snapshot detail.</p></div></div>
+      {archival?.message&&<Help>{archival.message}</Help>}
+      <div className="cloud-summary"><div><span>Latest verified cleanup</span><strong>{time(archival?.last_success_at,true)}</strong></div>
+        <div><span>Snapshots removed last run</span><strong>{archival?.last_pruned_snapshots==null?'—':archival.last_pruned_snapshots.toLocaleString('en-IN')}</strong></div>
+        <div><span>Reusable database space</span><strong>{bytes(archival?.reusable_bytes)}</strong></div></div>
+      <Help>Account details, open positions, pending orders and trade summaries stay on the server. Failed or unverified Google uploads never authorize deletion. Cleanup frees room for new records inside SQLite; its file size may stay the same until safe maintenance is possible. Keep independent backups.</Help>
     </Panel>
     <Panel title="Server resources" subtitle={sample?`Latest sample ${time(sample.sampled_at,true)} IST · uptime ${(sample.uptime_seconds/3600).toFixed(1)} hours`:'Waiting for the first resource sample'}>
       {resources?.active_alerts.map(alert=><div className="inline-error cloud-resource-alert" role="alert" key={alert.metric}><AlertTriangle size={16}/>{alert.message}{alert.sample_unavailable?' Latest sample unavailable.':''}</div>)}

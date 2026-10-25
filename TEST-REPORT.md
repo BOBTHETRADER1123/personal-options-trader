@@ -1,3 +1,13 @@
+# Backup and archival update — 26 October 2026
+
+335 automated tests passed in 21.32 seconds using the official Python-only SQLAlchemy 2.1.5 build in an isolated test folder. Windows Application Control blocked the installed optional compiled extension during collection; no Windows security settings or live server dependencies were changed. One existing Starlette/httpx test-helper deprecation warning remains. TypeScript checking passed.
+
+New coverage verifies disabled sample capture, Google account-bound metadata, upload/account-switch serialization, token rotation, Google network waits outside the recording lock, <=200-row archival transactions, rollback-journal headroom, durable partial-prune receipts, restart resume, current-day protection, checksum/source-coverage refusal, and capture-lock timeout/cancellation cleanup. Automatic archival retains account settings, active positions, orders, summaries, daily exports, legacy journals and per-trade/day continuity anchors. It does not clear the entire database or automatically VACUUM a nearly full volume.
+
+The approved Google OAuth client is configured in Production mode with drive.file only. Credentials were saved in RamNaym private environment settings. Google Drive and Sheets APIs are enabled. Owner consent, authenticated upload/readback, genuine broker connectivity, sustained market-hour capture, and multi-GB archival throughput remain live acceptance tests. The 12 GiB trigger and 10 GiB reusable-space target are configurable. No actual source snapshots were pruned during validation.
+
+---
+
 # Current update: 25 October 2026
 
 Live deployment acceptance, 25 October 2026: GitHub main 3b355116d7005b53c93580a62d8251e283c3fd2e was deployed by Vercel as 687ngUJXMnaggkfXwoQCUsQmg5KA. The public /api/health returns database_ready=true and /api/session recognizes an existing owner. Owner sign-in and authenticated WSS were observed. Approved migration checks passed: owners1, trades4, original quote_events78172, original timeline104612, integrityok, with browser sessions excluded from the copy. A source-only redeploy and container restart retained owners1/trades4, no /app/private_workspace payload, and GUNICORN_WORKERS1. RamNaym measured average CPU14.7%, peak20.2%, RAM10.6% and591MB storage during the observed sample workload; this is not a real broker market-hour peak-load result. The storage UI now uses application data against the configured15GB allowance instead of the host filesystem's free space.

@@ -1,7 +1,7 @@
 """Owner-authorized, server-side Google Drive archives.
 
-PostgreSQL is authoritative. The persistent volume holds a bounded staging cache,
-never the sole trade journal. This module contains no record-deletion operation.
+The configured application database is authoritative. The persistent volume also
+holds a bounded staging cache. This module contains no record-deletion operation.
 All Drive requests use the owner's explicitly configured OAuth client; Codex's
 connected Google account is deliberately unrelated to this application.
 """
@@ -18,6 +18,9 @@ import secrets
 import shutil
 import tempfile
 import time
+import threading
+from contextlib import nullcontext
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,9 +35,10 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base, SessionLocal, iso_now
+from .google_accounts import GoogleAccountBinding, PreviousGoogleAccount
 
 log = logging.getLogger(__name__)
-SCOPE = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets"
+SCOPE = "https://www.googleapis.com/auth/drive.file"
 DRIVE = "https://www.googleapis.com/drive/v3"
 UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -201,13 +205,14 @@ def complete_authorization(db, session_hash: str, state: str, code: str,
     pending = db.get(CloudDriveOAuthState, state_hash)
     if not pending or not hmac.compare_digest(pending.session_hash, session_hash) or pending.used or pending.expires_at < time.time():
         raise AuthorizationRequired("Google Drive connection request expired. Start again.")
+    encrypted_verifier = pending.encrypted_verifier
     claimed = db.execute(update(CloudDriveOAuthState).where(
         CloudDriveOAuthState.state_hash == state_hash, CloudDriveOAuthState.used == False,
         CloudDriveOAuthState.expires_at >= time.time()).values(used=True))
     db.commit()
     if claimed.rowcount != 1:
         raise AuthorizationRequired("Google Drive connection request expired. Start again.")
-    verifier = config.decrypt(pending.encrypted_verifier)
+    verifier = config.decrypt(encrypted_verifier)
     own_client = client is None
     client = client or httpx.Client(timeout=30, follow_redirects=False)
     try:
@@ -216,17 +221,28 @@ def complete_authorization(db, session_hash: str, state: str, code: str,
             "code_verifier": verifier})
         if token.get("scope") and not set(SCOPE.split()).issubset(str(token["scope"]).split()):
             raise AuthorizationRequired("Google Drive file permission was not granted.")
-        previous = db.get(CloudDriveCredential, 1)
         refresh = token.get("refresh_token")
         if not refresh:
             raise AuthorizationRequired("Offline access was not granted. Reconnect with consent.")
+        try:
+            response=client.get(DRIVE+'/about',headers={'Authorization':'Bearer '+token['access_token']},params={'fields':'user(permissionId,emailAddress)'})
+            if response.status_code!=200:raise BackupError('Google account identity could not be verified; previous connection retained.')
+            profile=response.json().get('user',{})
+        except (httpx.HTTPError,ValueError,AttributeError):
+            raise BackupError('Google account identity could not be verified; previous connection retained.') from None
+        # Keep SQLite reads closed during the identity HTTP request. A read
+        # transaction on DELETE-journal storage would otherwise delay recorder
+        # commits until Google's response arrived.
+        previous = db.get(CloudDriveCredential, 1)
+        from .google_accounts import bind_account
+        identity=bind_account(db,profile)
         if previous:
             previous.encrypted_refresh_token = config.encrypt(refresh)
             previous.connected_at, previous.auth_required, previous.last_error = iso_now(), False, None
         else:
             db.add(CloudDriveCredential(id=1, encrypted_refresh_token=config.encrypt(refresh), auth_required=False))
         db.commit()
-        return {"connected": True, "offline_access": True}
+        return {"connected": True, "offline_access": True,**identity}
     finally:
         if own_client:
             client.close()
@@ -406,6 +422,21 @@ def _default_artifacts(db, job_id: str) -> list[dict]:
     return get_export_artifacts(db, job_id)
 
 
+def serialized_google_operation(method):
+    """Serialize account-bound work in the deliberately single-worker backend.
+
+    Keep the lock for the complete network operation and its acknowledgement:
+    an account switch must not reset metadata while an old upload can still
+    acknowledge it. RLock permits nested Sheets/Drive calls on the same thread.
+    """
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        cloud = getattr(self, 'cloud', self)
+        with getattr(cloud, 'operation_lock', nullcontext()):
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class CloudBackupService:
     def __init__(self, config: DriveConfig | None = None, session_factory=SessionLocal,
                  artifacts_provider: Callable = _default_artifacts, client_factory: Callable = DriveClient,
@@ -417,6 +448,8 @@ class CloudBackupService:
         self.last_error = None
         self.last_success = None
         self._token, self._expires = None, 0
+        self._credential_generation=0
+        self.operation_lock = threading.RLock()
         self._wake_event = None
         self._wake_loop = None
 
@@ -432,35 +465,60 @@ class CloudBackupService:
             except RuntimeError:
                 pass  # Application is shutting down; durable jobs survive.
 
+    @serialized_google_operation
+    def invalidate_token(self):
+        self._credential_generation+=1
+        self._token,self._expires=None,0
+
+    @serialized_google_operation
+    def complete_authorization(self, session_hash: str, state: str, code: str,
+                               client: httpx.Client | None = None) -> dict:
+        """Switch credentials and account metadata after old Google work ends."""
+        with self.factory() as db:
+            result = complete_authorization(db, session_hash, state, code, self.config, client)
+        self.invalidate_token()
+        self.last_error = None
+        if result.get('account_changed'):self.last_success = None
+        return result
+
+    @serialized_google_operation
     def access_token(self) -> str:
         if self._token and self._expires > time.time() + 60:
             return self._token
         self.config.validate()
+        generation=self._credential_generation
         with self.factory() as db:
             credential = db.get(CloudDriveCredential, 1)
             if not credential or credential.auth_required:
                 raise AuthorizationRequired("Connect Google Drive to enable cloud backups.")
-            refresh = self.config.decrypt(credential.encrypted_refresh_token)
+            original_credential=credential.encrypted_refresh_token
+            refresh = self.config.decrypt(original_credential)
         own_client = self.token_client is None
         client = self.token_client or httpx.Client(timeout=30, follow_redirects=False)
         try:
             data = _token_request(client, {"client_id": self.config.client_id, "client_secret": self.config.client_secret,
                 "refresh_token": refresh, "grant_type": "refresh_token"})
+            with self.factory() as check_db:
+                current=check_db.get(CloudDriveCredential,1)
+                if not current or current.encrypted_refresh_token!=original_credential:
+                    raise BackupError('Google account changed during refresh; retry using the current account.')
             if data.get("refresh_token"):
                 # Preserve a rotated refresh token before using the new access
                 # token. No unencrypted token is written to a file or response.
                 with self.factory() as db:
                     row = db.get(CloudDriveCredential, 1)
-                    if row:
+                    if row and row.encrypted_refresh_token==original_credential:
                         row.encrypted_refresh_token = self.config.encrypt(data["refresh_token"])
                         db.commit()
+            if generation!=self._credential_generation:
+                raise BackupError('Google account changed during refresh; retry using the current account.')
             self._token = data["access_token"]
             self._expires = time.time() + max(60, int(data.get("expires_in", 3600)))
             return self._token
         except AuthorizationRequired:
             with self.factory() as db:
                 row = db.get(CloudDriveCredential, 1)
-                if row:
+                if row and row.encrypted_refresh_token==original_credential:
                     row.auth_required, row.last_error = True, "Google Drive authorization must be renewed."
                     db.commit()
             raise
@@ -585,6 +643,7 @@ class CloudBackupService:
                 raise BackupError("Backup claim expired; archive remains queued.")
         self.last_success, self.last_error = iso_now(), None
 
+    @serialized_google_operation
     def process_pending_once(self, limit: int = 1) -> int:
         if not self.config.enabled:
             return 0
@@ -676,15 +735,17 @@ class CloudBackupService:
         self._wake_loop, self._wake_event = None, None
 
     def status(self, db) -> dict:
+        from .google_accounts import GoogleAccountBinding
+        binding=db.get(GoogleAccountBinding,1)
         credential = db.get(CloudDriveCredential, 1)
         counts = dict(db.execute(select(CloudBackupJob.status, func.count()).group_by(CloudBackupJob.status)).all())
         jobs = db.scalars(select(CloudBackupJob).order_by(CloudBackupJob.updated_at.desc()).limit(30)).all()
-        return {"enabled": self.config.enabled, "configured": all((self.config.client_id, self.config.client_secret,
+        return {"account_email":binding.email if binding else None,"account_change_supported":True,"enabled": self.config.enabled, "configured": all((self.config.client_id, self.config.client_secret,
                 self.config.encryption_key, self.config.redirect_uri)),
             "connected": bool(credential and not credential.auth_required),
             "authorization_required": bool(credential and credential.auth_required), "counts": counts,
             "last_error": self.last_error or (credential.last_error if credential else None),
-            "last_success": self.last_success, "retention": "All trading records retained; automatic deletion disabled.",
+            "last_success": self.last_success, "retention": "Essential trading state is retained. Older snapshot cleanup requires the separate verified archival policy.",
             "jobs": [{"id": j.id, "trade_id": j.trade_id, "status": j.status, "attempts": j.attempts,
                 "last_error": j.last_error, "verified_at": j.verified_at, "next_attempt": j.next_attempt,
                 "artifacts": j.artifacts} for j in jobs]}

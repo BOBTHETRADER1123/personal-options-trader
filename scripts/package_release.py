@@ -8,9 +8,6 @@ ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT.parent/'PersonalOptionsTrader-Source.zip'
 TOP={'.gitignore','.gitattributes','.env.example','.python-version','.dockerignore','Dockerfile','pytest.ini','render.yaml','README.md','START-HERE.md','TEST-REPORT.md'}
 FRONT={'package.json','pnpm-lock.yaml','pnpm-workspace.yaml','tsconfig.json','vite.config.ts','index.html','vercel.json','.env.example'}
-VM={'install.sh','configure.py','Caddyfile.template','app.env.example','personal-options-trader.service',
-    'personal-options-trader-proxy.service','personal-options-trader-backup.service',
-    'personal-options-trader-backup.timer','backup_daily.py','test_vm_deploy.py'}
 RAMNAYM={'import_workspace.py','main.py','runtime.py','start.py','safe_worker.py','gunicorn_conf.py','requirements.txt',
          'package_trial.py','build_frontend.mjs','test_ramnaym.py'}
 
@@ -25,7 +22,7 @@ def allowed(path,root=ROOT):
     if parts[0]=='companion':return len(parts)==2 and (name.endswith(('.py','.bat','.txt')) or name=='.env.example')
     if parts[0]=='docs':return name.endswith(('.md','.txt','.png','.svg'))
     if parts[0]=='scripts':return len(parts)==2 and name.endswith('.py')
-    if parts[0]=='deploy':return len(parts)==3 and ((parts[1]=='vm' and name in VM) or (parts[1]=='ramnaym' and name in RAMNAYM))
+    if parts[0]=='deploy':return len(parts)==3 and parts[1]=='ramnaym' and name in RAMNAYM
     return False
 
 def main():
