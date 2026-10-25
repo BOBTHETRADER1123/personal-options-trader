@@ -4,9 +4,9 @@ This is an update to the existing personal paper-trading app. It preserves worki
 
 ## Current setup and deployment status
 
-The prepared production design is **Vercel frontend + RamNaym server 1606 backend + SQLite at `/app/data/trading.db`** on the verified persistent volume. One asynchronous application worker owns market recording. The existing React/TypeScript frontend is retained.
+The production deployment is **Vercel frontend + RamNaym server 1606 backend + SQLite at `/app/data/trading.db`** on the verified persistent volume. One asynchronous application worker owns market recording. The existing React/TypeScript frontend is retained.
 
-**Prepared source is not proof of a completed deployment.** The RamNaym full-app deployment, approved laptop-workspace migration and Vercel connection switch are being completed and checked. Do not treat the public website as ready until its database readiness, owner login and paper workflow have passed. The older Render/Neon deployment remains separate; Neon records are preserved and are not deleted by this update. The last known old cloud database condition was unavailable after its transfer allowance was exhausted.
+**Verified on 25 October 2026:** the public Vercel website now connects to RamNaym SQLite and reports database_ready=true. The approved laptop copy contains one owner, four saved sample trades, 78,172 original quote records and 104,612 original history rows. Owner sign-in through Vercel and an authenticated WebSocket were observed. A subsequent source-only redeploy and container restart retained the account and four trades; the private bootstrap payload is absent from the active image, and the worker limit remains one. These checks do not prove authenticated broker feeds or Google uploads: those external connections still require setup and live testing. Sample trades remain separate from genuine broker-data paper trades. The old Neon database and laptop source remain preserved.
 
 Website: [personal-options-trader.vercel.app](https://personal-options-trader.vercel.app/). Private source: [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader). `http://127.0.0.1:8011` is an isolated laptop preview, not the public cloud service.
 

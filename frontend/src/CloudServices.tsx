@@ -11,8 +11,7 @@ type DriveStatus = {enabled:boolean; configured:boolean; connected:boolean; auth
 type ResourceSample = {sampled_at:string; uptime_seconds:number;
   cpu:{percent:number|null; capacity_vcpu:number; source:string};
   ram:{used_bytes:number|null; limit_bytes:number|null; percent:number|null; source:string};
-  disk:{used_bytes:number|null; total_bytes:number|null; free_bytes:number|null; percent:number|null; source:string};
-  neon_usage:{available:boolean; source:string; message:string}};
+  storage?:{application_bytes:number|null; plan_limit_bytes:number|null; percent:number|null; warning_thresholds:number[]; sqlite_bytes:number|null}};
 type Resources = {sample:ResourceSample|null; active_alerts:{metric:string; severity:string; message:string; sample_unavailable?:boolean}[];
   notifications:{metric:string; severity:string; timestamp:string; message:string}[];
   thresholds:Record<string,{warning:number; critical:number}>};
@@ -98,14 +97,19 @@ export function CloudServicesPanel({notify}:{notify:(message:string,error?:boole
     </Panel>
     <Panel title="Server resources" subtitle={sample?`Latest sample ${time(sample.sampled_at,true)} IST · uptime ${(sample.uptime_seconds/3600).toFixed(1)} hours`:'Waiting for the first resource sample'}>
       {resources?.active_alerts.map(alert=><div className="inline-error cloud-resource-alert" role="alert" key={alert.metric}><AlertTriangle size={16}/>{alert.message}{alert.sample_unavailable?' Latest sample unavailable.':''}</div>)}
-      <div className="cloud-resource-grid">{(['cpu','ram','disk'] as const).map(metric=> {
+      <div className="cloud-resource-grid">{(['cpu','ram'] as const).map(metric=> {
         const value = sample?.[metric], percent = value?.percent;
-        return <div className="cloud-resource-card" key={metric}><span>{metric==='cpu'?'CPU':metric==='ram'?'Memory':'Persistent disk'}</span><strong>{percent == null ? 'Unavailable' : `${percent.toFixed(1)}%`}</strong>
+        return <div className="cloud-resource-card" key={metric}><span>{metric==='cpu'?'CPU':'Memory'}</span><strong>{percent == null ? 'Unavailable' : `${percent.toFixed(1)}%`}</strong>
           <progress max="100" value={percent??undefined} aria-label={`${metric} usage`} />
-          <small>{metric==='cpu' ? `${sample?.cpu.capacity_vcpu??'—'} vCPU capacity` : metric==='ram' ? `${bytes(sample?.ram.used_bytes)} / ${bytes(sample?.ram.limit_bytes)}` : `${bytes(sample?.disk.free_bytes)} free`}</small>
+          <small>{metric==='cpu' ? `${sample?.cpu.capacity_vcpu??'—'} vCPU capacity` : `${bytes(sample?.ram.used_bytes)} / ${bytes(sample?.ram.limit_bytes)}`}</small>
           <small>Warning {resources?.thresholds[metric]?.warning??'—'}% · Critical {resources?.thresholds[metric]?.critical??'—'}%</small></div>;
-      })}</div>
-      <Help><HardDrive size={14}/>{sample?.neon_usage?.message||'Server measurements describe this hosting container and its persistent disk.'} Unavailable values are not zero. Alerts appear here and in server logs; external email or SMS delivery is not configured.</Help>
+      })}<div className="cloud-resource-card"><span>Persistent storage</span><strong>{sample?.storage?.percent == null ? 'Unavailable' : `${sample.storage.percent.toFixed(1)}%`}</strong>
+        <progress max="100" value={sample?.storage?.percent??undefined} aria-label="Persistent app storage usage" />
+        <small>{bytes(sample?.storage?.application_bytes)} / {bytes(sample?.storage?.plan_limit_bytes)} plan allowance</small>
+        <small>SQLite database: {bytes(sample?.storage?.sqlite_bytes)}</small>
+        <small>Storage warnings: {(sample?.storage?.warning_thresholds??[60,75,85,95]).map(value=>`${value}%`).join(' · ')}</small>
+      </div></div>
+      <Help><HardDrive size={14}/>Persistent storage shows app data against the configured plan allowance. Unavailable values are not zero. Alerts appear here and in server logs; external email or SMS delivery is not configured.</Help>
       {resources?.notifications.length ? <details className="cloud-notifications"><summary>Recent resource notifications ({resources.notifications.length})</summary>{resources.notifications.slice(-10).reverse().map((item,index)=><p key={`${item.timestamp}-${item.metric}-${index}`}><Badge tone={item.severity==='recovered'?'green':'amber'}>{item.severity}</Badge> {item.message}<small>{time(item.timestamp,true)} IST</small></p>)}</details> : null}
     </Panel>
   </div>;
