@@ -25,7 +25,10 @@ from . import engine
 from .payoff import strategy_risk
 from .scheduler import CollectorLease, ExchangeCalendar, guard_lease
 from . import cloud_backup, resource_health, maintenance, reporting, daily_reports, sheets_sync, archival
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
+from . import broker_auth, broker_setup
 
 from .log_safety import install as install_safe_logs
 install_safe_logs()
@@ -45,6 +48,8 @@ resource_monitor=None
 daily_service=None
 sheets_service=None
 storage_archiver=None
+fivepaisa_auth=None
+kotak_setup=None
 _active_positions=[]
 _activity_until=0.0
 _viewers=0
@@ -291,6 +296,9 @@ def restore_active_state():
 def initialize_database():
     """Run blocking database setup outside the HTTP event loop."""
     maintenance.migrate(db_engine)
+    # Restore encrypted broker settings before collectors start. No network calls.
+    kotak_setup.restore()
+    fivepaisa_auth.restore()
     with SessionLocal() as db:
         if not db.get(SchemaVersion,1):db.add(SchemaVersion(version=1));db.commit()
         persisted_trades=[row.data for row in db.scalars(select(Trade))]
@@ -336,12 +344,14 @@ async def database_services(reporting_loop):
 
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until
+    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,fivepaisa_auth,kotak_setup
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
     from .brokers import FeedManager
     stop_event=asyncio.Event();database_ready=False;_viewers=0;_activity_until=0;_started_at=time.monotonic()
+    fivepaisa_auth=broker_auth.FivepaisaAuthService(session_factory=SessionLocal)
+    kotak_setup=broker_setup.KotakSetupService(factory=SessionLocal)
     catalog=ContractCatalog();engine.set_catalog(catalog)
     exchange_calendar=ExchangeCalendar();collector_lease=CollectorLease(SessionLocal)
     cloud_service=cloud_backup.CloudBackupService(session_factory=SessionLocal)
@@ -376,6 +386,14 @@ async def lifespan(app):
 
 app=FastAPI(title='Personal Options Trader',version='1.0.0',lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=ALLOWED_ORIGINS,allow_credentials=True,allow_methods=['GET','POST','PATCH','DELETE','OPTIONS'],allow_headers=['Content-Type','X-CSRF-Token','Authorization'])
+
+@app.exception_handler(RequestValidationError)
+async def private_broker_validation(request, error):
+    # Validation errors ordinarily echo submitted input, including private keys.
+    if request.url.path.startswith('/api/brokers/'):
+        return JSONResponse({'detail':'Check the connection fields and try again.'},status_code=422)
+    return await request_validation_exception_handler(request,error)
+
 
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -594,6 +612,80 @@ async def reload_instruments():
 
 @app.get('/api/brokers',dependencies=[Depends(require_session)])
 def brokers(db=Depends(get_db)):return engine.dashboard(db,feed_manager.statuses() if feed_manager else {})['brokers']
+
+class KotakCredentialInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    consumer_key:SecretStr
+    mobile_number:SecretStr
+    ucc:SecretStr
+    mpin:SecretStr
+    totp_secret:SecretStr
+
+@app.get('/api/brokers/kotak/setup',dependencies=[Depends(require_session)])
+def kotak_setup_status(db=Depends(get_db)):
+    return kotak_setup.status(db)
+
+@app.post('/api/brokers/kotak/setup',dependencies=[Depends(require_session)])
+async def save_kotak_setup(payload:KotakCredentialInput,request:Request):
+    rate_limit(request,'broker-setup',limit=6)
+    values={name:getattr(payload,name).get_secret_value() for name in type(payload).model_fields}
+    try:
+        # Credential writes use short transactions; no broker HTTP call runs here.
+        async with write_lock:
+            result=await asyncio.to_thread(kotak_setup.save,values)
+    except broker_setup.BrokerSetupError as error:
+        raise HTTPException(409,str(error)) from None
+    # Reconnect through the normal collector demand/lease path, outside the save.
+    global _feed_contract_ids
+    _feed_contract_ids=None
+    touch_activity()
+    return result
+
+@app.get('/api/brokers/fivepaisa/auth/status',dependencies=[Depends(require_session)])
+def fivepaisa_auth_status(db=Depends(get_db)):
+    return fivepaisa_auth.status(db)
+
+@app.post('/api/brokers/fivepaisa/auth/begin')
+async def begin_fivepaisa_auth(request:Request,current=Depends(require_session),db=Depends(get_db)):
+    rate_limit(request,'broker-login',limit=6)
+    session_hash=current.token_hash
+    db.rollback()
+    try:
+        state=await asyncio.to_thread(fivepaisa_auth.begin,session_hash)
+    except broker_auth.BrokerAuthError as error:
+        raise HTTPException(409,str(error)) from None
+    # VendorKey goes only in the subsequent server redirect to the official broker.
+    from urllib.parse import urlencode
+    return {'url':'/api/brokers/fivepaisa/authorize?'+urlencode({'state':state})}
+
+@app.get('/api/brokers/fivepaisa/authorize')
+async def authorize_fivepaisa(state:str=Query(min_length=16,max_length=250),current=Depends(require_session),db=Depends(get_db)):
+    session_hash=current.token_hash
+    db.rollback()
+    try:url=await asyncio.to_thread(fivepaisa_auth.authorization_url,state,session_hash)
+    except broker_auth.BrokerAuthError as error:
+        raise HTTPException(409,str(error)) from None
+    return RedirectResponse(url,status_code=303)
+
+@app.get('/api/brokers/fivepaisa/callback')
+async def callback_fivepaisa(request:Request,current=Depends(require_session),db=Depends(get_db)):
+    query=request.query_params
+    state=query.get('state') or query.get('State') or ''
+    token=query.get('RequestToken') or ''
+    if not 16<=len(state)<=250 or not 1<=len(token)<=8192:
+        return RedirectResponse('/?broker=fivepaisa_failed',status_code=303)
+    session_hash=current.token_hash
+    db.rollback()
+    try:
+        # State consumption, HTTPS exchange and encrypted save use separate short
+        # transactions. A slow broker must not stop one-second paper recording.
+        await asyncio.to_thread(fivepaisa_auth.complete,token,state,session_hash)
+    except broker_auth.BrokerAuthError:
+        return RedirectResponse('/?broker=fivepaisa_failed',status_code=303)
+    global _feed_contract_ids
+    _feed_contract_ids=None
+    touch_activity()
+    return RedirectResponse('/?broker=fivepaisa_connected',status_code=303)
 
 @app.get('/api/settings',dependencies=[Depends(require_session)])
 def settings(db=Depends(get_db)):return engine.get_settings(db)

@@ -159,3 +159,36 @@ report; offline parser tests alone do not establish live connectivity.
 | Error | Correct master, permissions or subscription budget; no fake prices are substituted. |
 | Connected but stale | Inspect actual exchange session, quote receive time and broker access. |
 | Disconnected | The backend stopped the connection; stale marks remain timestamped. |
+
+
+## Private connection screens (26 October 2026)
+
+Open **Broker connections** on the owner-only website. **Set up Kotak Neo**
+accepts the application key, registered mobile, client code, MPIN and
+Base32 authenticator setup key. These values are encrypted before database
+storage with the backend-only `BROKER_CREDENTIAL_KEY`; they are never
+returned by the status API. Preserve that key privately for recovery.
+Saving credentials does not prove authentication or a live feed worked.
+The existing read-only collector authenticates and subscribes when eligible
+contracts are selected during an exchange session.
+
+For **5paisa**, private server settings require `FIVEPAISA_APP_KEY`,
+`FIVEPAISA_ENCRYPTION_KEY`, `FIVEPAISA_USER_ID`, `FIVEPAISA_REDIRECT_URI`
+and `BROKER_CREDENTIAL_KEY`. Register this callback on the broker application:
+
+`https://personal-options-trader.vercel.app/api/brokers/fivepaisa/callback`
+
+Choose **Sign in to 5paisa**. Enter the broker PIN/OTP only on the official
+5paisa page. The backend exchanges the returned request token over verified
+HTTPS, encrypts the access token and client code in the private database,
+and restores unexpired credentials after restart. The documented expiry is
+23:59 IST each day; there is no invented refresh token. State is one-use,
+short-lived, owner-session-bound and fenced against overlapping sign-ins.
+The authorization redirect includes the application key only when opening
+the official broker destination. Callback query strings are redacted in
+application logs. Status endpoints contain no submitted secrets.
+
+Refresh that broker's contracts after sign-in, then choose a valid contract
+in Market watch or Option chain. An authenticated token alone is not a
+verified streaming connection. Actual permissions, socket reception and
+market-hours performance still require authenticated account testing.

@@ -18,7 +18,7 @@ from pathlib import Path
 import uuid
 from sqlalchemy import select,delete,text
 from .database import Base,engine,iso_now
-from . import models,reporting,cloud_backup,daily_reports,sheets_sync,archival,google_accounts  # Register tables without starting feeds.
+from . import models,reporting,cloud_backup,daily_reports,sheets_sync,archival,google_accounts,broker_auth,broker_setup  # Register tables without starting feeds.
 
 FORMAT='personal-options-trader-journal-v1'
 
@@ -42,7 +42,7 @@ def migrate(target=engine):
     Base.metadata.create_all(target)
     with target.begin() as connection:
         versions=models.SchemaVersion.__table__
-        for version in (1,2,3,4,5):
+        for version in (1,2,3,4,5,6):
             if not connection.execute(select(versions.c.version).where(versions.c.version==version)).first():
                 connection.execute(versions.insert(),{'version':version,'applied_at':iso_now()})
 
@@ -107,7 +107,7 @@ def main():
         command=sub.add_parser(action);command.add_argument('path')
         if action=='restore':command.add_argument('--server-stopped',action='store_true')
     args=parser.parse_args()
-    if args.action=='migrate':migrate();result={'schema_version':5,'ok':True}
+    if args.action=='migrate':migrate();result={'schema_version':6,'ok':True}
     elif args.action=='backup':result=backup(args.path)
     else:result=restore(args.path,server_stopped=args.server_stopped)
     print(json.dumps(result,indent=2))

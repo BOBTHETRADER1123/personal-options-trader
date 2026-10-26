@@ -1,7 +1,7 @@
 """Additive migrations share the existing app configuration and connection pool."""
 from alembic import context
 from app.database import Base, engine
-from app import models, reporting, cloud_backup, daily_reports, sheets_sync, archival, google_accounts
+from app import models, reporting, cloud_backup, daily_reports, sheets_sync, archival, google_accounts, broker_auth, broker_setup
 
 
 def online():

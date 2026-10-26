@@ -1,3 +1,16 @@
+## Broker connection update — 26 October 2026
+
+- Full isolated automated suite: **387 passed**, one existing Starlette/httpx deprecation warning.
+- Frontend TypeScript check and isolated production build passed.
+- Added encrypted Kotak private setup and session-bound 5paisa daily authorization.
+- Tested secret redaction, CSRF/owner boundaries, callback replay/expiry/fencing,
+  encrypted restart restoration and non-blocking HTTP exchange.
+- Source-only RamNaym package: 56 runtime files plus checksum manifest;
+  credentials and workspace data excluded.
+- **Not yet live tested:** authenticated Kotak/5paisa streaming, actual account
+  permissions, sustained broker load, daily reauthorization and market recording
+  using those live feeds. A saved setup or token is not a live feed test.
+
 # Export CPU recovery — 26 October 2026
 
 343 automated tests passed in 27.67 seconds with the supported Python-only SQLAlchemy 2.1.5 test build. The eight new resource tests cover lease renewal during slow normalization, replaced-owner fencing, refusal to revive expired ownership, recording priority pauses, cancellation/source retention, streamed deterministic ZIP processing, CPU-budget accounting and CSV completeness.
