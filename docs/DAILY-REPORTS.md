@@ -39,7 +39,8 @@ The backend generates XLSX itself; it does not rely on Google's native spreadshe
 Current configurable backend limits are:
 
 ```dotenv
-DAILY_EXPORT_MAX_CELLS=8000000
+DAILY_EXPORT_MAX_CELLS=1000000
+DAILY_EXPORT_CPU_PERCENT=35
 DAILY_EXPORT_MAX_FILE_MB=64
 DAILY_EXPORT_SHEET_DATA_ROWS=100000
 ```
@@ -67,3 +68,7 @@ Archived daily files remain the complete history even after source detail is pru
 ## Live sheets and recovery
 
 See [live Google Sheets setup](GOOGLE-SHEETS-LIVE.md). Google authorization is needed for uploads, not for generating or downloading a local daily workbook. Unavailable Google services leave captured records on the durable server database and pending work queued. Export leases and retry state support restart recovery; real-host restart and Google-account checks must still be recorded separately in the trial evidence.
+
+## Export resource controls
+
+Daily exports renew their fenced ownership lease while building and verifying files. Large parts split at a default one million cells. ZIP members and compressed CSV are processed in chunks to avoid holding full uncompressed copies in memory. The export thread targets 35% CPU through cooperative pauses; this is not a hard container cap, and brief compression bursts can still peak higher. Heavy export work pauses while active market recording needs the server, then resumes with the same job ownership. Source snapshots and unfinished parts remain available after interruptions.

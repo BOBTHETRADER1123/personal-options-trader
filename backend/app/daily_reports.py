@@ -4,6 +4,7 @@ Only captured PnlSnapshot history is exported; missing seconds are never invente
 from __future__ import annotations
 import asyncio
 import csv
+from contextvars import ContextVar
 import gzip
 import hashlib
 import io
@@ -12,6 +13,7 @@ import logging
 import os
 import time
 import threading
+import tempfile
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -86,16 +88,74 @@ class DailyReportPart(Base):
 
 class DailyReportError(Exception):pass
 
+_EXPORT_PROGRESS=ContextVar('daily_export_progress',default=None)
+def _checkpoint():
+ callback=_EXPORT_PROGRESS.get()
+ if callback:callback()
+
+class _ExportBuffer(io.BytesIO):
+ """Let compression yield CPU and observe cancellation between bounded writes."""
+ def __init__(self):super().__init__();self._written=0
+ def write(self,value):
+  result=super().write(value);self._written+=len(value)
+  if self._written>=65536:self._written=0;_checkpoint()
+  return result
+
+class _ExportLease:
+ """Renew ownership during slow ZIP work; never resurrect an expired claim."""
+ def __init__(self,service,day,owner):
+  self.service,self.day,self.owner=service,day,owner
+  self.stop=threading.Event();self.lost=threading.Event();self.thread=None
+  self.cpu_start=time.thread_time();self.wall_start=time.monotonic()
+ def _renew(self):
+  def renew(db):
+   now=time.time()
+   changed=db.execute(update(DailyReport).where(DailyReport.trading_date==self.day,
+    DailyReport.status=='generating',DailyReport.lease_owner==self.owner,DailyReport.lease_until>now)
+    .values(lease_until=now+self.service.limits.lease_seconds))
+   if changed.rowcount!=1:raise DailyReportError('Daily export ownership changed or expired; source records retained.')
+  run_transaction(renew,self.service.factory)
+ def _heartbeat(self):
+  interval=min(30,max(.02,self.service.limits.lease_seconds/3))
+  while not self.stop.wait(interval):
+   try:self._renew()
+   except Exception:self.lost.set();return
+ def __enter__(self):
+  self._renew();self.token=_EXPORT_PROGRESS.set(self.checkpoint)
+  self.thread=threading.Thread(target=self._heartbeat,name='daily-export-lease',daemon=True);self.thread.start()
+  return self
+ def _check(self):
+  if self.lost.is_set():raise DailyReportError('Daily export ownership could not be renewed; source records retained.')
+  if self.service._stop_event is not None and self.service._stop_event.is_set():
+   raise DailyReportError('Daily export stopped safely; source records retained.')
+ def checkpoint(self):
+  self._check();paused=False
+  while not self.service.can_work():
+   paused=True;self._check();time.sleep(.1)
+  if paused:self.cpu_start,self.wall_start=time.thread_time(),time.monotonic()
+  # A cooperative export-thread budget, not a hard container CPU limit.
+  # Recheck often; there is no accumulated credit after a market-session pause.
+  while True:
+   self._check()
+   debt=(time.thread_time()-self.cpu_start)/self.service.cpu_fraction-(time.monotonic()-self.wall_start)
+   if debt<=0:break
+   time.sleep(min(.1,debt))
+   if not self.service.can_work():return self.checkpoint()
+ def __exit__(self,*_):
+  self.stop.set()
+  if self.thread:self.thread.join()
+  _EXPORT_PROGRESS.reset(self.token)
+
 @dataclass(frozen=True)
 class ReportLimits:
  max_sheet_rows:int=1_048_576
- max_workbook_cells:int=8_000_000
+ max_workbook_cells:int=1_000_000
  max_workbook_bytes:int=64*1024*1024
  max_data_rows_per_sheet:int=100_000
  lease_seconds:int=1800
  @classmethod
  def from_env(cls):
-  return cls(max_workbook_cells=max(10000,min(8_000_000,int(os.getenv('DAILY_EXPORT_MAX_CELLS','8000000')))),
+  return cls(max_workbook_cells=max(10000,min(8_000_000,int(os.getenv('DAILY_EXPORT_MAX_CELLS','1000000')))),
    max_workbook_bytes=max(4096,int(os.getenv('DAILY_EXPORT_MAX_FILE_MB','64'))*1024*1024),
    max_data_rows_per_sheet=max(1,int(os.getenv('DAILY_EXPORT_SHEET_DATA_ROWS','100000'))))
  def validate(self):
@@ -219,10 +279,12 @@ def _row(t,s,l,day_end):
  return [safe_cell(v) for v in values]
 
 def _normalize_xlsx(payload):
- output=io.BytesIO()
+ output=_ExportBuffer()
  with zipfile.ZipFile(io.BytesIO(payload)) as source,zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as target:
   for name in sorted(source.namelist()):
-   item=zipfile.ZipInfo(name,date_time=(2000,1,1,0,0,0));item.compress_type=zipfile.ZIP_DEFLATED;target.writestr(item,source.read(name))
+   item=zipfile.ZipInfo(name,date_time=(2000,1,1,0,0,0));item.compress_type=zipfile.ZIP_DEFLATED
+   with source.open(name) as original,target.open(item,'w') as normalized:
+    while chunk:=original.read(65536):normalized.write(chunk);_checkpoint()
  return output.getvalue()
 
 def _workbook(trading_date):
@@ -261,9 +323,11 @@ class DailyTradeCounter(Base):
  value:Mapped[int]=mapped_column(Integer,default=0)
 
 class DailyReportService:
- def __init__(self,session_factory=SessionLocal,calendar=None,limits=None,on_finalized=None):
+ def __init__(self,session_factory=SessionLocal,calendar=None,limits=None,on_finalized=None,can_work=None):
   self.factory=session_factory;self.calendar=calendar or ExchangeCalendar();self.limits=limits or ReportLimits.from_env()
   self.limits.validate();self.last_error=None;self.on_finalized=on_finalized
+  self.can_work=can_work or (lambda:True);self._stop_event=None
+  self.cpu_fraction=max(.05,min(1.,float(os.getenv('DAILY_EXPORT_CPU_PERCENT','35'))/100))
   self._wake_lock=threading.Lock();self._loop=None;self._wake=None;self._pending_wake=False
 
  def notify_work(self):
@@ -353,17 +417,31 @@ class DailyReportService:
   summary.append(['Estimated margins/charges are separate from official broker funds and theoretical payoff.'])
   _heading(summary,['Trade ID','Strategy ID','Broker','Worksheet','Records','Snapshot count','Continued'])
   for item in coverage:summary.append([safe_cell(item[key]) for key in ('trade_id','strategy_id','broker','sheet','record_count','snapshot_count','continued')])
-  stream=io.BytesIO();wb.save(stream);xlsx=_normalize_xlsx(stream.getvalue())
-  csv_bytes=gzip.compress(csv_text.getvalue().encode('utf-8-sig'),mtime=0)
+  _checkpoint();stream=_ExportBuffer();wb.save(stream);_checkpoint();xlsx=_normalize_xlsx(stream.getvalue())
+  csv_stream=_ExportBuffer();csv_text.seek(0)
+  try:
+   with gzip.GzipFile(fileobj=csv_stream,mode='wb',mtime=0,filename='') as compressed:
+    compressed.write(b'\xef\xbb\xbf')
+    while chunk:=csv_text.read(65536):compressed.write(chunk.encode('utf-8'));_checkpoint()
+   csv_bytes=csv_stream.getvalue()
+  finally:csv_text.close()
   if max(len(xlsx),len(csv_bytes))>self.limits.max_workbook_bytes:raise _FileTooLarge('Generated daily file exceeds the configured byte limit.')
   verified=load_workbook(io.BytesIO(xlsx),read_only=True,data_only=True)
   try:
    if set(verified.sheetnames)!={'Daily_Summary',*(item['sheet'] for item in coverage)}:raise DailyReportError('Trade-sheet coverage verification failed.')
    for item in coverage:
-    count=sum(1 for _ in verified[item['sheet']].iter_rows(values_only=True))-META_ROWS
+    count=0
+    for _ in verified[item['sheet']].iter_rows(values_only=True):
+     count+=1
+     if count%250==0:_checkpoint()
+    count-=META_ROWS
     if count!=item['record_count']:raise DailyReportError('Second-by-second worksheet row verification failed.')
   finally:verified.close()
-  count=sum(1 for _ in csv.reader(io.StringIO(gzip.decompress(csv_bytes).decode('utf-8-sig'))))-1
+  count=-1
+  with gzip.GzipFile(fileobj=io.BytesIO(csv_bytes),mode='rb') as compressed,io.TextIOWrapper(compressed,encoding='utf-8-sig',newline='') as text:
+   for _ in csv.reader(text):
+    count+=1
+    if count%250==0:_checkpoint()
   if count!=records:raise DailyReportError('Compressed history row count verification failed.')
   artifacts=[]
   for kind,content,sheets in (('xlsx',xlsx,len(coverage)+1),('csv_gz',csv_bytes,0)):
@@ -376,7 +454,7 @@ class DailyReportService:
   start,end=bounds(day);ordinals=self._ordinal_map(trades)
   artifacts=[];all_coverage=[];snapshots_total=0
   def fresh():
-   book=_workbook(day);summary=book.create_sheet('Daily_Summary');text=io.StringIO(newline='');writer=csv.writer(text);writer.writerow(COLUMNS)
+   book=_workbook(day);summary=book.create_sheet('Daily_Summary');text=tempfile.SpooledTemporaryFile(max_size=2*1024*1024,mode='w+',encoding='utf-8',newline='');writer=csv.writer(text);writer.writerow(COLUMNS)
    return book,summary,text,writer
   wb,summary,csv_text,csv_writer=fresh();coverage=[];cells=400;part_number=1
   max_rows=min(self.limits.max_data_rows_per_sheet,self.limits.max_sheet_rows-META_ROWS,max(1,(cell_limit-400)//len(COLUMNS)-META_ROWS))
@@ -385,6 +463,7 @@ class DailyReportService:
    chunk=0;sheet=None;current=None
    for second,payload in self._snapshots(t['id'],start,end):
     snapshots_total+=1
+    if snapshots_total%250==1:_checkpoint()
     for leg_index,leg in enumerate(payload.get('legs') or [{}]):
      if sheet is None or current['record_count']>=max_rows or cells+len(COLUMNS)>cell_limit:
       if coverage and cells+len(COLUMNS)*(META_ROWS+1)>cell_limit:
@@ -424,7 +503,7 @@ class DailyReportService:
    for item in artifacts:table.append([item[key] for key in ('kind','part_number','filename','record_count','size','sha256')])
    _heading(table,['Trade ID','Strategy ID','Broker','Worksheet','Part','Records','Continued'])
    for item in all_coverage:table.append([safe_cell(item[key]) for key in ('trade_id','strategy_id','broker','sheet','part_number','record_count','continued')])
-   stream=io.BytesIO();index.save(stream);content=_normalize_xlsx(stream.getvalue())
+   _checkpoint();stream=_ExportBuffer();index.save(stream);content=_normalize_xlsx(stream.getvalue())
    if len(content)>self.limits.max_workbook_bytes:raise DailyReportError('Master index exceeds configured file limit; records retained.')
    metadata=_part_metadata(day,'index_xlsx',0,content,0,1,[]);self._store(owner,metadata,content);artifacts.append(metadata)
   record_count=sum(item['record_count'] for item in all_coverage)
@@ -454,13 +533,15 @@ class DailyReportService:
   if owner is None:
    with self.factory() as db:return report_manifest(db,trading_date)
   try:
-   cells=self.limits.max_workbook_cells
-   while True:
-    try:return self._build(trading_date,owner,cells)
-    except _FileTooLarge:
-     minimum=len(COLUMNS)*(META_ROWS+1)+400
-     if cells<=minimum:raise DailyReportError('Even a single-record workbook exceeds the configured byte limit; source records retained.')
-     cells=max(minimum,cells//2)
+   with _ExportLease(self,trading_date,owner):
+    cells=self.limits.max_workbook_cells
+    while True:
+     _checkpoint()
+     try:return self._build(trading_date,owner,cells)
+     except _FileTooLarge:
+      minimum=len(COLUMNS)*(META_ROWS+1)+400
+      if cells<=minimum:raise DailyReportError('Even a single-record workbook exceeds the configured byte limit; source records retained.')
+      cells=max(minimum,cells//2)
   except Exception as error:
    safe=str(error) if isinstance(error,DailyReportError) else f'Daily export interrupted ({type(error).__name__}); source records retained.'
    def fail(db):
@@ -471,6 +552,7 @@ class DailyReportService:
    raise DailyReportError(safe) from None
 
  async def run(self,stop_event):
+  self._stop_event=stop_event
   loop=asyncio.get_running_loop();wake=asyncio.Event()
   with self._wake_lock:
    self._loop,self._wake=loop,wake

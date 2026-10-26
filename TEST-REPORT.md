@@ -1,3 +1,15 @@
+# Export CPU recovery — 26 October 2026
+
+343 automated tests passed in 27.67 seconds with the supported Python-only SQLAlchemy 2.1.5 test build. The eight new resource tests cover lease renewal during slow normalization, replaced-owner fencing, refusal to revive expired ownership, recording priority pauses, cancellation/source retention, streamed deterministic ZIP processing, CPU-budget accounting and CSV completeness.
+
+An isolated Windows synthetic run used20 strategies mirrored into40 broker trades,10,000 snapshots and20,000 leg rows. Export completed in37.241 seconds with13.062 process CPU seconds (35.08% CPU/wall ratio),85.21 MiB peak process working set, two XLSX parts plus paired CSV files and a master index. Every source snapshot remained, and row counts/trade coverage passed. This is a local synthetic measurement, not a RamNaym live-feed capacity guarantee.
+
+Remote evidence before this fix: the25 October report was on attempt9, still generating with its lease expired by287 seconds; its six stored staging parts occupied96,474,962 bytes. The app worker used961.5 MiB RSS while reported container CPU stayed near100%. The fix renews/fences ownership independently, streams ZIP/CSV processing, defaults to one-million-cell parts, targets35% export-thread CPU cooperatively, and pauses heavy generation when active market recording needs the server. Short compression peaks can still exceed the target. No trading history is deleted by this change.
+
+Google OAuth on dasarishreyas21@gmail.com and one actual completed-trade Excel upload were verified in the live app at08:44:50 IST. Full daily-history finalization and real broker connections remain separate acceptance checks.
+
+---
+
 # Backup and archival update — 26 October 2026
 
 335 automated tests passed in 21.32 seconds using the official Python-only SQLAlchemy 2.1.5 build in an isolated test folder. Windows Application Control blocked the installed optional compiled extension during collection; no Windows security settings or live server dependencies were changed. One existing Starlette/httpx test-helper deprecation warning remains. TypeScript checking passed.

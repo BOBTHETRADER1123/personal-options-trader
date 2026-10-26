@@ -347,7 +347,7 @@ async def lifespan(app):
     cloud_service=cloud_backup.CloudBackupService(session_factory=SessionLocal)
     resource_monitor=resource_health.ResourceMonitor()
     sheets_service=sheets_sync.SheetsSyncService(SessionLocal,cloud_service)
-    daily_service=daily_reports.DailyReportService(SessionLocal,calendar=exchange_calendar,on_finalized=sheets_service.notify_work)
+    daily_service=daily_reports.DailyReportService(SessionLocal,calendar=exchange_calendar,on_finalized=sheets_service.notify_work,can_work=lambda:not recording_needed())
     storage_archiver=archival.AutomaticArchiver(cloud_service,sheets_service,daily_service,lambda:resource_monitor.latest,write_lock,ready_provider=lambda:database_ready,can_prune=lambda:not recording_needed())
     # A laptop acknowledgement alone cannot remove the only cloud history.
     reporting.configure_archival(lambda db:False,None)
