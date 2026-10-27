@@ -1,3 +1,17 @@
+## Market-feed corrections — 27 October 2026
+
+- Complete automated suite: **423 passed**, one existing Starlette/httpx deprecation warning.
+- Isolated production build and source-only runtime ZIP checksum validation passed.
+- New tests cover zero/missing 5paisa last prices without losing later valid
+  messages, OI timestamp retention, real authentication error handling, Kotak
+  native price scaling, expiry business dates and unknown multiplier blocking.
+- Live observations before deployment: owner 5paisa OAuth completed, official
+  catalog loaded, 522 subscriptions initiated, and a zero-price protocol error
+  stopped that feed. The corrected release still needs quote-delivery verification.
+- Kotak official master URL and public NSE/MCX headers were reachable using
+  private server credentials. Corrected full catalog import and live TOTP/feed
+  acceptance still need verification. No real orders were sent.
+
 ## Broker connection update — 26 October 2026
 
 - Full isolated automated suite: **387 passed**, one existing Starlette/httpx deprecation warning.

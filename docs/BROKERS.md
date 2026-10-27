@@ -192,3 +192,25 @@ Refresh that broker's contracts after sign-in, then choose a valid contract
 in Market watch or Option chain. An authenticated token alone is not a
 verified streaming connection. Actual permissions, socket reception and
 market-hours performance still require authenticated account testing.
+
+
+## Live-feed corrections — 27 October 2026
+
+5paisa zero, blank or absent last prices on mapped contracts produce no usable
+quote. They retain the original OI receipt and do not stop other contracts.
+Malformed prices and rejected authentication remain explicit failures.
+
+Current Kotak native derivative masters with `lPrecision=2` encode strike and
+tick prices in paise. Convert those fields once; explicit normalized prices
+remain in human units. The [official SDK search implementation](https://github.com/Kotak-Neo/kotak-neo-python/blob/main/neo_api_client/services/scrip_search.py)
+compares native strike with the requested human strike multiplied by 100.
+Unsupported native precision fails validation. Direct MCX/BSE expiry epochs
+retain the business date used by that SDK; NSE retains its documented epoch
+offset and IST conversion. Native unknown commodity multipliers (-1/0)
+retain the contract for viewing, with fills blocked until monetary conversion
+is verified. They cannot turn an unverified estimate into a broker value.
+
+On 27 October, the owner completed actual 5paisa OAuth and the server imported
+its official master. The socket subscribed to 522 NIFTY contracts, then exposed
+the unavailable-price bug corrected above. These observations confirm login,
+master access and socket initiation, not sustained quote delivery or load capacity.

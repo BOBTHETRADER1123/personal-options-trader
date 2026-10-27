@@ -41,6 +41,14 @@ def tick_timestamp(value) -> str | None:
     return epoch_timestamp(value, milliseconds=True) if value is not None else None
 
 
+def _check_authentication_message(row):
+    # Authentication messages have no stable documented shape. Match their
+    # meaning without exposing the message, token or socket URL.
+    text = json.dumps(row).lower()
+    if any(term in text for term in ("expired", "unauthorized", "invalid token", "invalid access")):
+        raise FeedAuthenticationError("5paisa session rejected; refresh the backend access token")
+
+
 def parse_message(data: str | bytes | list | dict, contracts: dict, *, received_at=None, received_ns=None, open_interest=None) -> list[dict]:
     if isinstance(data, (str, bytes)):
         try:
@@ -57,18 +65,28 @@ def parse_message(data: str | bytes | list | dict, contracts: dict, *, received_
             if identity in contracts:
                 open_interest[identity] = {"value": row["OpenInterest"], "received_at": received_at or utc_now()}
         if "LastRate" not in row:
-            # Authentication messages have no stable documented shape. Match
-            # their meaning without exposing the message, tokens or URL.
-            text = json.dumps(row).lower()
-            if any(term in text for term in ("expired", "unauthorized", "invalid token", "invalid access")):
-                raise FeedAuthenticationError("5paisa session rejected; refresh the backend access token")
+            _check_authentication_message(row)
             continue
         key = (str(row.get("Exch", "")), str(row.get("ExchType", "")), str(row.get("Token", "")))
         contract = contracts.get(key)
         if not contract:
             raise FeedProtocolError("5paisa returned an unmapped contract token")
+        last_rate = row["LastRate"]
+        if isinstance(last_rate, bool):
+            raise FeedProtocolError("Invalid market-feed price")
+        # Untraded contracts can have zero/empty LTP. They do not constitute a
+        # new usable market quote and must not stop every other subscription.
+        # Preserve OI above, leave the previous price/timestamp untouched, and
+        # emit no synthetic zero or borrowed price. Malformed/negative/nonfinite
+        # values still fail protocol validation rather than being concealed.
+        if isinstance(last_rate, str) and not last_rate.strip():
+            last_rate = None
+        price = optional_price(last_rate)
+        if price is None:
+            _check_authentication_message(row)
+            continue
         oi = (open_interest or {}).get(key, {})
-        results.append(normalized_quote("fivepaisa", contract, row["LastRate"], received_at=received_at,
+        results.append(normalized_quote("fivepaisa", contract, price, received_at=received_at,
                                         received_ns=received_ns, bid=optional_price(row.get("BidRate")),
                                         ask=optional_price(row.get("OffRate")), volume=row.get("TotalQty"),
                                         previous_close=row.get("PClose"), open_interest=oi.get("value"),

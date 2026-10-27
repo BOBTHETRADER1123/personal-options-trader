@@ -13,6 +13,7 @@ import math
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -65,6 +66,35 @@ def _underlying(text: str) -> str:
     return {"NIFTY50": "NIFTY", "NIFTYBANK": "BANKNIFTY", "BANKNIFTY50": "BANKNIFTY", "S&PBSESENSEX": "SENSEX"}.get(text, text)
 
 
+def _kotak_native_price(row, native_name, normalized_name, default=""):
+    """Current transformed derivative master prices are integer paise.
+
+    The official SDK search_scrip compares dStrikePrice with human strike*100.
+    Current native masters identify this schema with lPrecision=2; this is a
+    supported schema check, not a general claim that precision is a divider.
+    Explicit normalized fields stay in human price units. Older normalized
+    inputs without native precision retain their documented human-unit form.
+    """
+    normalized = _pick(row, normalized_name)
+    if normalized:
+        return normalized
+    raw = _pick(row, native_name)
+    if not raw:
+        return default
+    precision = _pick(row, "lPrecision")
+    if precision:
+        try:
+            if Decimal(precision) != 2:
+                raise ValueError("Unsupported Kotak native price precision")
+            value = Decimal(raw) / 100
+            if not value.is_finite():
+                raise ValueError("Invalid Kotak native price")
+            return str(value)
+        except InvalidOperation:
+            raise ValueError("Invalid Kotak native price or precision") from None
+    return raw
+
+
 def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -> dict:
     """Parse documented native CSV columns or the explicit normalized template.
 
@@ -95,14 +125,16 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
         underlying = _pick(row, "pSymbolName", "pUnderlying", "underlying")
         expiry = _pick(row, "expiry", "lExpiryDate", "pExpiryDate")
         if "lExpiryDate" in row and "expiry" not in row and str(expiry).isdigit():
-            # Official Kotak Instruments API documentation specifies a
-            # 315511200-second offset for NSE/CDE, but direct Unix for BSE/MCX.
-            seconds = int(expiry) + (315511200 if segment in {"nse_fo", "cde_fo"} else 0)
-            expiry = datetime.fromtimestamp(seconds, IST).date().isoformat()
-        strike = _pick(row, "dStrikePrice", "strike")
+            # Official instrument docs specify the NSE/CDE epoch offset. The
+            # SDK formats direct BSE/MCX epochs as UTC business dates; their
+            # end-of-day timestamps must not roll into tomorrow in IST.
+            shifted = segment in {"nse_fo", "cde_fo"}
+            seconds = int(expiry) + (315511200 if shifted else 0)
+            expiry = datetime.fromtimestamp(seconds, IST if shifted else timezone.utc).date().isoformat()
+        strike = _kotak_native_price(row, "dStrikePrice", "strike")
         option_type = _pick(row, "pOptionType", "option_type")
         lot = _pick(row, "lLotSize", "lot_size")
-        tick = _pick(row, "dTickSize", "tick_size", default="0.05")
+        tick = _kotak_native_price(row, "dTickSize", "tick_size", default="0.05")
     option_type = option_type.upper()
     # Both official masters use XX for futures in derivative segments. An
     # explicit FUT in the normalized template is supported as well; cash XX
@@ -121,15 +153,21 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     parsed_expiry = _date(expiry)
     parsed_strike = 0.0 if option_type == "FUT" else _positive(strike)
     parsed_lot = _positive(lot, True)
-    # Transformed-v1 strike/expiry schemas can differ across broker releases.
-    # Values must be native human-price/ISO fields or explicitly normalized by
-    # the operator. Never silently apply an assumed /100 or epoch-origin shift.
+    # Kotak native paise fields were converted only for the supported schema
+    # above. Normalized template prices and 5paisa prices are already human units.
     contract_id = f"{broker}:{exchange}:{segment}:{token}" if broker == "fivepaisa" else f"{broker}:{segment}:{token}"
     # A commodity's broker order quantity may differ from the monetary value
     # of one quoted price point. Only explicitly supplied master information
     # can authorize this conversion; no commodity-specific mapping is guessed.
     multiplier_text = _pick(row, "price_multiplier", "Multiplier", "lMultiplier", "MULTIPLIER")
-    price_multiplier = _positive(multiplier_text) if exchange == "MCX" and multiplier_text else None if exchange == "MCX" else 1.0
+    # Current Kotak commodity masters use -1/0 in lMultiplier when no monetary
+    # conversion is supplied. Retain the contract with an unverified multiplier;
+    # the paper engine already blocks MCX fills until it can price them safely.
+    # Explicit normalized overrides and other broker multipliers remain strict.
+    native_unknown = (broker == "kotak" and exchange == "MCX"
+                      and not _pick(row, "price_multiplier", "Multiplier", "MULTIPLIER")
+                      and str(_pick(row, "lMultiplier")).strip() in {"-1", "-1.0", "0", "0.0"})
+    price_multiplier = (None if native_unknown else _positive(multiplier_text) if multiplier_text else None) if exchange == "MCX" else 1.0
     return {"id": contract_id, "instrument_id": contract_id, "broker": broker,
             "token": str(token), "symbol": symbol, "underlying": _underlying(underlying),
             "exchange": exchange, "segment": segment, "expiry": parsed_expiry,
