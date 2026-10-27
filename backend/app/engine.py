@@ -355,8 +355,8 @@ def archive_close(db,trade):
 def new_leg(db,request,broker,settings,at):
     item=request if isinstance(request,dict) else request.model_dump()
     contract=contract_for(item['instrument_id'],broker,settings['demo_mode'])
-    if contract.get('exchange')=='MCX' and not settings['demo_mode'] and not contract.get('price_multiplier'):
-        raise HTTPException(422,'This MCX master is missing its verified price multiplier. Import the broker monetary multiplier before paper execution.')
+    if contract.get('exchange')=='MCX' and not settings['demo_mode'] and (not contract.get('price_multiplier') or not contract.get('monetary_conversion_source')):
+        raise HTTPException(422,'This MCX contract needs verified quantity and price units. Refresh the broker contracts before paper execution.')
     contract_id=contract.get('instrument_id',contract['id'])
     quote=resolve_quote(db,contract,broker,settings)
     if not quote:raise HTTPException(409,f'No quote for {contract["symbol"]}; wait for the feed.')
@@ -370,7 +370,7 @@ def new_leg(db,request,broker,settings,at):
         price,quote,slip=execution_price(db,contract,item['side'],broker,settings,
             limit_price=item['price'] if item.get('order_type')=='LIMIT' else None)
     lots=int(item['lots']);quantity=lots*int(contract['lot_size'])*float(contract.get('price_multiplier') or 1)
-    leg={k:contract.get(k) for k in ('symbol','underlying','exchange','segment','expiry','strike','option_type','lot_size','price_multiplier','multiplier_verified','token','source')}
+    leg={k:contract.get(k) for k in ('symbol','underlying','exchange','segment','expiry','strike','option_type','lot_size','price_multiplier','multiplier_verified','monetary_conversion_source','broker_quantity_multiplier','token','source')}
     leg.update({'id':ident('leg'),'instrument_id':contract_id,'side':item['side'],'lots':lots,'filled_lots':0 if pending else lots,'open_lots':0 if pending else lots,'order_type':item.get('order_type','MARKET'),'limit_price':item.get('price'),'entry_price':price,'current_price':float(quote['ltp']),'exit_price':None,'entry_at':None if pending else at,'exit_at':None,'realized_pnl':0.0,'unrealized_pnl':0.0,'charges':0.0 if pending else charges(price,quantity,settings),'slippage_cost':0 if pending else slip*quantity,'status':'pending' if pending else 'open','stop_loss':item.get('stop_loss'),'target':item.get('target'),'quote_at':quote.get('received_at'),'exchange_quote_at':quote.get('exchange_timestamp'),'quote_event_id':quote.get('event_id'),'quote_source':quote.get('broker',broker),'bid':quote.get('bid'),'ask':quote.get('ask'),'demo':settings['demo_mode']})
     return leg
 

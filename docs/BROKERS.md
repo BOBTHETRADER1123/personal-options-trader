@@ -214,3 +214,14 @@ On 27 October, the owner completed actual 5paisa OAuth and the server imported
 its official master. The socket subscribed to 522 NIFTY contracts, then exposed
 the unavailable-price bug corrected above. These observations confirm login,
 master access and socket initiation, not sustained quote delivery or load capacity.
+
+
+### Verified MCX energy conversions
+
+For Crude Oil, Crude Oil Mini, Natural Gas and Natural Gas Mini, match the
+broker's physical contract quantity and pricing metadata against the official
+MCX specifications. Apply quantity once. 5paisa's native `Multiplier` is a
+quantity field, not a second monetary multiplier. Unknown conversions and
+cached rows lacking current provenance stay visible but cannot create paper
+fills until refreshed. See [MCX-CONTRACT-UNITS.md](MCX-CONTRACT-UNITS.md).
+The actual broker mini symbol `NATGASMINI` uses the verified energy session.

@@ -64,11 +64,10 @@ def test_future_ignores_native_no_strike_sentinel_but_scales_tick():
 
 def test_fivepaisa_human_price_fields_and_strict_multiplier_unchanged():
     row = {'Exch':'M', 'ExchType':'D', 'ScripCode':'123', 'Name':'OPAQUE', 'SymbolRoot':'NATURALGAS',
-           'Expiry':'20301029', 'StrikeRate':'545', 'TickSize':'.05', 'ScripType':'CE', 'LotSize':'1250', 'Multiplier':'1'}
+           'Expiry':'20301029', 'StrikeRate':'545', 'TickSize':'.05', 'ScripType':'CE', 'LotSize':'1250', 'Multiplier':'1250'}
     result = normalize_row('fivepaisa', row)
     assert result['strike'] == 545 and result['tick_size'] == .05 and result['price_multiplier'] == 1
-    with pytest.raises(ValueError):
-        normalize_row('fivepaisa', {**row, 'Multiplier':'-1'})
+    assert normalize_row('fivepaisa', {**row, 'Multiplier':'-1'})['price_multiplier'] is None
 
 
 def test_direct_bse_end_of_day_epoch_keeps_utc_business_date():

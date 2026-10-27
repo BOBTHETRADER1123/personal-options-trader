@@ -66,6 +66,63 @@ def _underlying(text: str) -> str:
     return {"NIFTY50": "NIFTY", "NIFTYBANK": "BANKNIFTY", "BANKNIFTY50": "BANKNIFTY", "S&PBSESENSEX": "SENSEX"}.get(text, text)
 
 
+# Physical trading units verified against the MCX 2026 and published 2027
+# energy contract specifications. See docs/MCX-CONTRACT-UNITS.md for sources.
+_MCX_ENERGY_UNITS = {
+    "CRUDEOIL": (100, {"barrel", "barrels", "bbl"}),
+    "CRUDEOILM": (10, {"barrel", "barrels", "bbl"}),
+    "NATURALGAS": (1250, {"mmbtu"}),
+    "NATGASMINI": (250, {"mmbtu"}),
+}
+
+
+def _mcx_conversion(broker, row, underlying, lot_size):
+    """Return an extra monetary factor, never multiply contract quantity twice.
+
+    5paisa documents Multiplier as a TOTAL QUANTITY conversion. It is not an
+    additional factor after our lot_size has already expanded lots to units.
+    Unknown commodities remain unavailable until explicitly verified.
+    """
+    raw_multiplier = _pick(row, "Multiplier", "MULTIPLIER") if broker == "fivepaisa" else _pick(row, "lMultiplier")
+    try:
+        quantity_multiplier = _positive(raw_multiplier) if raw_multiplier else None
+    except (ValueError, TypeError, OverflowError):
+        quantity_multiplier = None
+    result = {"price_multiplier": None, "multiplier_verified": False,
+              "broker_quantity_multiplier": quantity_multiplier,
+              "monetary_conversion_source": None}
+    explicit = _pick(row, "price_multiplier")
+    if explicit:
+        result.update(price_multiplier=_positive(explicit), multiplier_verified=True,
+                      monetary_conversion_source="operator_verified_normalized_multiplier")
+        return result
+    specification = _MCX_ENERGY_UNITS.get(_underlying(underlying))
+    if not specification or lot_size != specification[0]:
+        return result
+    if broker == "fivepaisa":
+        verified = quantity_multiplier == lot_size
+    else:
+        def unit(field):return re.sub(r"\s+", "", _pick(row, field)).casefold()
+        allowed_units = specification[1]
+        # The broker explicitly supplies the quoted unit and traded quantity
+        # unit. Require unity quotation/conversion factors, not a name-based
+        # assumption about an arbitrary MCX contract.
+        units_ok = unit("pPriceUnits") in allowed_units and unit("pTrdUnits") in allowed_units
+        delivery = unit("pDeliveryUnits")
+        units_ok = units_ok and (not delivery or delivery in allowed_units)
+        try:
+            quotation = _positive(_pick(row, "dPriceQuatation", "dPriceQuotation"))
+            factors_ok = all(not _pick(row, key) or _positive(_pick(row, key)) == 1
+                             for key in ("dPriceNum", "dPriceDen", "dGenNum", "dGenDen"))
+            verified = units_ok and quotation == 1 and factors_ok
+        except (ValueError, TypeError, OverflowError):
+            verified = False
+    if verified:
+        result.update(price_multiplier=1.0, multiplier_verified=True,
+                      monetary_conversion_source="mcx_energy_contract_units_v1")
+    return result
+
+
 def _kotak_native_price(row, native_name, normalized_name, default=""):
     """Current transformed derivative master prices are integer paise.
 
@@ -156,24 +213,14 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     # Kotak native paise fields were converted only for the supported schema
     # above. Normalized template prices and 5paisa prices are already human units.
     contract_id = f"{broker}:{exchange}:{segment}:{token}" if broker == "fivepaisa" else f"{broker}:{segment}:{token}"
-    # A commodity's broker order quantity may differ from the monetary value
-    # of one quoted price point. Only explicitly supplied master information
-    # can authorize this conversion; no commodity-specific mapping is guessed.
-    multiplier_text = _pick(row, "price_multiplier", "Multiplier", "lMultiplier", "MULTIPLIER")
-    # Current Kotak commodity masters use -1/0 in lMultiplier when no monetary
-    # conversion is supplied. Retain the contract with an unverified multiplier;
-    # the paper engine already blocks MCX fills until it can price them safely.
-    # Explicit normalized overrides and other broker multipliers remain strict.
-    native_unknown = (broker == "kotak" and exchange == "MCX"
-                      and not _pick(row, "price_multiplier", "Multiplier", "MULTIPLIER")
-                      and str(_pick(row, "lMultiplier")).strip() in {"-1", "-1.0", "0", "0.0"})
-    price_multiplier = (None if native_unknown else _positive(multiplier_text) if multiplier_text else None) if exchange == "MCX" else 1.0
+    conversion = (_mcx_conversion(broker, row, underlying, parsed_lot) if exchange == "MCX" else
+                  {"price_multiplier": 1.0, "multiplier_verified": True,
+                   "broker_quantity_multiplier": None, "monetary_conversion_source": None})
     return {"id": contract_id, "instrument_id": contract_id, "broker": broker,
             "token": str(token), "symbol": symbol, "underlying": _underlying(underlying),
             "exchange": exchange, "segment": segment, "expiry": parsed_expiry,
             "strike": parsed_strike, "option_type": option_type, "instrument_type": "future" if option_type == "FUT" else "option", "lot_size": parsed_lot,
-            "tick_size": _positive(tick), "price_multiplier": price_multiplier,
-            "multiplier_verified": price_multiplier is not None,
+            "tick_size": _positive(tick), **conversion,
             "demo": False, "source": "broker_master",
             "imported_at": datetime.now(timezone.utc).isoformat()}
 
@@ -255,6 +302,14 @@ class ContractCatalog:
                     raise ValueError("Invalid option type or exchange")
                 if str(row["id"]).startswith("DEMO:"):
                     raise ValueError("Live masters cannot contain demo identifiers")
+                if (row["exchange"] == "MCX" and row.get("source") == "broker_master"
+                        and not row.get("monetary_conversion_source")):
+                    # Old caches may have multiplied physical lot quantity by
+                    # the broker's quantity multiplier a second time. Keep them
+                    # visible, but require refreshed/verified metadata for fills.
+                    # This affects catalog rows only, never persisted trade legs.
+                    row = {**row, "price_multiplier": None, "multiplier_verified": False,
+                           "requires_master_refresh": True}
                 if row.get("price_multiplier") is not None:
                     _positive(row["price_multiplier"])
                 pending.append(row)

@@ -1,3 +1,20 @@
+## Verified MCX quantity accounting — 27 October 2026
+
+- Complete suite: **461 passed**. After adding the broker NATGASMINI calendar
+  alias, all **10 MCX accounting/session tests passed** separately.
+- Buy and sell paper-ledger tests verify a one-rupee move changes net P&L by
+  exactly the physical quantity: 100/10 barrels or 1250/250 MMBtu, once.
+- Current official public 5paisa master: **148,470 derivative contracts parsed**
+  with no unexpected errors, including all four supported energy products.
+- Native quantity multipliers are retained separately. Unverified MCX values
+  and legacy cached conversion factors cannot authorize a new paper fill.
+- Actual live observation: 5paisa Crude Oil option-chain subscription contained
+  390 contracts and delivered market prices with broker-specific receive times.
+  This is quote-reception evidence, not a sustained monthly-capacity test.
+- Real broker orders remain absent. Live commodity paper-trade lifecycle,
+  one-second export/recovery acceptance and Kotak socket authentication still
+  need verification after this deployment.
+
 ## Market-feed corrections — 27 October 2026
 
 - Complete automated suite: **423 passed**, one existing Starlette/httpx deprecation warning.

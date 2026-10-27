@@ -110,14 +110,16 @@ def test_fivepaisa_native_master_normalization():
     assert row["price_multiplier"] is None and row["multiplier_verified"] is False
 
 
-def test_verified_mcx_multiplier_preserved_without_assumed_mapping():
+def test_quantity_multiplier_does_not_authorize_unverified_mcx_value():
     data = {"ScripCode": "123", "Exch": "M", "ExchType": "D", "Name": "GOLD CE", "SymbolRoot": "GOLD",
             "Expiry": "20301029", "StrikeRate": "75000", "ScripType": "CE", "LotSize": "1", "Multiplier": "100"}
     row = normalize_row("fivepaisa", data)
-    assert row["lot_size"] == 1 and row["price_multiplier"] == 100
-    assert row["multiplier_verified"] is True
+    assert row["lot_size"] == 1 and row["price_multiplier"] is None
+    assert row["multiplier_verified"] is False
+    explicit = normalize_row("fivepaisa", {**data, "price_multiplier": "100"})
+    assert explicit["price_multiplier"] == 100 and explicit["monetary_conversion_source"]
     with pytest.raises(ValueError):
-        normalize_row("fivepaisa", {**data, "Multiplier": "0"})
+        normalize_row("fivepaisa", {**data, "price_multiplier": "0"})
 
 
 def test_equity_multiplier_is_one_and_demo_mcx_explicitly_fictional():
