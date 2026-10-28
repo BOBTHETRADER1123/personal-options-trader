@@ -1,101 +1,74 @@
 # Your Personal Options Trader
 
-This is your responsive paper trading app, including its website, backend, Excel reports, and Windows laptop companion. **It cannot submit real broker orders.**
+This is your private paper-trading website. **Kotak Neo is the only enabled broker. The app cannot place real broker orders.** Existing 5paisa and Dhan trade histories and exports are preserved as historical records; they are not active connection or new-trade choices.
 
-## Open your online app
+## Open the website
 
-Open **[Personal Options Trader](https://personal-options-trader.vercel.app)**. On this laptop, double-click the **Personal Options Trader Online** desktop shortcut or **Open-Online-Trading-App.cmd** in the project folder. It opens the same website and starts the separate online report companion in the background.
+Open [Personal Options Trader](https://personal-options-trader.vercel.app/) on your phone or laptop and sign in with your existing app password. Both devices use the same online workspace.
 
-Your hosted owner account is already created. **The online database is currently unavailable because Neon's monthly public network-transfer allowance is exhausted.** This is separate from storage capacity; downloading or deleting Excel archives does not reset it. No paid upgrade has been made. Your local practice account and records remain available.
+The configured online setup is Vercel for the website, RamNaym server **1606** for the backend, and SQLite at `/app/data/trading.db` on its persistent volume. It does not depend on Neon or your laptop remaining switched on. The hosting plan must remain active, and broker sessions, market permissions and service connectivity must be available. No uninterrupted-uptime guarantee is implied.
 
-The online companion is paired but stopped during the database outage. Its folder is **Documents/PaperTrading/OnlineTrades**. Restart it with the online shortcut after database access returns. Its first completed online workbook still needs an end-to-end check.
+If the page says **Connection unavailable**, use **Check connection** after the backend is reachable. A loading Vercel page alone does not prove the backend is healthy. Do not create a second owner account or replace the database to fix a connection error.
 
-New Excel reports show the final result, maximum profit and maximum loss actually reached, and their IST times, plus the strategy legs. They omit tick-by-tick data. Existing detailed reports are preserved. Available laptop reports are verified in [your Google Drive backup folder](https://drive.google.com/drive/folders/1CxpHsKBCJ8dxxNYbKAx6NMwEU9tojMn5). Daily backups run at **4:00 pm IST** when the laptop and Codex are available; [details](docs/GOOGLE-DRIVE-BACKUPS.md).
+## Connect Kotak Neo
 
-The full online report folder on this laptop is `C:\Users\Dasari Sampath Kumar\Documents\PaperTrading\OnlineTrades`.
+1. Open **Broker connections** and choose **Set up Kotak Neo**.
+2. In Kotak Neo, create the Trade API application and complete TOTP registration if needed.
+3. Enter the application key, registered mobile number, client code, MPIN and authenticator setup key only in the private website setup form. Never put them in chat, GitHub or frontend settings.
+4. Choose **Save private setup**, then **Refresh contracts** to import Kotak's NSE, BSE and MCX derivative contracts.
+5. Select a permitted contract during its exchange session. Check the actual feed status and quote timestamp before placing a paper trade.
 
-Render's free backend can sleep or restart. An initial visit may take longer while it wakes, and prices missed while it is stopped cannot be recorded later. Continuous market capture is not guaranteed by this free setup.
+Saving credentials does not itself prove that the broker connection works. A rejected or expired session requires Kotak's supported authentication flow again. [Connection details and limitations](docs/BROKERS.md).
 
-## Keep using local practice on this Windows laptop
+## Create a paper strategy
 
-Your local practice app, account and data are retained. Double-click the **Personal Options Trader** shortcut on your desktop, or **Open-Trading-App.cmd** in the project folder. It opens [your local app](http://127.0.0.1:8000), starts the local backend and report companion in the background, and reuses your existing settings. Sign in with the local password you already created.
+1. Open **Option chain**, choose the exchange, underlying and expiry, and select buy or sell beside a contract. Or open **New paper trade** to start in the strategy builder.
+2. Set expiry, strike, CE/PE or futures, buy/sell and lots for each leg. Only contracts in the current Kotak master can be selected.
+3. Check the quote age, estimated margin, estimated charges and expiry payoff. An unknown MCX monetary conversion or stale price blocks a market paper fill.
+4. Select **Review paper trade**, review the assumptions and confirm. This records a simulation inside the app; it sends no broker order.
+5. Open **Positions & trades** to inspect individual legs, partial exits and full strategy exits. A live-data paper exit also requires a usable quote.
 
-Check that the page says **Laptop workspace**. If its address ends in `vercel.app`, you are using the separate online workspace. The local connection error caused by competing price/report writes was repaired on 23 October; refresh the local page after starting the app. Your local records and password were preserved.
+Sample mode uses fictional contracts and synthetic prices. It is separate from genuine broker-data paper trades and cannot validate a market feed. All-time trade counts distinguish saved genuine paper executions from preserved sample records.
 
-You can close the browser and reopen the shortcut later. The services continue running while the laptop is awake. When you want to stop the app and companion, double-click **Stop-Trading-App.cmd** in the project folder. Your saved records stay in place.
+## View records and live P&L
 
-Local practice works separately from the hosted workspace; its trades do not automatically appear online. Keep the whole **personal-options-trader** folder together. Do not move individual files out of it. Both desktop shortcuts point to this folder.
+The backend calculates and durably records active-trade P&L at one-second intervals during the contract's verified exchange session. Each snapshot retains the original market quote timestamp and shows stale or reused prices accurately. Closing the browser does not stop recording an open paper position while the cloud service and broker connection remain available.
 
-## First local installation on another Windows computer
+Trades held over several dates keep their original trade and strategy IDs. Contracts cannot trade beyond actual expiry; any authorized rollover is a separately linked transaction. The app does not automatically roll a position just because its contract expired.
 
-1. Install **Python 3.12 or later** from [python.org](https://www.python.org/downloads/windows/). In the installer, select **Add Python to PATH**.
-2. Install **Node.js LTS** from [nodejs.org](https://nodejs.org/). Keep the default installation options. Both downloads are free. If they are already installed, skip these steps.
-3. Open the project folder in File Explorer. Double-click **Setup-Windows.cmd**. It installs the app’s packages and builds the website. Wait for **Setup complete**. This needs internet access on its first run.
-4. Double-click **Open-Trading-App.cmd**. It starts the local app and prepares companion pairing automatically.
-5. On your first visit, create a unique password of at least 12 characters. There is no default password. The local app does not need a hosting setup token.
-6. Your initial workspace contains clearly marked **sample contracts and simulated prices**. Use it to learn the controls. These examples are not historical exchange data and cannot validate a live feed.
+## Connect the separate Google account
 
-Running setup again preserves an existing private configuration and database. **Start-Windows.cmd** remains available for a visible backend console; keep that console open while using it. It starts only the backend, so use the companion instructions below if you choose this option.
+Open **Data & settings**, connect Google, and select the Google account you want to use for trading archives. Review Google's permission screen yourself. You can change accounts later; old files stay in the account where they were created.
 
-## Try the main workflow
+Google authorization and private server settings must be configured before uploads can succeed. The app-owned cloud connection performs uploads while your laptop is off. The older Codex/laptop report companion is a separate optional workflow and is not required for cloud recording. [Google setup](docs/GOOGLE-SHEETS-LIVE.md).
 
-1. Open **Strategy builder**. Select NIFTY, BANK NIFTY, SENSEX, or a sample MCX commodity.
-2. Choose a strategy template. Or use **Custom** and **Add leg**.
-3. Use the dropdowns to choose expiry, strike, CE/PE, buy/sell, and lots. The plus/minus strike buttons step through contracts in the catalog.
-4. Select one or more paper accounts: Dhan, Kotak Neo, or 5paisa. Select **Review paper trade**, check the preview, then confirm.
-5. Open **Positions** and select the trade. Try **Add lots**, **Add leg**, and **Partial exit**. Every confirmed action is journaled.
-6. Choose **Exit strategy**, then confirm. Open **Trade history** to inspect the closing P&L, MFE/MAE and their times, and profit giveback.
-7. Open **Excel reports**. Your completed trade generates an individual workbook. The download button saves a normal browser download. For automatic verified saving, follow the next section.
+## Download daily Excel history
 
-## Save reports to your laptop automatically
+Open **Daily Excel Downloads**. Each IST trading date has a daily report, with a separate worksheet for each individual broker-specific trade and continued sheets for positions held across dates. Large reports split into numbered workbook parts with compressed CSV supplements so records are not silently omitted.
 
-For the online app, use **Personal Options Trader Online** or **Open-Online-Trading-App.cmd**. Online reports use **Documents/PaperTrading/OnlineTrades**. Connection and pairing are confirmed; the first online workbook save remains to be checked.
+1. Check that the export is finalized and its record count and worksheet coverage are verified.
+2. Download every listed XLSX/CSV part to your Windows laptop.
+3. Reopen the workbooks and compare the displayed checksum and file size with your downloaded files.
+4. Keep a second independent verified copy for recovery. A single laptop download is not protection against laptop failure.
 
-For local practice, use **Personal Options Trader** or **Open-Trading-App.cmd**. Local reports use **Documents/PaperTrading/Trades**. A local workbook has already been saved and reopened successfully.
+[Daily report details](docs/DAILY-REPORTS.md).
 
-Reports are marked saved only after their checksum and Excel verification succeed. Keep the laptop awake; if it is offline, queued jobs resume when the appropriate companion reconnects. The two companions have separate settings and folders.
+## Reuse cloud storage safely
 
-For manual local pairing or a custom local destination, use **Start-Companion.cmd**:
+**Delete Verified Cloud Copies** requires your explicit confirmation that a verified local backup exists. Clicking Download alone is not sufficient. This action must not delete open positions, unsynchronized records or the only remaining copy of history. Empty Google Drive Trash yourself only after verifying independent copies.
 
-1. Double-click **Start-Companion.cmd** in the main project folder.
-2. Follow the prompts. For local use, accept `http://127.0.0.1:8000` as the backend. Choose your save folder or accept `Documents/PaperTrading/Trades`.
-3. The companion shows a **hash**. Copy that hash into the project’s private `.env` file after `COMPANION_TOKEN_SHA256=`. A `.env` file opens in Notepad through **Open with**.
-4. Stop and restart the backend. Leave the companion running. Reports are marked saved only after its checksum and Excel verification succeed.
-5. If the laptop is offline, leave the jobs queued. They remain in the backend database and resume when the companion reconnects.
+The separately configured automatic local-history archive triggers at **12 GiB**, verifies eligible older completed daily archives in Google Drive, and then removes only eligible snapshot details in bounded transactions. It retains active state, continuity anchors, essential summaries and export evidence. It does not clear the whole database, and freed SQLite pages may be reused without shrinking the file. [Archive policy](docs/GOOGLE-DRIVE-CLOUD.md).
 
-Never put your private `.env` file in GitHub. Online journal cleanup is disabled by default. The complete explanation is in [the export guide](docs/EXPORTS.md).
+## Check health and hosting
 
-## Use the same app on your phone
+Use **Data & settings** to review feed status, recording gaps, CPU, RAM, persistent storage, exports and backup queues. Dashboard/log warnings do not imply email or SMS monitoring is configured. The Medium plan has a finite **15 GB** storage allowance; verify daily exports and respond to capacity alerts.
 
-Open **[personal-options-trader.vercel.app](https://personal-options-trader.vercel.app)** on both the phone and laptop. After hosted owner setup, sign in to the same online account on both devices. The local `127.0.0.1` address only opens the separate practice app on this laptop.
+The agreed trial extension was through **28 October 2026, 11:59 PM IST**. Check the actual RamNaym plan status before relying on service after that point. No paid subscription should be created automatically.
 
-Your phone and laptop must open the **same Vercel HTTPS address**, connected to the **same Render backend and Neon database**. In Android Chrome, use **Add to Home screen** to install the app shortcut. The laptop companion still needs to run on the laptop for local file saving.
+## Optional local practice and recovery
 
-As of **21 October 2026**, GitHub source, Vercel Hobby, Render Free and Neon Free PostgreSQL are configured. Hosted owner sign-in, a completed online workbook and physical-phone synchronization/installation still need verification. No paid service has been selected. See [the cloud guide](docs/DEPLOYMENT.md) for the current setup and remaining checks.
+The **Personal Options Trader** desktop shortcut or **Open-Trading-App.cmd** opens the separate laptop workspace at `http://127.0.0.1:8000`. This workspace needs the laptop to remain awake and does not automatically synchronize its trades to the cloud. Existing laptop and old Neon records remain preserved.
 
-## Connect real market prices
+For a fresh local installation, install Python 3.12+ and supported Node.js, run **Setup-Windows.cmd**, then **Open-Trading-App.cmd**. Setup preserves existing private configuration and records. Use **Stop-Trading-App.cmd** to stop its local services safely.
 
-1. Use [the broker guide](docs/BROKERS.md) to obtain market-data permission from each broker you want to use.
-2. Add credentials only to the backend’s private environment settings. Never add them to the website, GitHub, reports, or this chat.
-3. Import the broker’s current instrument master. It supplies genuine expiry dates, strikes, tokens and lot sizes. Live MCX contracts also require a verified monetary price multiplier.
-4. Set the feed subscriptions, turn Sample mode off in **Settings**, and restart the backend.
-5. Check **Broker connections** for actual source, price, receive time, and stale warnings before simulating a trade. Permission or session failures are shown; sample data is never presented as a live connection.
-
-Your own broker accounts and permissions are required. Real-account login, live feed operation, and broker subscription costs have not been verified without them.
-
-## If something does not open
-
-| What happens | What to do |
-| --- | --- |
-| The setup window says Python or Node is missing | Install them from the official links above, then reopen setup. |
-| Online app takes a long time to open | Allow the free backend time to wake, then reload the website. Check the internet connection. |
-| The local browser says it cannot connect | Open the local desktop shortcut or Open-Trading-App.cmd and allow the app to start. Use port 8000. If you chose Start-Windows.cmd, keep its console open. |
-| Another app already uses port 8000 | Close the other local server, then restart. For a different port, follow README.md. |
-| Sign-in expires | Sign in again. Your server records remain saved. |
-| Market feed is stale | Check the broker session, subscription and backend status. Existing marks remain visible with a warning; stale marks are not fresh execution prices. |
-| Report stays pending | Keep the backend running. Check Excel reports for its error, then retry. |
-| Online report is ready but not saved | Reopen Open-Online-Trading-App.cmd and keep the laptop awake. Check Documents/PaperTrading/OnlineTrades and the report's error detail. |
-| Local report is ready but not saved | Reopen Open-Trading-App.cmd and keep the laptop awake. Check Documents/PaperTrading/Trades. For manual pairing, check the companion URL and pairing hash. |
-| Excel has a file open | Close that workbook and retry. Do not delete the journal/database to resolve this. |
-
-For verification results and remaining account-specific checks, read [TEST-REPORT.md](TEST-REPORT.md).
+Never upload `.env`, databases, passwords, API keys or OAuth tokens to GitHub. See [operations and recovery](docs/OPERATIONS.md), [older companion exports](docs/EXPORTS.md), and [actual verification status](TEST-REPORT.md).

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, Trash2, Plus, Minus, RotateCcw, ArrowRight, ArrowUpRight, Layers, Info, ShieldCheck } from 'lucide-react';
-import { brokers, money, num, uid } from './api';
+import { api, brokers, money, num, uid } from './api';
 import { Badge, Help, LineChart, Panel, Pnl } from './components';
 import type { Row } from './components';
 import type { ChainSelection } from './OptionChain';
@@ -14,18 +14,76 @@ const templates:Template[]=[
  {name:'Long Straddle',category:'Volatility',legs:[['BUY','CE',0],['BUY','PE',0]]},{name:'Long Strangle',category:'Volatility',legs:[['BUY','CE',2],['BUY','PE',-2]]},{name:'Custom Strategy',category:'Custom',legs:[['BUY','CE',0]]},{name:'Long Future',category:'Futures',legs:[['BUY','FUT',0]]},{name:'Short Future',category:'Futures',legs:[['SELL','FUT',0]]}
 ];
 function smallPayoff(template:Template){const payoff=(x:number)=>template.legs.reduce((n,[s,t,k])=>n+(s==='BUY'?1:-1)*((t==='FUT'?x:t==='CE'?Math.max(x-k,0):Math.max(k-x,0))-(2-Math.abs(k)*.15)),0);const a=Array.from({length:15},(_,i)=>payoff(i-7)),lo=Math.min(...a),hi=Math.max(...a);return <svg viewBox="0 0 120 43" aria-hidden="true"><line x1="0" y1="25" x2="120" y2="25" stroke="#333e35" strokeDasharray="3 4"/><polyline points={a.map((y,i)=>`${i/14*120},${37-(y-lo)/(hi-lo||1)*32}`).join(' ')} stroke="#abd783" strokeWidth="2" fill="none"/></svg>;}
-export default function Builder({instruments,quotes,onReview,addingTo,onCancelAdd,staleAfterSeconds=10,initialSelection,onSelectionConsumed}:{preferredFeed?:string;staleAfterSeconds?:number;instruments:Row[];quotes:Row[];onReview:(payload:Row,analysis:Row)=>void;addingTo?:Row|null;onCancelAdd:()=>void;initialSelection?:ChainSelection|null;onSelectionConsumed?:()=>void}){
+export default function Builder({instruments,quotes,onReview,addingTo,onCancelAdd,staleAfterSeconds=10,initialSelection,onSelectionConsumed,onContractsLoaded,catalogMode=true}:{onContractsLoaded?:(rows:Row[])=>void;catalogMode?:boolean;preferredFeed?:string;staleAfterSeconds?:number;instruments:Row[];quotes:Row[];onReview:(payload:Row,analysis:Row)=>void;addingTo?:Row|null;onCancelAdd:()=>void;initialSelection?:ChainSelection|null;onSelectionConsumed?:()=>void}){
  const [clock,setClock]=useState(Date.now());
  useEffect(()=>{const timer=setInterval(()=>{if(document.visibilityState==='visible')setClock(Date.now());},1000);return()=>clearInterval(timer);},[]);
  const [importedContracts,setImportedContracts]=useState<Row[]>([]),[importedQuotes,setImportedQuotes]=useState<Row[]>([]);
+ const [selectedQuotes,setSelectedQuotes]=useState<{scope:string;rows:Row[]}>({scope:'',rows:[]}),[quoteProblem,setQuoteProblem]=useState({scope:'',text:''});
+ const [metadata,setMetadata]=useState<Row|null>(null),[loadedContracts,setLoadedContracts]=useState<Row[]>([]),[catalogLoading,setCatalogLoading]=useState(true),[catalogError,setCatalogError]=useState(''),[catalogRefresh,setCatalogRefresh]=useState(0);
+ const reloadCatalog=useRef(0);
+ useEffect(()=>{let cancelled=false;setCatalogLoading(true);setCatalogError('');setMetadata(null);setLoadedContracts([]);api('/api/instruments/catalog').then(value=>{if(!cancelled)setMetadata(value);}).catch(error=>{if(!cancelled){setCatalogError((error as Error).message);setCatalogLoading(false);}});return()=>{cancelled=true;};},[catalogMode,catalogRefresh]);
  const imported=useRef<{nonce:string;underlying:string;expiry:string;pending:boolean}|null>(null),appliedSelection=useRef('');
- const catalogInstruments=useMemo(()=>{const rows=new Map(instruments.map(i=>[`${i.broker}:${i.instrument_id||i.id}`,i]));for(const i of importedContracts){const key=`${i.broker}:${i.instrument_id||i.id}`;if(!rows.has(key))rows.set(key,i);}return [...rows.values()].filter(i=>Boolean(brokers[i.broker]));},[instruments,importedContracts]);
- const quoteRows=useMemo(()=>{const rows=new Map<string,Row>();for(const q of [...importedQuotes,...quotes]){const key=`${q.broker}:${q.instrument_id}`,previous=rows.get(key);if(!previous||Date.parse(q.received_at||q.quote_at||'')>=Date.parse(previous.received_at||previous.quote_at||'')||!previous.received_at)rows.set(key,q);}return [...rows.values()];},[quotes,importedQuotes]);
- const available=useMemo(()=>Array.from(new Set(catalogInstruments.map(i=>i.underlying))),[catalogInstruments]);
+ const catalogInstruments=useMemo(()=>{const rows=new Map([...instruments,...loadedContracts].map(i=>[`${i.broker}:${i.instrument_id||i.id}`,i]));for(const i of importedContracts){const key=`${i.broker}:${i.instrument_id||i.id}`;if(!rows.has(key))rows.set(key,i);}return [...rows.values()].filter(i=>Boolean(brokers[i.broker])&&Boolean(i.demo)===catalogMode);},[instruments,loadedContracts,importedContracts,catalogMode]);
+ const available=useMemo(()=>Array.from(new Set<string>([...(metadata?.underlyings||[]),...catalogInstruments.map(i=>i.underlying)])).sort(),[metadata,catalogInstruments]);
  const [underlying,setUnderlying]=useState('NIFTY'),[exchange,setExchange]=useState('NSE'),[expiry,setExpiry]=useState(''),[legs,setLegs]=useState<Leg[]>([]),[name,setName]=useState('Bull Call Spread'),[selectedBrokers,setSelectedBrokers]=useState<string[]>(['kotak']),[category,setCategory]=useState('Bullish'),[tab,setTab]=useState('Payoff graph'),[orderType,setOrderType]=useState('MARKET'),[advanced,setAdvanced]=useState(false);
- const exchanges=useMemo(()=>Array.from(new Set(catalogInstruments.filter(i=>i.underlying===underlying).map(i=>i.exchange))).sort(),[catalogInstruments,underlying]);
+ const exchanges=useMemo(()=>Array.from(new Set<string>([...(metadata?.groups||[]).filter((g:Row)=>g.underlying===underlying).map((g:Row)=>g.exchange),...catalogInstruments.filter(i=>i.underlying===underlying).map(i=>i.exchange)])).sort(),[metadata,catalogInstruments,underlying]);
  const ownContracts=useMemo(()=>catalogInstruments.filter(i=>i.underlying===underlying&&i.exchange===exchange),[catalogInstruments,underlying,exchange]);
- const expiries=useMemo(()=>Array.from(new Set(ownContracts.map(i=>i.expiry))).sort(),[ownContracts]);
+ function matchingContract(leg:Leg,broker:string){const matches=(i:Row)=>i.expiry===leg.expiry&&Number(i.strike)===leg.strike&&i.option_type===leg.option_type;return (leg.instrument_id?ownContracts.find(i=>(i.instrument_id||i.id)===leg.instrument_id&&i.broker===broker&&matches(i)):undefined)||ownContracts.find(i=>matches(i)&&i.broker===broker);}
+ const quoteSelection=useMemo(()=>{const selected=new Map<string,{broker:string;instrument_id:string}>();for(const leg of legs.filter(l=>l.enabled))for(const broker of selectedBrokers){const row=matchingContract(leg,broker);if(row&&row.demo===false){const instrument_id=row.instrument_id||row.id;selected.set(`${broker}:${instrument_id}`,{broker,instrument_id});}}return [...selected.values()].sort((a,b)=>`${a.broker}:${a.instrument_id}`.localeCompare(`${b.broker}:${b.instrument_id}`));},[ownContracts,legs,selectedBrokers]);
+ const quoteSelectionKey=JSON.stringify(quoteSelection),quoteScope=`${catalogMode?'sample':'live'}:${underlying}:${exchange}:${quoteSelectionKey}`;
+ useEffect(()=>{
+  setSelectedQuotes({scope:quoteScope,rows:[]});setQuoteProblem({scope:quoteScope,text:''});
+  if(catalogMode||!quoteSelection.length)return;
+  let cancelled=false,busy=false;const controller=new AbortController();
+  async function poll(){
+   if(cancelled||busy||document.visibilityState!=='visible')return;
+   busy=true;
+   try{const result=await api('/api/quotes/selection',{method:'POST',body:JSON.stringify({instruments:quoteSelection}),signal:controller.signal});if(!cancelled){setSelectedQuotes({scope:quoteScope,rows:result.quotes||[]});setQuoteProblem({scope:quoteScope,text:''});}}
+   catch(error){if(!cancelled){setSelectedQuotes({scope:quoteScope,rows:[]});setQuoteProblem({scope:quoteScope,text:(error as Error).message});}}
+   finally{busy=false;}
+  }
+  void poll();const timer=setInterval(()=>void poll(),5000),visible=()=>{if(document.visibilityState==='visible')void poll();};
+  document.addEventListener('visibilitychange',visible);
+  return()=>{cancelled=true;controller.abort();clearInterval(timer);document.removeEventListener('visibilitychange',visible);};
+ },[catalogMode,quoteScope,quoteSelectionKey]);
+ // Live selections are authoritative, including an empty/missing response.
+ // Old chain imports and the dashboard's bounded latest-quote list cannot keep
+ // a missing broker quote visible or satisfy a different account's paper fill.
+ const quoteRows=useMemo(()=>{
+  if(!catalogMode)return selectedQuotes.scope===quoteScope?selectedQuotes.rows:[];
+  const rows=new Map<string,Row>();for(const q of [...importedQuotes,...quotes].filter(q=>q.demo!==false)){const key=`${q.broker}:${q.instrument_id}`,previous=rows.get(key);if(!previous||Date.parse(q.received_at||q.quote_at||'')>=Date.parse(previous.received_at||previous.quote_at||'')||!previous.received_at)rows.set(key,q);}return [...rows.values()];
+ },[catalogMode,selectedQuotes,quoteScope,quotes,importedQuotes]);
+ const quoteError=quoteProblem.scope===quoteScope?quoteProblem.text:'';
+
+ const expiries=useMemo(()=>Array.from(new Set<string>([...(metadata?.groups||[]).filter((g:Row)=>g.underlying===underlying&&g.exchange===exchange).flatMap((g:Row)=>g.expiries),...ownContracts.map(i=>i.expiry)])).sort(),[metadata,ownContracts,underlying,exchange]);
+ const requestedExpiries=[...new Set([expiry,...legs.map(l=>l.expiry)])].filter(value=>value&&expiries.includes(value)).sort().join(',');
+ useEffect(()=>{
+  if(!metadata)return;
+  if(!requestedExpiries){setCatalogLoading(false);return;}
+  const controller=new AbortController(),request=++reloadCatalog.current;let cancelled=false;
+  setCatalogLoading(true);setCatalogError('');
+  async function load(){
+   const rows:Row[]=[];
+   // Fetch every selected leg expiry, including calendars and imported baskets.
+   // Each response is bounded; complete broker copies retain their own IDs.
+   for(const selectedExpiry of requestedExpiries.split(',')){
+    let offset:number|null=0;
+    while(offset!==null){
+     const params=new URLSearchParams({underlying,exchange,expiry:selectedExpiry,limit:'2000',offset:String(offset)});
+     const result:Row=await api(`/api/instruments?${params}`,{signal:controller.signal});
+     rows.push(...result.instruments);offset=result.next_offset??null;
+    }
+   }
+   if(cancelled||request!==reloadCatalog.current)return;
+   setLoadedContracts(rows);
+   const merged=new Map<string,Row>();for(const row of [...importedContracts,...rows])if(Boolean(row.demo)===catalogMode)merged.set(`${row.broker}:${row.instrument_id||row.id}`,row);
+   onContractsLoaded?.([...merged.values()]);setCatalogLoading(false);
+  }
+  load().catch(error=>{if(!cancelled){setCatalogError((error as Error).message);setCatalogLoading(false);}});
+  return()=>{cancelled=true;controller.abort();};
+ },[metadata,underlying,exchange,requestedExpiries,catalogMode,onContractsLoaded]);
+ // A newly selected leg expiry is loaded before choosing its nearest valid strike.
+ useEffect(()=>{if(catalogLoading)return;setLegs(previous=>previous.map(leg=>{const valid=ownContracts.filter(c=>c.expiry===leg.expiry&&c.option_type===leg.option_type&&c.broker===selectedBrokers[0]).map(c=>Number(c.strike));if(!valid.length||valid.includes(leg.strike))return leg;const nearest=valid.reduce((a,b)=>Math.abs(b-(leg.strike||atm))<Math.abs(a-(leg.strike||atm))?b:a);return {...leg,strike:nearest,instrument_id:undefined};}));},[loadedContracts,catalogLoading,selectedBrokers.join(',')]);
  const strikes=useMemo(()=>Array.from(new Set(ownContracts.filter(i=>i.expiry===expiry&&i.option_type!=='FUT').map(i=>Number(i.strike)))).sort((a,b)=>a-b),[ownContracts,expiry]);
  const referenceContract=ownContracts.find(c=>c.broker===selectedBrokers[0]);
  const futureReference=ownContracts.find(c=>c.broker===selectedBrokers[0]&&c.option_type==='FUT');
@@ -34,7 +92,7 @@ export default function Builder({instruments,quotes,onReview,addingTo,onCancelAd
  const spotKnown=Boolean(referenceContract?.spot);
  const atm=strikes.length?strikes.reduce((a,b)=>Math.abs(b-spot)<Math.abs(a-spot)?b:a,strikes[0]):0;
  const demo=ownContracts.some(i=>i.demo);
- function contract(leg:Leg){const matches=(i:Row)=>i.expiry===leg.expiry&&Number(i.strike)===leg.strike&&i.option_type===leg.option_type;return (leg.instrument_id?ownContracts.find(i=>(i.instrument_id||i.id)===leg.instrument_id&&i.broker===selectedBrokers[0]&&matches(i)):undefined)||ownContracts.find(i=>matches(i)&&i.broker===selectedBrokers[0]);}
+ function contract(leg:Leg){return matchingContract(leg,selectedBrokers[0]);}
  function quoteFor(leg:Leg){return findOwnQuote(quoteRows,contract(leg),selectedBrokers[0]);}
  function price(leg:Leg){const c=contract(leg),quote=quoteFor(leg),sample=c?.demo?Number(c.base_price||0):0;return orderType==='LIMIT'?leg.price||Number(quote?.ltp||sample):Number(quote?.ltp||sample);}
  function loadTemplate(template:Template){imported.current=null;const a=strikes.indexOf(atm);setName(template.name);setLegs((addingTo?template.legs.slice(0,1):template.legs).map(([side,type,offset])=>({key:uid(),enabled:true,side:side as Leg['side'],option_type:type as Leg['option_type'],expiry,strike:type==='FUT'?0:strikes[Math.max(0,Math.min(strikes.length-1,a+offset))]||atm,lots:1,price:0})));}
@@ -48,15 +106,16 @@ export default function Builder({instruments,quotes,onReview,addingTo,onCancelAd
  const active=legs.filter(l=>l.enabled&&contract(l));
  const invalid=legs.filter(l=>l.enabled&&!contract(l));
  const waiting=active.filter(l=>{if(demo)return false;const quote=quoteFor(l),received=Date.parse(quote?.received_at||quote?.quote_at||'');return !quote||quote.stale||!Number.isFinite(received)||clock-received>staleAfterSeconds*1000||!(price(l)>0);});
+ const accountsWaiting=!demo&&legs.filter(l=>l.enabled).some(leg=>selectedBrokers.some(broker=>{const row=matchingContract(leg,broker),quote=findOwnQuote(quoteRows,row,broker),received=Date.parse(quote?.received_at||'');return !row||!quote||quote.stale||!Number.isFinite(received)||clock-received>staleAfterSeconds*1000||!(Number(quote.ltp)>0);}));
  const unknownMultiplier=active.some(l=>contract(l)?.exchange==='MCX'&&!contract(l)?.price_multiplier);
  const canValue=active.length>0&&!invalid.length&&!waiting.length&&!unknownMultiplier;
- const canReview=canValue&&selectedBrokers.length>0&&Boolean(name.trim());
+ const canReview=canValue&&!catalogLoading&&!catalogError&&!quoteError&&!accountsWaiting&&selectedBrokers.length>0&&Boolean(name.trim());
  const riskLegs:Row[]=[...(addingTo?.legs||[]).filter((l:Row)=>l.open_lots>0),...active.map(l=>({...contract(l),...l,entry_price:price(l),open_lots:l.lots}))];
  const units=monetaryUnits;
  const preview=previewRisk(riskLegs,spot),premium=preview.netPremium;
  const payout=(settlement:number)=>payoffAt(riskLegs,settlement);
  const sameExpiry=preview.supported;
- const warning=invalid.length?'Choose a valid contract for every enabled leg.':unknownMultiplier?'Import a verified MCX monetary price multiplier before simulating this contract.':waiting.length?'Waiting for fresh quotes from this account’s broker. No other broker’s prices are substituted.':!sameExpiry?'Combined expiry payoff requires the same exchange, underlying and expiry. The strategy can still be recorded.':'';
+ const warning=catalogError?`Contract loading failed: ${catalogError}`:catalogLoading?'Loading selected contracts…':quoteError?`Market quotes unavailable: ${quoteError}`:invalid.length?'Choose a valid contract for every enabled leg.':unknownMultiplier?'Import a verified MCX monetary price multiplier before simulating this contract.':waiting.length?'Waiting for fresh quotes from this account’s broker. No other broker’s prices are substituted.':accountsWaiting?'Waiting for fresh quotes from every selected paper account.':!sameExpiry?'Combined expiry payoff requires the same exchange, underlying and expiry. The strategy can still be recorded.':'';
  const maxProfit=preview.maxProfit,maxLoss=preview.maxLoss,breakevens=preview.breakevens;
  const width=Math.max(spot*.04,(strikes[1]-strikes[0]||50)*8),graph=Array.from({length:121},(_,i)=>({x:Math.max(0,spot-width)+i*(width*2)/120,y:payout(Math.max(0,spot-width)+i*width*2/120)}));
  const analysis={net_premium:premium,max_profit:maxProfit,max_loss:maxLoss,breakevens,supported:canValue&&sameExpiry,estimated_margin:preview.estimatedMargin,hedge_benefit:preview.hedgeBenefit,demo};
@@ -64,7 +123,8 @@ export default function Builder({instruments,quotes,onReview,addingTo,onCancelAd
  return <div className="builder-page">
   {addingTo&&<div className="banner"><Layers size={16}/>Adding a leg to {addingTo.name} · {brokers[addingTo.broker]}<button className="text-btn" onClick={onCancelAdd}>Cancel</button></div>}
   <div className="builder-toolbar"><div className="underlying-select"><span className="instrument-icon">{underlying.slice(0,1)}</span><select aria-label="Exchange" disabled={Boolean(addingTo)} value={exchange} onChange={e=>setExchange(e.target.value)}>{exchanges.map(ex=><option key={ex}>{ex}</option>)}</select><select aria-label="Underlying" disabled={Boolean(addingTo)} value={underlying} onChange={e=>setUnderlying(e.target.value)}>{available.map(u=><option key={u}>{u}</option>)}</select><span className="muted" title={spotKnown?'Sample underlying reference':'Median imported strike, not a live underlying quote'}>{num(spot)}{!spotKnown&&<small> strike reference</small>}</span></div><div className="toolbar-right"><Badge tone="amber">{demo?'Sample contracts':'Instrument master'}</Badge><span className="muted">Options & futures workspace</span></div></div>
-  {!catalogInstruments.length?<Panel title="Your contract catalog is empty"><div className="empty"><h3>Import an instrument master</h3><p>Connect a broker and import current contracts, or enable sample mode in Settings to explore the app.</p></div></Panel>:<>
+  {catalogError&&<Help>{catalogError} <button className="text-btn" onClick={()=>setCatalogRefresh(value=>value+1)}>Retry contract loading</button></Help>}
+  {!catalogInstruments.length?<Panel title="Your contract catalog is empty"><div className="empty"><h3>{catalogLoading?'Loading selected contracts…':'No contracts loaded'}</h3><p>{catalogError||'Choose an underlying to load its contracts. If the catalog is empty, connect a broker and refresh contracts, or enable sample mode in Settings.'}</p></div></Panel>:<>
   <div className="builder-grid">
    <section className="panel leg-panel"><div className="panel-head"><div><span className="eyebrow">STRATEGY BUILDER</span><input className="strategy-name" aria-label="Strategy name" value={name} maxLength={100} onChange={e=>setName(e.target.value)}/></div><button className="icon-btn" title="Reset legs to selected template" onClick={()=>loadTemplate(templates.find(t=>t.name===name)||templates[1])}><RotateCcw size={17}/></button></div>
     <div className="leg-toolbar"><span><Check size={14}/>{active.length} selected legs</span><select aria-label="Entry order type" value={orderType} onChange={e=>setOrderType(e.target.value)}><option value="MARKET">Market simulation</option><option value="LIMIT">Limit simulation</option></select></div>

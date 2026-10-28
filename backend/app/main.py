@@ -9,12 +9,15 @@ import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from threading import Lock
+from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select, delete
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 from .database import (Base, engine as db_engine, SessionLocal, get_db, iso_now,
                        is_database_unavailable, is_sqlite_contention,
                        run_transaction, sqlite_error_code)
@@ -39,6 +42,9 @@ feed_manager=None
 feed_status={}
 catalog=None
 _feed_contract_ids=None
+_feed_refresh_lock=asyncio.Lock()
+_quote_selection_lock=Lock()
+_quote_selection_requests={}
 database_ready=True
 DATABASE_RETRY_SECONDS=60
 collector_lease=None
@@ -48,7 +54,6 @@ resource_monitor=None
 daily_service=None
 sheets_service=None
 storage_archiver=None
-fivepaisa_auth=None
 kotak_setup=None
 _active_positions=[]
 _activity_until=0.0
@@ -64,7 +69,7 @@ def touch_activity():
 
 def update_demand(db):
     global _active_positions,_runtime_settings
-    _active_positions=[t for t in engine.trade_records(db) if t['status'] in ('open','pending')]
+    _active_positions=[t for t in engine.trade_records(db) if t['status'] in ('open','pending') and t.get('broker') in engine.BROKERS]
     _runtime_settings=engine.get_settings(db)
 
 def recording_needed():
@@ -102,27 +107,45 @@ async def wait_for_shutdown(seconds):
     try:await asyncio.wait_for(stop_event.wait(),timeout=seconds)
     except asyncio.TimeoutError:pass
 
+def requested_quote_selection_ids():
+    now=time.monotonic()
+    with _quote_selection_lock:
+        for key in list(_quote_selection_requests):
+            if _quote_selection_requests[key][0]<=now:_quote_selection_requests.pop(key,None)
+        return set().union(*(row[1] for row in _quote_selection_requests.values())) if _quote_selection_requests else set()
+
+
 def selected_feed_contracts(db):
     wanted={s.strip() for s in os.getenv('FEED_INSTRUMENT_IDS','').split(',') if s.strip()}
     wanted.update(option_chain.requested_contract_ids())
+    wanted.update(requested_quote_selection_ids())
     for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
         if row.data.get('demo') is False:
             wanted.update(l['instrument_id'] for l in row.data.get('legs',[]) if l.get('status') in {'open','pending'})
-    return [c for c in catalog.all(demo=False) if c['id'] in wanted and c.get('broker') in engine.BROKERS]
+    return catalog.select_live(wanted,engine.BROKERS)
 
 async def refresh_selected_feeds(db,force=False):
     global _feed_contract_ids
     if feed_manager is None:return
-    if collector_lease and collector_lease.token is None:return
-    contracts=await asyncio.to_thread(selected_feed_contracts,db)
-    if exchange_calendar:
-        now=datetime.now(timezone.utc)
-        contracts=[c for c in contracts if exchange_calendar.state(c,now)['open']]
-    identities=frozenset((c['id'],c['broker']) for c in contracts)
-    if force or identities!=_feed_contract_ids:
-        await feed_manager.stop()
-        await feed_manager.start(contracts)
-        _feed_contract_ids=identities
+    # Every caller commits its paper mutation before reconfiguring sockets.
+    # Release any subsequent read snapshot before waiting for another refresh:
+    # rollback-journal commits must never wait for a socket-owning reader.
+    await asyncio.to_thread(option_chain.finish_read_transaction,db)
+    binding=db.get_bind()
+    def selected():
+        with Session(binding,expire_on_commit=False) as reader:
+            return selected_feed_contracts(reader)
+    async with _feed_refresh_lock:
+        if collector_lease and collector_lease.token is None:return
+        contracts=await asyncio.to_thread(selected)
+        if exchange_calendar:
+            now=datetime.now(timezone.utc)
+            contracts=[c for c in contracts if exchange_calendar.state(c,now)['open']]
+        identities=frozenset((c['id'],c['broker']) for c in contracts)
+        if force or identities!=_feed_contract_ids:
+            await feed_manager.stop()
+            await feed_manager.start(contracts)
+            _feed_contract_ids=identities
 
 def demo_quote(contract,broker,now=None):
     now=now or time.time();base=float(contract.get('base_price') or 100)
@@ -159,7 +182,7 @@ def seed_demo(db):
     underlyings=list(dict.fromkeys(c['underlying'] for c in all_contracts))
     nifty=next((u for u in underlyings if u.upper().replace(' ','') in ('NIFTY','NIFTY50')),underlyings[0] if underlyings else None)
     gold=next((u for u in underlyings if 'GOLD' in u.upper()),nifty)
-    configurations=[('NIFTY bull call spread',nifty,'kotak','spread'),('NIFTY iron condor',nifty,'kotak','condor'),('Gold protective spread',gold,'fivepaisa','spread'),('Completed practice trade',nifty,'fivepaisa','closed')]
+    configurations=[('NIFTY bull call spread',nifty,'kotak','spread'),('NIFTY iron condor',nifty,'kotak','condor'),('Gold protective spread',gold,'kotak','spread'),('Completed practice trade',nifty,'kotak','closed')]
     for index,(name,underlying,broker,kind) in enumerate(configurations):
         calls=contracts(underlying,broker,'CE');puts=contracts(underlying,broker,'PE')
         if len(calls)<4:continue
@@ -298,7 +321,6 @@ def initialize_database():
     maintenance.migrate(db_engine)
     # Restore encrypted broker settings before collectors start. No network calls.
     kotak_setup.restore()
-    fivepaisa_auth.restore()
     with SessionLocal() as db:
         if not db.get(SchemaVersion,1):db.add(SchemaVersion(version=1));db.commit()
         persisted_trades=[row.data for row in db.scalars(select(Trade))]
@@ -344,13 +366,13 @@ async def database_services(reporting_loop):
 
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,fivepaisa_auth,kotak_setup
+    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,kotak_setup,_feed_refresh_lock
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
     from .brokers import FeedManager
-    stop_event=asyncio.Event();database_ready=False;_viewers=0;_activity_until=0;_started_at=time.monotonic()
-    fivepaisa_auth=broker_auth.FivepaisaAuthService(session_factory=SessionLocal)
+    stop_event=asyncio.Event();_feed_refresh_lock=asyncio.Lock();database_ready=False;_viewers=0;_activity_until=0;_started_at=time.monotonic()
+    with _quote_selection_lock:_quote_selection_requests.clear()
     kotak_setup=broker_setup.KotakSetupService(factory=SessionLocal)
     catalog=ContractCatalog();engine.set_catalog(catalog)
     exchange_calendar=ExchangeCalendar();collector_lease=CollectorLease(SessionLocal)
@@ -596,10 +618,56 @@ def recent_events(limit:int=20,db=Depends(get_db)):
     limit=max(1,min(200,limit))
     return [{'id':e.id,'trade_id':e.trade_id,'kind':e.kind,'timestamp':e.timestamp,**e.data} for e in db.scalars(select(Event).order_by(Event.id.desc()).limit(limit))]
 
+# Reuse immutable catalog rows by reference. Copying the entire 100k+ contract
+# universe for each phone refresh previously consumed substantial CPU and RAM.
+# Only selected pages are serialized; metadata contains no complete contracts.
+from threading import Lock as _CatalogLock
+_catalog_view_lock=_CatalogLock()
+_catalog_view_cache={}
+
+def _catalog_day():
+    return datetime.now(timezone(timedelta(hours=5,minutes=30))).date().isoformat()
+
+def _catalog_view(demo):
+    global _catalog_view_cache
+    rows=catalog._demo if demo else catalog._live
+    day=_catalog_day()
+    key=(id(catalog),catalog.revision,id(rows),len(rows),bool(demo),day)
+    with _catalog_view_lock:
+        if _catalog_view_cache.get('key')==key:return _catalog_view_cache
+        grouped={};selected=[]
+        for row in rows:
+            if row['expiry']<day or row.get('broker') not in engine.BROKERS:continue
+            selected.append(row)
+            group_key=(row['underlying'],row['exchange'])
+            group=grouped.setdefault(group_key,{'underlying':row['underlying'],'exchange':row['exchange'],'expiries':set(),'brokers':set(),'contracts':0})
+            group['expiries'].add(row['expiry']);group['brokers'].add(row['broker']);group['contracts']+=1
+        groups=[{**g,'expiries':sorted(g['expiries']),'brokers':sorted(g['brokers'])} for _,g in sorted(grouped.items())]
+        metadata={'revision':catalog.revision,'trading_date':day,'total':len(selected),'groups':groups,
+                  'underlyings':sorted({g['underlying'] for g in groups}),'demo':bool(demo),
+                  'source':'Synthetic practice catalog — not exchange-valid contracts' if demo else 'Imported broker instrument master'}
+        # One cache only: switching mode/reloading never retains a second master.
+        _catalog_view_cache={'key':key,'rows':selected,'metadata':metadata}
+        return _catalog_view_cache
+
+@app.get('/api/instruments/catalog',dependencies=[Depends(require_session)])
+def instrument_catalog(db=Depends(get_db)):
+    return _catalog_view(engine.get_settings(db)['demo_mode'])['metadata']
+
 @app.get('/api/instruments',dependencies=[Depends(require_session)])
-def instruments(underlying:str|None=None,broker:str|None=None,db=Depends(get_db)):
-    demo=engine.get_settings(db)['demo_mode'];items=catalog.list_contracts(underlying=underlying,broker=broker,demo=demo)
-    return {'instruments':items,'underlyings':sorted({i['underlying'] for i in catalog.all(demo=demo)}),'demo':demo,'source':'Synthetic practice catalog â€” not exchange-valid contracts' if demo else 'Imported broker instrument master'}
+def instruments(underlying:str|None=None,broker:str|None=None,exchange:str|None=None,expiry:str|None=None,
+                limit:int=Query(2000,ge=1,le=2000),offset:int=Query(0,ge=0),db=Depends(get_db)):
+    demo=engine.get_settings(db)['demo_mode'];view=_catalog_view(demo)
+    items=[row for row in view['rows'] if (not underlying or row['underlying']==underlying)
+           and (not broker or row['broker']==broker) and (not exchange or row['exchange']==exchange)
+           and (not expiry or row['expiry']==expiry)]
+    total=len(items);end=min(total,offset+limit)
+    return {'instruments':items[offset:end],'underlyings':view['metadata']['underlyings'],'demo':demo,
+            'source':view['metadata']['source'],'revision':view['metadata']['revision'],
+            'total':total,'offset':offset,'limit':limit,'truncated':offset>0 or end<total,
+            'next_offset':end if end<total else None,
+            'selection_required':not underlying and total>limit,
+            'catalog_url':'/api/instruments/catalog'}
 
 @app.post('/api/instruments/reload',dependencies=[Depends(require_session)])
 async def reload_instruments():
@@ -609,6 +677,69 @@ async def reload_instruments():
         catalog.restore_live_contracts(active)
         await refresh_selected_feeds(db,force=True)
     return {'ok':True,'live_contracts':len(catalog.all(demo=False))}
+
+class QuoteSelectionItem(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    broker:Literal['kotak']
+    instrument_id:str=Field(min_length=1,max_length=180)
+
+
+class QuoteSelectionInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    instruments:list[QuoteSelectionItem]=Field(default_factory=list,max_length=40)
+
+
+def resolve_quote_selection(db,items):
+    settings=engine.get_settings(db)
+    option_chain.finish_read_transaction(db)
+    if settings['demo_mode']:
+        raise HTTPException(409,'Choose market-data mode before requesting broker quotes.')
+    today=datetime.now(timezone(timedelta(hours=5,minutes=30))).date().isoformat()
+    selected={}
+    for item in items:
+        row=catalog.find(item.instrument_id,item.broker) if catalog else None
+        if not row or row.get('demo') is not False or row['broker']!=item.broker or row['expiry']<today:
+            raise HTTPException(422,'Select current contracts from each selected broker instrument master.')
+        selected[(item.broker,item.instrument_id)]=row
+    return list(selected.values()),settings['stale_after_seconds']
+
+
+def read_selected_quotes(db,contracts,stale_after):
+    result=[]
+    public_fields=('broker','instrument_id','underlying','exchange','segment','symbol','expiry','strike','option_type',
+                   'ltp','bid','ask','received_at','exchange_timestamp','open_interest','volume','previous_close','source','demo')
+    for contract in contracts:
+        identifier=contract.get('instrument_id',contract['id']);broker=contract['broker']
+        quote=engine.latest_quote(db,identifier,broker)
+        if not quote or quote.get('demo') is not False or quote.get('broker')!=broker or quote.get('instrument_id')!=identifier:continue
+        if any(quote.get(key) is not None and quote[key]!=contract.get(key) for key in ('exchange','segment')):continue
+        public={key:quote.get(key) for key in public_fields}
+        age=engine.age_seconds(quote.get('received_at'))
+        public.update(quote_age_seconds=age,stale=age is None or age>stale_after)
+        result.append(public)
+    option_chain.finish_read_transaction(db)
+    return result
+
+
+@app.post('/api/quotes/selection')
+async def select_quotes(payload:QuoteSelectionInput,request:Request,current=Depends(require_session),db=Depends(get_db)):
+    rate_limit(request,'quote-selection',limit=120,seconds=60)
+    contracts,stale_after=await asyncio.to_thread(resolve_quote_selection,db,payload.instruments)
+    owner=current.token_hash
+    with _quote_selection_lock:
+        if contracts:
+            # Short-lived views are bounded separately from durable positions.
+            # An idle tab cannot retain subscriptions after its TTL expires.
+            if owner not in _quote_selection_requests and len(_quote_selection_requests)>=8:
+                oldest=min(_quote_selection_requests,key=lambda key:_quote_selection_requests[key][0])
+                _quote_selection_requests.pop(oldest,None)
+            _quote_selection_requests[owner]=(time.monotonic()+30,{row['id'] for row in contracts})
+        else:_quote_selection_requests.pop(owner,None)
+    touch_activity()
+    await refresh_selected_feeds(db)
+    quotes=await asyncio.to_thread(read_selected_quotes,db,contracts,stale_after)
+    return {'quotes':quotes,'requested':len(contracts),'subscription_ttl_seconds':30,'mode':'PAPER'}
+
 
 @app.get('/api/brokers',dependencies=[Depends(require_session)])
 def brokers(db=Depends(get_db)):return engine.dashboard(db,feed_manager.statuses() if feed_manager else {})['brokers']
@@ -640,52 +771,6 @@ async def save_kotak_setup(payload:KotakCredentialInput,request:Request):
     _feed_contract_ids=None
     touch_activity()
     return result
-
-@app.get('/api/brokers/fivepaisa/auth/status',dependencies=[Depends(require_session)])
-def fivepaisa_auth_status(db=Depends(get_db)):
-    return fivepaisa_auth.status(db)
-
-@app.post('/api/brokers/fivepaisa/auth/begin')
-async def begin_fivepaisa_auth(request:Request,current=Depends(require_session),db=Depends(get_db)):
-    rate_limit(request,'broker-login',limit=6)
-    session_hash=current.token_hash
-    db.rollback()
-    try:
-        state=await asyncio.to_thread(fivepaisa_auth.begin,session_hash)
-    except broker_auth.BrokerAuthError as error:
-        raise HTTPException(409,str(error)) from None
-    # VendorKey goes only in the subsequent server redirect to the official broker.
-    from urllib.parse import urlencode
-    return {'url':'/api/brokers/fivepaisa/authorize?'+urlencode({'state':state})}
-
-@app.get('/api/brokers/fivepaisa/authorize')
-async def authorize_fivepaisa(state:str=Query(min_length=16,max_length=250),current=Depends(require_session),db=Depends(get_db)):
-    session_hash=current.token_hash
-    db.rollback()
-    try:url=await asyncio.to_thread(fivepaisa_auth.authorization_url,state,session_hash)
-    except broker_auth.BrokerAuthError as error:
-        raise HTTPException(409,str(error)) from None
-    return RedirectResponse(url,status_code=303)
-
-@app.get('/api/brokers/fivepaisa/callback')
-async def callback_fivepaisa(request:Request,current=Depends(require_session),db=Depends(get_db)):
-    query=request.query_params
-    state=query.get('state') or query.get('State') or ''
-    token=query.get('RequestToken') or ''
-    if not 16<=len(state)<=250 or not 1<=len(token)<=8192:
-        return RedirectResponse('/?broker=fivepaisa_failed',status_code=303)
-    session_hash=current.token_hash
-    db.rollback()
-    try:
-        # State consumption, HTTPS exchange and encrypted save use separate short
-        # transactions. A slow broker must not stop one-second paper recording.
-        await asyncio.to_thread(fivepaisa_auth.complete,token,state,session_hash)
-    except broker_auth.BrokerAuthError:
-        return RedirectResponse('/?broker=fivepaisa_failed',status_code=303)
-    global _feed_contract_ids
-    _feed_contract_ids=None
-    touch_activity()
-    return RedirectResponse('/?broker=fivepaisa_connected',status_code=303)
 
 @app.get('/api/settings',dependencies=[Depends(require_session)])
 def settings(db=Depends(get_db)):return engine.get_settings(db)

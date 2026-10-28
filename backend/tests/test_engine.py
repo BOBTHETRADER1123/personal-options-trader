@@ -67,11 +67,11 @@ def test_add_lots_weighted_average_and_partial_exit(db):
     assert result['realized_pnl']==pytest.approx(1166.67,abs=.01)
     assert result['unrealized_pnl']==pytest.approx(2333.33,abs=.01)
 
-def test_idempotent_multibroker_and_key_mismatch(db):
-    key='multi-broker-001';first=enter(db,brokers=['kotak','fivepaisa'],key=key)
-    second=enter(db,brokers=['kotak','fivepaisa'],key=key)
+def test_idempotent_kotak_trade_and_key_mismatch(db):
+    key='kotak-only-001';first=enter(db,brokers=['kotak'],key=key)
+    second=enter(db,brokers=['kotak'],key=key)
     assert first['action_id']==second['action_id']
-    assert db.scalar(select(func.count()).select_from(Trade))==2
+    assert db.scalar(select(func.count()).select_from(Trade))==1
     with pytest.raises(HTTPException):enter(db,lots=1,key=key)
 
 def test_limit_waits_then_fills_at_limit_or_better(db):
@@ -540,15 +540,18 @@ def test_removed_broker_history_remains_readable_but_new_trade_schema_rejects_it
                    legs=[{'instrument_id':c['id'],'side':'BUY','lots':1}],idempotency_key='legacy-broker-guard',confirmed=True)
 
 
-def test_two_broker_paper_strategy_uses_each_actual_quote(db):
-    c=contract('kotak');other=contract('fivepaisa')
-    quote(db,c,100,'kotak');quote(db,other,123,'fivepaisa')
-    result=engine.create_trades(db,{'name':'Independent comparison','underlying':'NIFTY','brokers':['kotak','fivepaisa'],
+def test_kotak_quote_executes_while_retired_broker_cannot_create_a_copy(db):
+    c=contract('kotak')
+    quote(db,c,100,'kotak')
+    with pytest.raises(ValueError):quote(db,c,123,'fivepaisa')
+    result=engine.create_trades(db,{'name':'Active broker boundary','underlying':'NIFTY','brokers':['kotak','fivepaisa'],
         'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1,'order_type':'MARKET','enabled':True}],
-        'idempotency_key':'independent-feed-comparison','confirmed':True})
+        'idempotency_key':'kotak-retired-boundary','confirmed':True})
     db.commit()
-    entries={t['broker']:t['legs'][0]['entry_price'] for t in result['trades']}
-    assert entries=={'kotak':100,'fivepaisa':123}
+    assert {t['broker']:t['legs'][0]['entry_price'] for t in result['trades']}=={'kotak':100}
+    retired=next(item for item in result['results'] if item['broker']=='fivepaisa')
+    assert retired['success'] is False and 'Kotak Neo only' in retired['error']
+    assert db.scalar(select(func.count()).select_from(Trade))==1
 
 
 def test_expired_option_owner_settlement_can_close_at_zero_intrinsic(db):

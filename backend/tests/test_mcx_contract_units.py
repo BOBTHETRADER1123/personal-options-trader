@@ -73,20 +73,21 @@ def test_explicit_normalized_operator_override_keeps_intent_and_provenance():
         normalize_row('fivepaisa', five(price_multiplier='0'))
 
 
-def test_old_unverified_cached_mcx_stays_visible_but_cannot_reuse_squared_factor(tmp_path):
-    old = normalize_row('fivepaisa', five())
-    old.pop('monetary_conversion_source')
-    old.update(price_multiplier=1250, multiplier_verified=True)
-    original_trade_leg = dict(old)
-    verified = normalize_row('kotak', kotak())
-    equity = {**normalize_row('fivepaisa', five()), 'id':'equity', 'exchange':'NSE', 'price_multiplier':1}
-    path = tmp_path / 'public-master.json'
-    path.write_text(json.dumps({'instruments':[old, verified, equity]}))
-    catalog = ContractCatalog(path)
-    assert catalog.error is None and len(catalog._live) == 3
-    cached = next(row for row in catalog._live if row['id'] == old['id'])
+def test_old_unverified_kotak_factor_is_blocked_and_retired_cache_is_omitted(tmp_path):
+    old=normalize_row('kotak',kotak('NATURALGAS',1250,'mmBtu'))
+    old.pop('monetary_conversion_source');old.update(price_multiplier=1250,multiplier_verified=True)
+    original_trade_leg=dict(old)
+    verified=normalize_row('kotak',kotak(pSymbol='456'))
+    equity={**verified,'id':'equity','instrument_id':'equity','exchange':'NSE','price_multiplier':1}
+    retired=normalize_row('fivepaisa',five())
+    path=tmp_path/'public-master.json'
+    path.write_text(json.dumps({'instruments':[old,verified,equity,retired]}))
+    before=path.read_bytes();catalog=ContractCatalog(path)
+    assert catalog.error is None and len(catalog._live)==3
+    cached=catalog.find(old['id'],'kotak')
     assert cached['price_multiplier'] is None and cached['multiplier_verified'] is False
     assert cached['requires_master_refresh'] is True
-    assert next(row for row in catalog._live if row['broker'] == 'kotak')['price_multiplier'] == 1
-    assert next(row for row in catalog._live if row['id'] == 'equity')['price_multiplier'] == 1
-    assert original_trade_leg['price_multiplier'] == 1250  # No trade-history rewrite.
+    assert catalog.find(verified['id'],'kotak')['price_multiplier']==1
+    assert catalog.find('equity','kotak')['price_multiplier']==1
+    assert catalog.find(retired['id']) is None
+    assert path.read_bytes()==before and original_trade_leg['price_multiplier']==1250

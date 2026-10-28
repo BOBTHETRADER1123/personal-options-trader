@@ -20,8 +20,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-BROKERS = ("kotak", "fivepaisa")
-LEGACY_BROKERS = ("dhan",)
+BROKERS = ("kotak",)
+LEGACY_BROKERS = ("dhan", "fivepaisa")
+# Offline decoding remains available for preserved historical imports only.
+PARSABLE_BROKERS = ("kotak", "fivepaisa")
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_PATH = Path(__file__).resolve().parents[1] / "data" / "instruments.json"
 FIVEPAISA_MASTER_URL = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/all"
@@ -158,7 +160,7 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     Kotak changed its CSV schema; transformed-v1 fields are supported. A schema
     change fails validation rather than inventing missing tokens or lot sizes.
     """
-    if broker not in BROKERS:
+    if broker not in PARSABLE_BROKERS:
         raise ValueError("Unknown broker")
     row = {str(key).strip().rstrip(";"): value for key, value in row.items()}
     if broker == "fivepaisa":
@@ -428,11 +430,70 @@ class ContractCatalog:
                     contracts.append(contract)
         return self.merge_live_contracts(contracts)
 
+    def _lookup_indexes(self):
+        # Feed receipts resolve a contract for every tick. Rebuilding a combined
+        # list or scanning the full exchange master here makes tick cost grow
+        # with unrelated contracts. Index references, then copy only matches.
+        # Length/identity also cover supported demo appends and list replacement
+        # before their caller publishes a catalog revision.
+        identity = (self.revision, id(self._demo), len(self._demo), id(self._live), len(self._live))
+        cached = getattr(self, "_lookup_cache", None)
+        if cached is not None and cached[0] == identity:
+            return cached[1], cached[2]
+        all_rows, live_rows = {}, {}
+        for rows, index in ((self._demo, all_rows), (self._live, live_rows)):
+            for row in rows:
+                identifier = row["id"]
+                previous = index.get(identifier)
+                if previous is None:
+                    index[identifier] = row
+                elif isinstance(previous, tuple):
+                    index[identifier] = (*previous, row)
+                else:
+                    index[identifier] = (previous, row)
+        for identifier, rows in live_rows.items():
+            previous = all_rows.get(identifier)
+            if previous is None:
+                all_rows[identifier] = rows
+            else:
+                first = previous if isinstance(previous, tuple) else (previous,)
+                following = rows if isinstance(rows, tuple) else (rows,)
+                all_rows[identifier] = (*first, *following)
+        # Retain list references so an abandoned list's id cannot be reused
+        # for a same-length replacement while this cache remains valid.
+        self._lookup_cache = (identity, all_rows, live_rows, self._demo, self._live)
+        return all_rows, live_rows
+
     def find(self, instrument_id: str, broker: str | None = None) -> dict | None:
-        for row in self._demo + self._live:
-            if row["id"] == instrument_id and (broker is None or row["broker"] == broker):
+        rows = self._lookup_indexes()[0].get(instrument_id)
+        if rows is None:
+            return None
+        if not isinstance(rows, tuple):
+            return dict(rows) if broker is None or rows["broker"] == broker else None
+        for row in rows:
+            if broker is None or row["broker"] == broker:
                 return dict(row)
         return None
+
+    def select_live(self, instrument_ids, brokers=None) -> list[dict]:
+        """Copy only selected, unexpired live identities for feed subscriptions.
+
+        Broker-specific rows remain separate even if their identifiers collide.
+        Historical find() deliberately retains expired identities; subscriptions
+        use the same expiry filter as all(demo=False), without copying all rows.
+        """
+        allowed = set(BROKERS) & set(BROKERS if brokers is None else brokers)
+        today = datetime.now(IST).date().isoformat()
+        index = self._lookup_indexes()[1]
+        selected = []
+        for identifier in sorted(set(instrument_ids)):
+            rows = index.get(identifier)
+            if rows is None:
+                continue
+            for row in rows if isinstance(rows, tuple) else (rows,):
+                if row["broker"] in allowed and row["expiry"] >= today:
+                    selected.append(dict(row))
+        return selected
 
     def list_contracts(self, underlying=None, broker=None, demo=True):
         return [r for r in self.all(demo) if (not underlying or r["underlying"] == underlying) and (not broker or r["broker"] == broker)]
@@ -457,7 +518,7 @@ def get_contract(instrument_id, broker=None):
 
 def import_master(broker: str, csv_text: str, destination: Path, segment: str | None = None) -> dict:
     if broker not in BROKERS:
-        raise ValueError("Only Kotak Neo and 5paisa masters are supported")
+        raise ValueError("Only Kotak Neo masters are supported; retired broker records remain preserved")
     rows, rejected, non_options = [], [], 0
     for number, raw in enumerate(csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff"))), 2):
         try:
@@ -525,7 +586,7 @@ def main():
     parser = argparse.ArgumentParser(description="Import fresh broker option masters; no trading APIs are called.")
     parser.add_argument("broker", choices=BROKERS)
     parser.add_argument("--csv", type=Path, help="Native broker CSV or normalized CSV")
-    parser.add_argument("--download", action="store_true", help="Download current official Kotak/5paisa master")
+    parser.add_argument("--download", action="store_true", help="Download current official Kotak Neo master")
     parser.add_argument("--segment", help="Kotak segment, e.g. nse_fo, bse_fo or mcx_fo")
     parser.add_argument("--output", type=Path, default=Path(os.environ.get("INSTRUMENT_MASTER_PATH", DEFAULT_PATH)))
     args = parser.parse_args()

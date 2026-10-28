@@ -17,7 +17,11 @@ def test_active_legs_survive_watchlist_filter_without_subscribing_unselected_cat
     monkeypatch.setenv('FEED_INSTRUMENT_IDS', watchlist)
     contracts = [{'id': 'kotak:' + name, 'broker': 'kotak', 'demo': False}
                  for name in ('watched', 'active', 'pending', 'closed', 'closed-leg', 'unused')]
-    monkeypatch.setattr(main, 'catalog', SimpleNamespace(all=lambda demo=False: contracts))
+    lookups=[]
+    def selected_rows(identifiers, brokers):
+        lookups.append(set(identifiers))
+        return [row for row in contracts if row['id'] in identifiers and row['broker'] in brokers]
+    monkeypatch.setattr(main, 'catalog', SimpleNamespace(select_live=selected_rows))
     database = create_engine('sqlite://')
     Base.metadata.create_all(database)
     try:
@@ -30,6 +34,7 @@ def test_active_legs_survive_watchlist_filter_without_subscribing_unselected_cat
             selected = main.selected_feed_contracts(db)
         expected = {'kotak:active', 'kotak:pending'} | ({watchlist} if watchlist else set())
         assert {row['id'] for row in selected} == expected
+        assert lookups==[expected]  # Only demanded IDs, never a full-catalog copy.
 
         async def verify():
             received = []

@@ -1,6 +1,6 @@
 # Current deployment: Vercel + RamNaym SQLite
 
-This updates the existing app. No Neon data is deleted. The new runtime uses only Kotak Neo and 5paisa market data, and cannot place real broker orders.
+This updates the existing app. No Neon data is deleted. The runtime uses only Kotak Neo market data and cannot place real broker orders. Existing 5paisa and Dhan trade records and archives are preserved as history; their feeds and new-trade choices are disabled.
 
 ## Verified hosting and limits
 Server 1606 Medium: 1 vCPU, 2GB RAM, 15GB persistent /app/data, exactly one application worker. On 24 October 2026 the running container reported a local ext4 mount, writable /app/data, SQLite3.46.1 and GUNICORN_WORKERS=1. A second independent process correctly failed to acquire a competing SQLite write lock. Previous disposable probe data survived normal restart and rebuild. On 25 October the migrated owner and four saved sample trades also survived a source-only redeploy and container restart. That proves persisted account/trade state for those checks, not live broker reconnection or gap-free market recording.
@@ -46,4 +46,4 @@ Use /health/live for lightweight process monitoring, and /health/ready for cache
 Never copy a live SQLite file alone: use SQLite backup API, include the full transactional snapshot, verify integrity, and test restore with the server stopped. Downloaded Excel is useful trade history but does not reconstruct owner credentials or pending-order state. Keep an encrypted independent recovery backup outside this one server. The app never auto-deletes Neon or unarchived source rows.
 
 ## Trial acceptance checks still required
-Actual Kotak and5paisa authenticated WebSockets; official master permissions; closed-browser recording during real sessions; one-second gap report; full app container restart recovery; Google five-second writes and download integrity; CPU/RAM/disk and response-time measurements. Automated mocks do not prove these live checks. No guaranteed uninterrupted uptime is claimed.
+Actual Kotak authenticated WebSocket; official master permissions; closed-browser recording during real sessions; one-second gap report; full app container restart recovery; Google five-second writes and download integrity; CPU/RAM/disk and response-time measurements. Automated mocks do not prove these live checks. No guaranteed uninterrupted uptime is claimed.

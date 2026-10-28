@@ -1,4 +1,4 @@
-"""Two independent, read-only Kotak Neo and 5paisa option-chain views.
+"""Read-only Kotak Neo option-chain views.
 
 Live identities come only from the selected broker's official master. Prices
 are that broker's received WebSocket marks; unavailable fields remain null.
@@ -25,10 +25,10 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from . import engine
 from .database import Base, get_db, iso_now
-from .instruments import BROKERS, FIVEPAISA_MASTER_URL, IST, normalize_row
+from .instruments import BROKERS, IST, normalize_row
 from .security import require_session
 from .models import LatestQuote
-from .brokers import KotakFeed, FivepaisaFeed
+from .brokers import KotakFeed
 
 router = APIRouter(prefix='/api/option-chain', tags=['Read-only option chain'], dependencies=[Depends(require_session)])
 _write_lock = asyncio.Lock()
@@ -40,8 +40,7 @@ _universes = WeakKeyDictionary()
 MIN_INTERVAL = 3.0
 MASTER_REFRESH_SECONDS = 300
 CHAIN_SUBSCRIPTION_SECONDS = 600
-SOURCES = {'kotak': 'https://github.com/Kotak-Neo/kotak-neo-python/blob/main/docs/guides/websocket.md',
-           'fivepaisa': 'https://xstream.5paisa.com/dev-docs/market-data-system/web-socket'}
+SOURCES = {'kotak': 'https://github.com/Kotak-Neo/kotak-neo-python/blob/main/docs/guides/websocket.md'}
 
 
 class ChainMaster(Base):
@@ -89,12 +88,12 @@ def age(value):
 
 def validate_broker(broker):
     if broker not in BROKERS:
-        raise HTTPException(422, 'Only Kotak Neo and 5paisa are enabled. Historical records remain readable.')
+        raise HTTPException(422, 'Only Kotak Neo is enabled. Retired broker history remains readable.')
 
 
 def configured(broker='kotak'):
     validate_broker(broker)
-    return bool((KotakFeed if broker == 'kotak' else FivepaisaFeed)(None, None).configured())
+    return bool(KotakFeed(None, None).configured())
 
 
 def mode_value(db, mode):
@@ -109,7 +108,7 @@ def requested_contract_ids():
     return set().union(*(value[1] for value in _requested.values())) if _requested else set()
 
 
-def parse_master(rows, broker='fivepaisa', today=None, segment=None):
+def parse_master(rows, broker='kotak', today=None, segment=None):
     validate_broker(broker)
     today = today or datetime.now(IST).date().isoformat()
     groups, seen = {}, set()
@@ -182,21 +181,19 @@ def master_status(db=None, broker='kotak'):
 
 def download_master(broker):
     validate_broker(broker)
-    segments = ('nse_fo', 'bse_fo', 'mcx_fo') if broker == 'kotak' else (None,)
-    client = None
-    if broker == 'kotak':
-        os.environ['NEO_LOG_LEVEL'] = 'NOLOG'
-        os.environ['NEO_LOG_FILE_ENABLED'] = 'false'
-        from neo_api_client import NeoAPI
-        from neo_api_client.logger import setup_logging
-        setup_logging(level='NOLOG', file_enabled=False)
-        if not os.getenv('KOTAK_CONSUMER_KEY'):
-            raise ValueError('Kotak consumer key required for official instrument master')
-        client = NeoAPI(consumer_key=os.environ['KOTAK_CONSUMER_KEY'], environment='prod', timeout=30)
+    segments = ('nse_fo', 'bse_fo', 'mcx_fo')
+    os.environ['NEO_LOG_LEVEL'] = 'NOLOG'
+    os.environ['NEO_LOG_FILE_ENABLED'] = 'false'
+    from neo_api_client import NeoAPI
+    from neo_api_client.logger import setup_logging
+    setup_logging(level='NOLOG', file_enabled=False)
+    if not os.getenv('KOTAK_CONSUMER_KEY'):
+        raise ValueError('Kotak consumer key required for official instrument master')
+    client = NeoAPI(consumer_key=os.environ['KOTAK_CONSUMER_KEY'], environment='prod', timeout=30)
     result = []
     total = 0
     for segment in segments:
-        url = client.scrip_master(exchange_segment=segment) if client else FIVEPAISA_MASTER_URL
+        url = client.scrip_master(exchange_segment=segment)
         if not isinstance(url, str) or not url.startswith('https://'):
             raise ValueError('Broker did not return an HTTPS master URL')
         with urllib.request.urlopen(url, timeout=90) as response:
@@ -382,8 +379,8 @@ def build_chain(metadata, contracts, expiry, raw=None, stamp=None, demo=False):
 
 
 @router.get('/underlyings')
-async def underlyings(q: str = Query('', max_length=100), mode: Literal['sample','live'] | None = None,
-                      broker: Literal['kotak','fivepaisa'] = 'kotak', db: Session = Depends(get_db)):
+def underlyings(q: str = Query('', max_length=100), mode: Literal['sample','live'] | None = None,
+                      broker: Literal['kotak'] = 'kotak', db: Session = Depends(get_db)):
     validate_broker(broker)
     selected_mode = mode_value(db, mode)
     groups = sample_universe(engine.catalog, broker) if selected_mode == 'sample' else [{k:v for k,v in g.items() if k != 'contracts'} for g in live_universe(broker).values()]
@@ -396,7 +393,7 @@ async def underlyings(q: str = Query('', max_length=100), mode: Literal['sample'
 
 
 @router.post('/master/refresh')
-async def reload_master(broker: Literal['kotak','fivepaisa'] = 'kotak', db: Session = Depends(get_db)):
+async def reload_master(broker: Literal['kotak'] = 'kotak', db: Session = Depends(get_db)):
     result = await refresh_master(db, force=True, broker=broker)
     if _refresh_feeds:
         await _refresh_feeds(db)
@@ -432,14 +429,36 @@ def cached_live_data(db, contracts, expiry, stale_after):
     return {'data': {'oc': oc}}, min((s for s in stamps if s), default=None)
 
 
+def finish_read_transaction(db):
+    """End a completed read without clearing the broker quote cache.
+
+    The callers are read-only, or have already committed a paper mutation.
+    Refuse pending ORM changes instead of accidentally publishing them.
+    """
+    if db.new or db.dirty or db.deleted:
+        raise RuntimeError('Save pending paper state before refreshing market data.')
+    if db.in_transaction():db.commit()
+
+
+def chain_settings(db, mode):
+    settings=engine.get_settings(db)
+    finish_read_transaction(db)
+    return settings, mode or ('sample' if settings['demo_mode'] else 'live')
+
+
+def live_chain_result(db, metadata, selected, expiry, stale_after):
+    raw,stamp=cached_live_data(db,selected,expiry,stale_after)
+    finish_read_transaction(db)
+    return build_chain(metadata,selected,expiry,raw=raw,stamp=stamp)
+
+
 @router.get('')
 async def option_chain(underlying: str = Query(..., min_length=1, max_length=180), expiry: str | None = None,
-                       mode: Literal['sample','live'] | None = None, broker: Literal['kotak','fivepaisa'] = 'kotak',
+                       mode: Literal['sample','live'] | None = None, broker: Literal['kotak'] = 'kotak',
                        db: Session = Depends(get_db)):
     validate_broker(broker)
-    selected_mode = mode_value(db, mode)
+    settings,selected_mode = await asyncio.to_thread(chain_settings,db,mode)
     demo = selected_mode == 'sample'
-    settings = engine.get_settings(db)
     workspace_matches = bool(settings['demo_mode']) == demo
     if demo:
         choices = sample_universe(engine.catalog, broker)
@@ -466,13 +485,12 @@ async def option_chain(underlying: str = Query(..., min_length=1, max_length=180
         _requested[broker] = (time.monotonic() + CHAIN_SUBSCRIPTION_SECONDS, {c['id'] for c in selected})
         if _refresh_feeds:
             await _refresh_feeds(db)
-        raw, stamp = cached_live_data(db, selected, expiry, settings['stale_after_seconds'])
-        result = build_chain(metadata, selected, expiry, raw=raw, stamp=stamp)
+        result = await asyncio.to_thread(live_chain_result,db,metadata,selected,expiry,settings['stale_after_seconds'])
         fresh = [q for row in result['rows'] for q in (row['ce'], row['pe']) if q and q['ltp'] is not None and not q['stale']]
         result.update(status='connected' if fresh else 'stale' if result['quotes'] else 'awaiting_quotes' if configured(broker) else 'credentials_required',
                       stale=not bool(fresh), trading_enabled=workspace_matches and bool(fresh),
                       message='Prices are from the selected broker only. OI, spot and Greeks remain unavailable when its feed does not supply them; stale rows retain their original quote timestamps.',
                       capabilities={'ltp': True, 'bid_ask': True, 'open_interest': True, 'spot': False, 'greeks': False,
-                                    'greeks_note': '5paisa offers a separate NSE-only Greeks feed; binary wire format/entitlements need broker verification. Kotak depth messages do not carry Greeks.'})
+                                    'greeks_note': 'Kotak depth messages do not carry Greeks; unavailable values remain blank.'})
     result.update(read_only=True, mode_matches_workspace=workspace_matches)
     return result

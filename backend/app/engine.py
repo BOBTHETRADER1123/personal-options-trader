@@ -24,7 +24,7 @@ from .models import (Setting, Trade, Event, Timeline, QuoteEvent, ActionRecord,
                      PnlSnapshot, RecordingCursor, RecordingGap)
 from .payoff import strategy_risk
 
-BROKERS={'kotak':'Kotak Neo','fivepaisa':'5paisa'}
+BROKERS={'kotak':'Kotak Neo'}
 DEFAULT_SETTINGS={'brokerage_per_order':20.0,'charges_percent':0.05,'slippage_bps':0.0,'fill_basis':'bid_ask','logging_mode':'full_history','recording_policy_version':3,'preferred_feed':'broker','stale_after_seconds':10,'demo_mode':True,'paper_capital':1000000.0,'unlimited_paper_buying_power':False,'trade_count_definition':'strategies','delete_after_local_save':False,'auto_delete_online':False}
 catalog = None
 log=logging.getLogger(__name__)
@@ -137,6 +137,7 @@ def contract_identity(value):
     return (str(value.get('exchange')),str(value.get('underlying')),str(value.get('expiry')),strike,str(value.get('option_type')))
 
 def contract_for(instrument_id,broker,demo):
+    if broker not in BROKERS:raise HTTPException(422,'This broker is retired. Saved history remains available; new paper fills use Kotak Neo only.')
     if catalog is None:raise HTTPException(503,'The instrument catalog has not loaded.')
     requested=catalog.find(instrument_id)
     if not requested:raise HTTPException(422,'Select a valid contract from the instrument master.')
@@ -194,6 +195,7 @@ def fill_reference(quote,side,settings):
     return float(price)
 
 def execution_price(db,contract,side,broker,settings,manual=None,quote_override=None,limit_price=None):
+    if broker not in BROKERS and manual is None:raise HTTPException(409,'This broker is retired. No new market-price fills are available.')
     if manual is not None:
         if not math.isfinite(float(manual)) or manual<0:raise HTTPException(422,'Paper fill price must be nonnegative and finite.')
         return float(manual),{'source':'manual_paper_assumption','ltp':float(manual),'received_at':iso_now()},0.0
@@ -299,6 +301,8 @@ def store_trade(db,trade):
 
 def public_trade(trade,settings=None):
     result=copy.deepcopy(trade)
+    result['broker_retired']=trade.get('broker') not in BROKERS
+    if result['broker_retired']:result['broker_status']='Retired broker · preserved history'
     for leg in result['legs']:
         leg['expired']=bool(leg.get('expiry') and str(leg['expiry'])[:10]<datetime.now(timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo('Asia/Kolkata')).date().isoformat())
         leg['settlement_required']=bool(leg['expired'] and leg.get('open_lots',0)>0)
@@ -394,7 +398,7 @@ def create_trades(db,payload):
         started=time.perf_counter_ns();at=iso_now()
         try:
             with db.begin_nested():
-                if broker not in BROKERS:raise HTTPException(422,'New paper trades support Kotak Neo and 5paisa only. Legacy records remain available.')
+                if broker not in BROKERS:raise HTTPException(422,'New paper trades support Kotak Neo only. Legacy records remain available.')
                 newlegs=[new_leg(db,l,broker,settings,at) for l in legs]
                 if any(l['underlying']!=payload['underlying'] for l in newlegs):raise HTTPException(422,'The selected contract belongs to a different underlying.')
                 trade={'id':ident('trade'),'strategy_id':action_id,'action_id':action_id,'name':payload['name'],'broker':broker,'underlying':payload['underlying'],'status':'open','mode':'PAPER','demo':settings['demo_mode'],'created_at':at,'closed_at':None,'legs':newlegs,'net_premium':sum(premium_cash_flow(l) for l in newlegs),'spot':catalog.find(legs[0]['instrument_id']).get('spot'),'mfe':None,'mae':None,'mfe_at':None,'mae_at':None,'dispatch_at':at,'processing_ms':(time.perf_counter_ns()-started)/1e6,'accounting_method':'weighted_average','export_queued':False}
@@ -430,6 +434,8 @@ def apply_action(db,trade_id,payload):
     row=db.get(Trade,trade_id)
     if not row:raise HTTPException(404,'Trade not found.')
     trade=copy.deepcopy(row.data);settings=get_settings(db);action=payload['action'];at=iso_now()
+    if trade['broker'] not in BROKERS and action not in {'edit','cancel_pending','settle_expiry'}:
+        raise HTTPException(409,'This broker is retired. Historical records are preserved; new trades and market-price actions use Kotak Neo only.')
     if action=='duplicate':
         new_payload={'name':f'{trade["name"]} copy'[:100],'underlying':trade['underlying'],'brokers':[trade['broker']],'legs':[{'instrument_id':l['instrument_id'],'side':l['side'],'lots':l['open_lots'] or l['lots'],'order_type':'MARKET','enabled':True} for l in trade['legs']],'idempotency_key':'duplicate_'+hashlib.sha256(payload['idempotency_key'].encode()).hexdigest(),'confirmed':True}
         result=create_trades(db,new_payload)
@@ -541,6 +547,7 @@ def record_quote(db,quote,process=True):
     return entry.id
 
 def _trade_uses_quote(trade,quote,settings):
+    if trade.get('broker') not in BROKERS or quote.get('broker') not in BROKERS:return False
     if trade['status'] not in ('open','pending') or bool(trade.get('demo'))!=bool(quote['demo']):return False
     source=settings['preferred_feed'];source=trade['broker'] if source=='broker' else source
     return source==quote['broker'] and any(leg['status'] in ('open','pending') and
@@ -792,6 +799,7 @@ def take_snapshots(db,now=None,calendar=None,lease=None):
         count=0
         for row in db.scalars(select(Trade).where(Trade.status.in_(['open','pending']))):
             trade=copy.deepcopy(row.data)
+            if trade.get('broker') not in BROKERS:continue
             if trade.get('demo') and not settings['demo_mode']:continue
             snapshot(db,trade,'one_second');store_trade(db,trade);count+=1
         return {'recorded':count,'calendar_unknown':0,'closed_session':0}
@@ -806,7 +814,7 @@ def take_snapshots(db,now=None,calendar=None,lease=None):
     else:
         from sqlalchemy.dialects.sqlite import insert
     # Only active positions are sampled; pending-only orders have no P&L yet.
-    active=[trade for trade in trade_records(db) if trade['status']=='open' and
+    active=[trade for trade in trade_records(db) if trade.get('broker') in BROKERS and trade['status']=='open' and
             (not trade.get('demo') or settings['demo_mode']) and
             any((leg.get('open_lots') or 0)>0 for leg in trade.get('legs',[]))]
     for trade in active:
@@ -844,15 +852,15 @@ def _dashboard_quotes(db,settings):
     if not state['quotes_loaded']:
         # SQL selects latest IDs on the server; historical quote JSON never
         # crosses the network merely to find the current market watch.
-        for row in db.scalars(select(LatestQuote).order_by(LatestQuote.received_at.desc()).limit(30)):
+        for row in db.scalars(select(LatestQuote).where(LatestQuote.broker.in_(BROKERS)).order_by(LatestQuote.received_at.desc()).limit(30)):
             cache_quote(db,row.data,persist=False)
         if not state['quotes']:
-            newest=select(func.max(QuoteEvent.id).label('id')).group_by(QuoteEvent.broker,QuoteEvent.instrument_id).order_by(func.max(QuoteEvent.id).desc()).limit(30).subquery()
+            newest=select(func.max(QuoteEvent.id).label('id')).where(QuoteEvent.broker.in_(BROKERS)).group_by(QuoteEvent.broker,QuoteEvent.instrument_id).order_by(func.max(QuoteEvent.id).desc()).limit(30).subquery()
             for row in db.scalars(select(QuoteEvent).join(newest,QuoteEvent.id==newest.c.id)):
                 cache_quote(db,{**row.data,'event_id':row.id},persist=False)
         state['quotes_loaded']=True
     with _cache_lock:values=list(state['quotes'].values())
-    values=sorted((q for q in values if bool(q.get('demo'))==bool(settings['demo_mode'])),key=lambda q:q.get('received_at',''),reverse=True)[:30]
+    values=sorted((q for q in values if q.get('broker') in BROKERS and bool(q.get('demo'))==bool(settings['demo_mode'])),key=lambda q:q.get('received_at',''),reverse=True)[:30]
     quotes=[]
     for value in values:
         age=age_seconds(value.get('received_at'))

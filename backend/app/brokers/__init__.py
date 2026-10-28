@@ -5,7 +5,6 @@ import asyncio
 import random
 
 from .base import FeedAuthenticationError, FeedProtocolError, utc_now
-from .fivepaisa import FivepaisaFeed
 from .kotak import KotakFeed
 
 
@@ -16,7 +15,7 @@ class FeedManager:
         self._tasks: list[asyncio.Task] = []
         self._states: dict[str, dict] = {}
         self._stopping = False
-        self._adapters = [KotakFeed(self._quote, self._status), FivepaisaFeed(self._quote, self._status)]
+        self._adapters = [KotakFeed(self._quote, self._status)]
         for adapter in self._adapters:
             self._states[adapter.broker] = {"broker": adapter.broker, "status": "not_configured", "configured": bool(adapter.configured()),
                                            "detail": "Add backend market-data credentials", "last_quote_at": None, "source": "live", "received_events": 0, "reconnect_count": 0}
@@ -91,4 +90,4 @@ class FeedManager:
                 await self._status(broker, {"status": "disconnected", "detail": "Market-data connection stopped"})
 
 
-__all__ = ["FeedManager", "KotakFeed", "FivepaisaFeed"]
+__all__ = ["FeedManager", "KotakFeed"]

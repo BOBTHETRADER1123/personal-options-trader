@@ -1,6 +1,6 @@
 # Personal Options Trader
 
-This is an update to the existing personal paper-trading app. It preserves working features and records. Only **Kotak Neo** and **5paisa** are active broker integrations; legacy Dhan records remain historical. Real broker order placement is disabled.
+This is an update to the existing personal paper-trading app. It preserves working features and records. Only **Kotak Neo** is enabled for market data and new paper trades. Saved 5paisa and Dhan records remain historical; their integrations are disabled. Real broker order placement is disabled.
 
 ## Current setup and deployment status
 
@@ -41,7 +41,7 @@ The laptop workspace and old cloud records remain preserved. [START-HERE.md](STA
 
 ## Historical notes from earlier releases
 
-**The following retained notes describe the earlier laptop / Render / Neon release. They are historical recovery context, not current production deployment instructions. References below to Dhan, compact recording, waiting for Neon, old hosting or older UI apply to that earlier release. Use the current guides above for new deployment and recording behavior.**
+**The following retained notes describe the earlier laptop / Render / Neon release. They are historical recovery context, not current production deployment instructions. References below to Dhan, 5paisa, compact recording, waiting for Neon, old hosting or older UI apply to that earlier release. They do not enable either retired broker in the current website. Use the current guides above for new deployment and recording behavior.**
 
 A responsive personal options paper trading desk for Indian indices and MCX commodities. It includes a React/TypeScript frontend, FastAPI backend, persistent journal, independent read-only broker adapters, strategy payoff engine, durable Excel export queue, and verified Windows local-save companion.
 
@@ -77,7 +77,7 @@ Sample mode uses **fictional contracts and synthetic quotes**, generated relativ
 ```text
 frontend/                React + TypeScript website and installable PWA shell
 backend/app/             FastAPI, authentication, database and paper engine
-backend/app/brokers/     Dhan v2, Kotak SFeed, 5paisa Xstream read-only adapters
+backend/app/brokers/     Active Kotak SFeed; retired protocol compatibility is not enabled
 backend/tests/           Accounting, broker protocol, security and recovery tests
 companion/               Windows export polling, safe saves and verification
 docs/BROKERS.md          Official APIs, session setup and master ingestion

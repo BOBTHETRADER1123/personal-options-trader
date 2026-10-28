@@ -51,47 +51,20 @@ def test_invalid_private_fields_are_never_echoed(client):
     assert 'input' not in r.text
 
 
-def test_authorization_redirect_is_owner_bound_and_no_key_in_begin(client,monkeypatch):
-    c,token=client;c.cookies.set(COOKIE,token);seen=[]
-    class Fake:
-        def begin(self,session):seen.append(session);return 'state-value-that-is-long-enough'
-        def authorization_url(self,state,session):
-            assert state=='state-value-that-is-long-enough' and session==digest(token)
-            return 'https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey=private-key'
-    monkeypatch.setattr(main,'fivepaisa_auth',Fake())
-    r=c.post('/api/brokers/fivepaisa/auth/begin',headers={'x-csrf-token':'test-csrf'})
-    assert r.status_code==200 and seen==[digest(token)]
-    assert 'private-key' not in r.text
-    r=c.get(r.json()['url'],follow_redirects=False)
-    assert r.status_code==303 and r.headers['location'].startswith('https://dev-openapi.5paisa.com/')
-    assert r.headers['referrer-policy']=='no-referrer'
+@pytest.mark.parametrize('method,path',[
+    ('GET','/api/brokers/fivepaisa/auth/status'),
+    ('POST','/api/brokers/fivepaisa/auth/begin'),
+    ('GET','/api/brokers/fivepaisa/authorize'),
+    ('GET','/api/brokers/fivepaisa/callback'),
+])
+def test_retired_authorization_routes_are_absent(client,method,path):
+    c,token=client;c.cookies.set(COOKIE,token)
+    response=c.request(method,path,headers={'x-csrf-token':'test-csrf'},follow_redirects=False)
+    assert response.status_code in (404,405) and 'location' not in response.headers
+    assert response.headers['referrer-policy']=='no-referrer'
 
 
-def test_callback_sanitizes_broker_failure_and_accepts_state_case(client,monkeypatch):
-    c,token=client;c.cookies.set(COOKIE,token);seen=[]
-    def complete(request_token,state,session):
-        seen.append((request_token,state,session));raise main.broker_auth.BrokerAuthError('Fixed failure')
-    monkeypatch.setattr(main,'fivepaisa_auth',SimpleNamespace(complete=complete))
-    r=c.get('/api/brokers/fivepaisa/callback',params={'RequestToken':'private-request','State':'state-value-that-is-long-enough'},follow_redirects=False)
-    assert r.status_code==303 and r.headers['location']=='/?broker=fivepaisa_failed'
-    assert seen==[('private-request','state-value-that-is-long-enough',digest(token))]
-    assert 'private-request' not in r.text
-
-
-def test_slow_broker_callback_does_not_hold_recorder_lock(monkeypatch):
-    async def run():
-        started=threading.Event();release=threading.Event()
-        def complete(*args):started.set();assert release.wait(3)
-        monkeypatch.setattr(main,'fivepaisa_auth',SimpleNamespace(complete=complete))
-        monkeypatch.setattr(main,'write_lock',asyncio.Lock())
-        request=SimpleNamespace(query_params={'RequestToken':'private','state':'state-value-that-is-long-enough'})
-        task=asyncio.create_task(main.callback_fivepaisa(request,SimpleNamespace(token_hash='session'),SimpleNamespace(rollback=lambda:None)))
-        try:
-            for _ in range(100):
-                if started.is_set():break
-                await asyncio.sleep(.005)
-            assert started.is_set() and not task.done()
-            async with asyncio.timeout(.2):
-                async with main.write_lock:assert main.process_health()['ok']
-        finally:release.set();await asyncio.wait_for(task,3)
-    asyncio.run(run())
+def test_retired_callback_cannot_restart_or_restore_authorization():
+    assert not hasattr(main,'fivepaisa_auth')
+    assert not hasattr(main,'callback_fivepaisa')
+    assert not any(getattr(route,'path','').startswith('/api/brokers/fivepaisa') for route in main.app.routes)

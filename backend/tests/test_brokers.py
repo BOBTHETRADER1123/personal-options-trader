@@ -61,7 +61,7 @@ def test_demo_contracts_are_never_live_and_have_dynamic_expiry():
     assert all(row["demo"] and row["token"] == "DEMO" and row["source"] == "synthetic_demo" for row in rows)
     assert {row["expiry"] for row in rows} == {"2030-01-08", "2030-01-15"}
     identifier = rows[0]["id"]
-    assert {r["broker"] for r in rows if r["id"] == identifier} == {"kotak", "fivepaisa"}
+    assert {r["broker"] for r in rows if r["id"] == identifier} == {"kotak"}
     assert {r["exchange"] for r in rows} == {"NSE", "BSE", "MCX"}
 
 
@@ -129,25 +129,31 @@ def test_equity_multiplier_is_one_and_demo_mcx_explicitly_fictional():
     assert all(r["price_multiplier"] == 1 and r["demo"] for r in demo_contracts() if r["exchange"] == "MCX")
 
 
-def test_master_import_preserves_other_brokers_and_is_atomic(tmp_path):
+def test_kotak_master_import_preserves_retired_rows_and_is_atomic(tmp_path):
     path = tmp_path / "master.json"
-    path.write_text(json.dumps({"instruments": [contract("kotak")]}))
-    text = "ScripCode,Exch,ExchType,Name,SymbolRoot,Expiry,StrikeRate,ScripType,LotSize\n123,N,D,NIFTY CE,NIFTY,2030-10-29,25000,CE,50\n"
-    result = import_master("fivepaisa", text, path)
-    assert result["imported"] == 1
-    assert {r["broker"] for r in json.loads(path.read_text())["instruments"]} == {"fivepaisa", "kotak"}
-    before = path.read_bytes()
-    with pytest.raises(ValueError):
-        import_master("fivepaisa", text.replace(",50\n", ",0\n"), path)
-    assert before == path.read_bytes()
+    retired=contract("fivepaisa")
+    path.write_text(json.dumps({"instruments": [retired]}))
+    text="pSymbol,pExchSeg,pSymbolName,pTrdSymbol,pOptionType,lLotSize,lExpiryDate,dStrikePrice,dTickSize,lPrecision\n123,nse_fo,NIFTY,NIFTY TEST CE,CE,50,2030-10-29,2500000,5,2\n"
+    result=import_master("kotak",text,path)
+    assert result["imported"]==1
+    rows=json.loads(path.read_text())["instruments"]
+    assert next(row for row in rows if row["broker"]=="fivepaisa")==retired
+    assert {row["broker"] for row in rows}=={"kotak","fivepaisa"}
+    assert {row["broker"] for row in ContractCatalog(path).all(False)}=={"kotak"}
+    before=path.read_bytes()
+    with pytest.raises(ValueError):import_master("kotak",text.replace(",50,",",0,"),path)
+    assert path.read_bytes()==before
+    with pytest.raises(ValueError,match="Only Kotak Neo"):import_master("fivepaisa",text,path)
+    assert path.read_bytes()==before
 
 
-def test_all_segment_master_ignores_currency_without_relabeling_as_index(tmp_path):
-    text = "ScripCode,Exch,ExchType,Name,SymbolRoot,Expiry,StrikeRate,ScripType,LotSize\n123,N,D,NIFTY CE,NIFTY,2030-10-29,25000,CE,50\n456,N,U,USDINR CE,USDINR,2030-10-29,85,CE,1000\n"
-    path = tmp_path / "master.json"
-    result = import_master("fivepaisa", text, path)
-    assert result["imported"] == 1 and result["ignored_non_options"] == 1
-    assert json.loads(path.read_text())["instruments"][0]["underlying"] == "NIFTY"
+def test_retired_all_segment_master_cannot_be_imported_and_currency_is_not_relabelled(tmp_path):
+    currency={"ScripCode":"456","Exch":"N","ExchType":"U","Name":"USDINR CE","SymbolRoot":"USDINR",
+              "Expiry":"2030-10-29","StrikeRate":"85","ScripType":"CE","LotSize":"1000"}
+    with pytest.raises(ValueError,match="Unsupported derivative segment"):normalize_row("fivepaisa",currency)
+    path=tmp_path/"master.json"
+    with pytest.raises(ValueError,match="Only Kotak Neo"):import_master("fivepaisa","",path)
+    assert not path.exists()
 
 
 def test_market_session_without_calendar_unknown(monkeypatch):
@@ -185,12 +191,14 @@ def test_adapter_sources_contain_no_live_order_methods():
         assert all(value not in path.read_text(encoding="utf-8") for value in forbidden), path.name
 
 
-def test_only_two_runtime_adapters_even_with_legacy_environment(monkeypatch):
+def test_only_kotak_runtime_adapter_even_with_legacy_environment(monkeypatch):
     monkeypatch.setenv('DHAN_CLIENT_ID','historical-only')
     monkeypatch.setenv('DHAN_ACCESS_TOKEN','must-not-create-an-adapter')
+    monkeypatch.setenv('FIVEPAISA_CLIENT_CODE','historical-only')
+    monkeypatch.setenv('FIVEPAISA_ACCESS_TOKEN','must-not-create-an-adapter')
     manager=FeedManager(None)
-    assert set(manager.statuses())=={'kotak','fivepaisa'}
-    assert {adapter.broker for adapter in manager._adapters}=={'kotak','fivepaisa'}
+    assert set(manager.statuses())=={'kotak'}
+    assert {adapter.broker for adapter in manager._adapters}=={'kotak'}
 
 
 def test_legacy_master_does_not_block_current_broker_and_cannot_be_imported(tmp_path):

@@ -24,10 +24,23 @@ def parse_sfeed(message, contracts: dict, *, received_at=None, received_ns=None)
     contract = contracts.get(key)
     if not contract:
         raise FeedProtocolError("Kotak SFeed returned an unmapped instrument token")
+    last_price = row.get("last_traded_price")
+    if isinstance(last_price, bool):
+        raise FeedProtocolError("Invalid market-feed price")
+    # The official SFeed decoder exposes the scaled LTP, including zero for an
+    # untraded strike. No usable LTP means no new quote, not a broken socket.
+    # Keep the previous mark and its timestamp unchanged. Invalid/negative or
+    # nonfinite prices still fail validation; broker auth errors remain SDK
+    # exceptions handled by stream(), independently of these market records.
+    if isinstance(last_price, str) and not last_price.strip():
+        last_price = None
+    price = optional_price(last_price)
+    if price is None:
+        return None
     buy, sell = row.get("buy") or [], row.get("sell") or []
     bid = optional_price(buy[0].get("price")) if buy else None
     ask = optional_price(sell[0].get("price")) if sell else None
-    return normalized_quote("kotak", contract, row["last_traded_price"], received_at=received_at,
+    return normalized_quote("kotak", contract, price, received_at=received_at,
                             received_ns=received_ns, bid=bid, ask=ask,
                             volume=row.get("volume_traded_today"), open_interest=row.get("open_interest"),
                             exchange_timestamp=epoch_timestamp(row.get("last_update_time") or row.get("last_trade_time")),

@@ -1,3 +1,14 @@
+## Kotak-only release and contract-loading repair — 28 October 2026
+
+- Complete offline regression suite: **527 passed**, one existing Starlette/httpx deprecation warning. TypeScript and the production Vite build passed.
+- Kotak Neo is the only active broker in website choices, request schemas, market-data adapters, option chains and new paper trades. Removed 5paisa sign-in routes cannot exchange or restore credentials.
+- Saved retired-broker trade records and report schemas are preserved. Tests verify their source data is unchanged, their history remains readable, and they cannot restart feeds or create new fills.
+- The dashboard no longer downloads the full instrument master. Strategy contracts are loaded in bounded pages for the selected exchange, underlying and expiries; selected-leg quotes have their own bounded, authenticated subscription request.
+- Catalog lookups are indexed. An isolated Windows benchmark with 300,000 synthetic contracts measured 1,000 last-contract lookups at 18.463 seconds before indexing and 0.000544 seconds after. This is not a live server capacity result.
+- Actual SQLite DELETE-journal concurrency tests verify that readers close before socket waits, another writer can commit during reconfiguration, and quote database reads leave the event loop responsive.
+- Kotak empty/untraded prices are ignored without manufacturing a new quote or interrupting other subscriptions; invalid prices and authentication errors remain visible.
+- Authenticated Kotak live-feed delivery, a full hosted paper-trade recording/export/recovery lifecycle and physical phone acceptance still require live verification. Offline tests do not prove these integrations.
+
 ## Verified MCX quantity accounting — 27 October 2026
 
 - Complete suite: **461 passed**. After adding the broker NATGASMINI calendar

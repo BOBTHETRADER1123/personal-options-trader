@@ -14,9 +14,11 @@ from fastapi import HTTPException
 @pytest.mark.parametrize('side',['BUY','SELL'])
 def test_one_rupee_move_uses_physical_quantity_once(tmp_path,symbol,quantity,side):
     # Synthetic future identity, native broker field units; no real account/API.
-    contract=normalize_row('fivepaisa',{'ScripCode':'123','Exch':'M','ExchType':'D','Name':'TEST FUTURE',
-        'SymbolRoot':symbol,'Expiry':'20301029','StrikeRate':'0','ScripType':'XX',
-        'LotSize':str(quantity),'Multiplier':str(quantity),'TickSize':'.05'})
+    unit='Barrels' if symbol.startswith('CRUDEOIL') else 'mmBtu'
+    contract=normalize_row('kotak',{'pSymbol':'123','pExchSeg':'mcx_fo','pSymbolName':symbol,
+        'pTrdSymbol':'TEST FUTURE','pOptionType':'XX','lExpiryDate':'2030-10-29','dStrikePrice':'0',
+        'lLotSize':str(quantity),'dTickSize':'5','lPrecision':'2','lMultiplier':'-1',
+        'pPriceUnits':unit,'pTrdUnits':unit,'pDeliveryUnits':unit,'dPriceQuatation':'1'})
     path=tmp_path/'master.json';path.write_text(json.dumps({'instruments':[contract]}))
     old_catalog=engine.catalog;catalog=ContractCatalog(path);engine.set_catalog(catalog)
     sql=create_engine(f'sqlite:///{tmp_path / "ledger.db"}');configure_sqlite(sql)
@@ -26,10 +28,10 @@ def test_one_rupee_move_uses_physical_quantity_once(tmp_path,symbol,quantity,sid
             settings=engine.update_settings(db,{'demo_mode':False,'fill_basis':'ltp','brokerage_per_order':0,
                 'charges_percent':0,'slippage_bps':0,'unlimited_paper_buying_power':True})
             def quote(price):
-                engine.record_quote(db,{'broker':'fivepaisa','instrument_id':contract['id'],'ltp':price,
+                engine.record_quote(db,{'broker':'kotak','instrument_id':contract['id'],'ltp':price,
                     'bid':price,'ask':price,'received_at':iso_now(),'demo':False})
             quote(300)
-            result=engine.create_trades(db,{'name':'Unit verification','underlying':symbol,'brokers':['fivepaisa'],
+            result=engine.create_trades(db,{'name':'Unit verification','underlying':symbol,'brokers':['kotak'],
                 'legs':[{'instrument_id':contract['id'],'side':side,'lots':1,'enabled':True,'order_type':'MARKET'}],
                 'idempotency_key':'one-point','confirmed':True})
             assert len(result['trades'])==1,result
@@ -47,11 +49,11 @@ def test_one_rupee_move_uses_physical_quantity_once(tmp_path,symbol,quantity,sid
 
 
 def test_stale_cached_mcx_factor_cannot_be_used_for_new_fills(monkeypatch):
-    legacy={'id':'fivepaisa:MCX:D:123','exchange':'MCX','price_multiplier':1250}
+    legacy={'id':'kotak:mcx_fo:123','exchange':'MCX','price_multiplier':1250}
     monkeypatch.setattr(engine,'contract_for',lambda *args:legacy)
     # Rejection precedes price lookup or any persistent paper-order mutation.
     with pytest.raises(HTTPException) as error:
-        engine.new_leg(None,{'instrument_id':legacy['id']},'fivepaisa',{'demo_mode':False},iso_now())
+        engine.new_leg(None,{'instrument_id':legacy['id']},'kotak',{'demo_mode':False},iso_now())
     assert error.value.status_code==422 and 'verified quantity' in error.value.detail
 
 

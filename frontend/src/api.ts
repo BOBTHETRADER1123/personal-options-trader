@@ -14,6 +14,6 @@ export const money=(n:number=0,decimals=2)=>new Intl.NumberFormat('en-IN',{style
 export const num=(n:number=0,decimals=2)=>new Intl.NumberFormat('en-IN',{maximumFractionDigits:decimals,minimumFractionDigits:decimals}).format(Number(n)||0);
 export const signed=(n:number=0)=>`${n>=0?'+':'−'}${money(Math.abs(n))}`;
 export function time(value?:string|null,full=false){if(!value)return '—';const d=new Date(value);return Number.isNaN(d.getTime())?value:new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',...(full?{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'}:{hour:'2-digit',minute:'2-digit',second:'2-digit'}),hour12:false}).format(d);}
-export const brokers:Record<string,string>={kotak:'Kotak Neo',fivepaisa:'5paisa'};
+export const brokers:Record<string,string>={kotak:'Kotak Neo'};
 
-export function brokerLabel(id:string){return brokers[id]||(id==='dhan'?'Dhan · legacy history':id);}
+export function brokerLabel(id:string){return brokers[id]||({dhan:'Dhan · legacy history',fivepaisa:'5paisa · legacy history'} as Record<string,string>)[id]||id;}

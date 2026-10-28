@@ -27,7 +27,7 @@ class LegInput(StrictModel):
 class TradeInput(StrictModel):
     name: str = Field(min_length=1, max_length=100)
     underlying: str = Field(min_length=1, max_length=60)
-    brokers: list[Literal['kotak','fivepaisa']] = Field(min_length=1, max_length=2)
+    brokers: list[Literal['kotak']] = Field(min_length=1, max_length=1)
     legs: list[LegInput] = Field(min_length=1, max_length=20)
     idempotency_key: str = Field(min_length=8, max_length=150)
     confirmed: bool = False
@@ -57,7 +57,7 @@ class SettingsInput(StrictModel):
     slippage_bps: float | None = Field(default=None,ge=0,le=10000)
     fill_basis: Literal['ltp','bid_ask'] | None = None
     logging_mode: Literal['summary','every_update','one_second','full_history'] | None = None
-    preferred_feed: Literal['broker','kotak','fivepaisa'] | None = None
+    preferred_feed: Literal['broker','kotak'] | None = None
     stale_after_seconds: int | None = Field(default=None,ge=2,le=3600)
     demo_mode: bool | None = None
     delete_after_local_save: bool | None = None
