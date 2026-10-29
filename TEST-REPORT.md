@@ -1,3 +1,13 @@
+## Paper execution review and connection clarity — 29 October 2026
+
+- Five focused frontend/model regression tests passed. The actual TypeScript execution estimator was compared against 11 backend paper-order cases, plus stale/foreign/invalid-input guards. Rendered review tests verify the initial wide-spread acknowledgment gate and pending-limit display. Material quote-change guards were exercised separately.
+- Strict TypeScript and the production build passed. The backend fill model is unchanged; the preceding full offline suite contained 543 passing tests.
+- New reviews show LTP, bid/ask, estimated side-specific fill, physical quantity and estimated entry charges. A spread of at least 5% of midpoint or side-price fallback requires acknowledgment. Prices/settings are read again before submission; a fill estimate moving by over 1%, a newly risky quote or changed execution assumptions triggers another review. Estimates are not guaranteed fills.
+- The builder's market-risk preview now uses the configured bid/ask-or-LTP and slippage assumptions instead of automatically using LTP. Limit orders retain their limit assumption and are labelled pending when not crossed. Synthetic sample references are explicitly labelled.
+- Connections checks verified active-position calendars every 30 seconds only while visible. It distinguishes closed-session idle state from authentication errors, reconnects and missing selections, without inventing market hours.
+- Actual production health at 17:21 IST: Kotak connected, 9 subscriptions, 455,949 received events, zero reconnects and zero buffer overflow. Four MCX strategies were recording; one Nifty strategy was outside its exchange session. CPU sample 34.64%, RAM 71.14%, application storage 17.38% of the configured 15 GiB limit. This is a single observed workload/sample, not a monthly or full-chain load guarantee.
+- This release changes website code and tests only. Publishing it to Vercel does not restart the active RamNaym collector or modify existing trading records.
+
 ## Kotak feed lag, subscription continuity and chain reference — 29 October 2026
 
 - Complete isolated regression suite: **543 passed**, one existing Starlette/httpx deprecation warning. Strict TypeScript and production builds passed.
