@@ -6,7 +6,7 @@ import json
 
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT.parent/'PersonalOptionsTrader-Source.zip'
-TOP={'.gitignore','.gitattributes','.env.example','.python-version','.dockerignore','Dockerfile','pytest.ini','render.yaml','README.md','START-HERE.md','TEST-REPORT.md'}
+TOP={'.gitignore','.gitattributes','.env.example','.python-version','.dockerignore','Dockerfile','pytest.ini','README.md','START-HERE.md','TEST-REPORT.md'}
 FRONT={'package.json','pnpm-lock.yaml','pnpm-workspace.yaml','tsconfig.json','vite.config.ts','index.html','vercel.json','.env.example'}
 RAMNAYM={'import_workspace.py','main.py','runtime.py','start.py','safe_worker.py','gunicorn_conf.py','requirements.txt',
          'package_trial.py','build_frontend.mjs','test_ramnaym.py'}
