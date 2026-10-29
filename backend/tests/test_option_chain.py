@@ -184,3 +184,61 @@ def test_refresh_is_broker_scoped_and_failed_download_preserves_file(db,monkeypa
 def test_invalid_expiry_rejected(db):
     with pytest.raises(HTTPException) as error:get(db,expiry='2099-01-01')
     assert error.value.status_code==422
+
+
+def store_mark(db, contract, price, stamp=None):
+    value = {**contract, 'instrument_id': contract['id'], 'ltp': price,
+        'bid': price-.05, 'ask': price+.05, 'demo': False,
+        'received_at': stamp or iso_now(), 'exchange_timestamp': '2030-01-01T00:00:00+00:00'}
+    engine.cache_quote(db, value, persist=True)
+    db.commit()
+    return value
+
+
+def test_latest_option_activity_does_not_hide_individual_stale_strikes(db):
+    old=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+    mark(db,stamp=old)
+    fresh=store_mark(db,contracts()[1],120)
+    result=get(db)
+    assert result['updated_at']==fresh['received_at']
+    assert result['status']=='connected' and not result['stale']
+    assert result['rows'][0]['ce']['quote_at']==old and result['rows'][0]['ce']['stale']
+    assert result['rows'][0]['pe']['quote_at']==fresh['received_at'] and not result['rows'][0]['pe']['stale']
+
+
+def test_exact_master_future_gives_labelled_reference_not_fabricated_spot(db):
+    older=normalize_row('kotak',native(800,'FUT',strike='0',expiry='2030-10-30'))
+    nearest=normalize_row('kotak',native(801,'FUT',strike='0',expiry='2030-11-28'))
+    later=normalize_row('kotak',native(802,'FUT',strike='0',expiry='2030-12-26'))
+    other_exchange=normalize_row('kotak',native(803,'FUT',strike='0',expiry='2030-10-31',exchange='B'))
+    engine.catalog.merge_live_contracts([older,nearest,later,other_exchange])
+    own=store_mark(db,nearest,25002)
+    mark(db)
+    result=get(db)
+    assert result['spot'] is None
+    assert result['price_reference']['instrument_id']==nearest['id']
+    assert result['price_reference']['quote_at']==own['received_at']
+    assert result['price_reference']['kind']=='futures_reference'
+    assert result['price_reference']['price']==25002
+    assert result['atm_basis']=='futures_reference' and result['atm_price']==25002
+    assert result['rows'][0]['atm'] and not result['rows'][0]['itm_call']
+    assert chain.requested_contract_ids()=={contracts()[0]['id'],contracts()[1]['id'],nearest['id']}
+    assert result['capabilities']['spot'] is False
+    listed=chain.underlyings(q='',mode='live',broker='kotak',db=db)
+    assert all('reference_futures' not in group for group in listed['underlyings'])
+    assert all(c['option_type'] in {'CE','PE'} for c in result['instruments'])
+
+
+def test_stale_or_reference_only_quote_cannot_make_option_chain_live(db):
+    future=normalize_row('kotak',native(801,'FUT',strike='0',expiry='2030-11-28'))
+    engine.catalog.merge_live_contracts([future])
+    old=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+    store_mark(db,future,25002,old)
+    result=get(db)
+    assert result['price_reference']['stale'] and result['atm_price'] is None
+    assert not any(row['atm'] for row in result['rows'])
+    store_mark(db,future,25002)
+    result=get(db)
+    assert result['price_reference']['stale'] is False and result['rows'][0]['atm']
+    assert result['updated_at'] is None and result['quotes']==[]
+    assert result['stale'] and not result['trading_enabled']

@@ -50,6 +50,55 @@ def parse_sfeed(message, contracts: dict, *, received_at=None, received_ns=None)
 class KotakFeed(ReadOnlyFeed):
     broker = "kotak"
 
+    def __init__(self, on_quote, on_status):
+        super().__init__(on_quote, on_status)
+        self._subscription_lock = asyncio.Lock()
+        self._socket = None
+        self._desired_contracts = []
+        self._subscribed = {}
+        self._mapping = {}
+
+    async def _apply_subscriptions(self, contracts):
+        from neo_api_client.websocket.feed import WsToken
+        desired = {(r["segment"], str(r["token"])): r for r in contracts}
+        if len(desired) > 3000:
+            raise FeedProtocolError("Kotak SFeed subscriptions exceed 3000; narrow the watchlist")
+        removed = self._subscribed.keys() - desired.keys()
+        added = desired.keys() - self._subscribed.keys()
+        # Retained position tokens remain subscribed throughout a view change.
+        # Remove first so a large chain change cannot exceed the token budget.
+        if removed:
+            await self._socket.unsubscribe_scrips([WsToken(*key) for key in sorted(removed)])
+            for key in removed:
+                self._subscribed.pop(key, None)
+                self._mapping.pop(key, None)
+        # Install new metadata before subscribing: ticks may arrive while send
+        # yields. Queued ticks for a removed token are ignored by stream().
+        self._mapping.update(desired)
+        if added:
+            await self._socket.subscribe_scrips([WsToken(*key) for key in sorted(added)])
+        self._subscribed.update(desired)
+        await self.status("connected", f"SFeed subscribed to {len(desired)} contracts; awaiting actual quotes", subscriptions=len(desired))
+
+    async def reconfigure(self, contracts):
+        """Change view demand without closing the broker's existing socket."""
+        desired = list(contracts)
+        if len(desired) > 3000:
+            raise FeedProtocolError("Kotak SFeed subscriptions exceed 3000; narrow the watchlist")
+        self._desired_contracts = desired
+        async with self._subscription_lock:
+            if self._socket is None:
+                # Initial authentication is still pending; stream reads this
+                # latest desired list immediately before its first subscribe.
+                return
+            try:
+                async with asyncio.timeout(10):
+                    await self._apply_subscriptions(desired)
+            except FeedProtocolError:
+                raise
+            except Exception:
+                raise ConnectionError("Kotak SFeed subscription update failed") from None
+
     def configured(self):
         if os.environ.get("KOTAK_SID") and os.environ.get("KOTAK_UCC"):
             return True
@@ -70,7 +119,7 @@ class KotakFeed(ReadOnlyFeed):
             raise FeedProtocolError("Install backend/requirements-brokers.txt to enable Kotak SFeed") from exc
         if len(contracts) > 3000:
             raise FeedProtocolError("Kotak SFeed subscriptions exceed 3000; narrow the watchlist")
-        mapping = {(r["segment"], str(r["token"])): r for r in contracts}
+        self._desired_contracts = list(contracts)
         if os.environ.get("KOTAK_SID"):
             ws = SFeedWebSocket(user=os.environ["KOTAK_UCC"], auth=os.environ["KOTAK_SID"],
                                ack_wait_timeout=0, max_reconnect_attempts=0, max_connect_retries=0)
@@ -91,23 +140,48 @@ class KotakFeed(ReadOnlyFeed):
                 # explanation instead of returning secrets to the dashboard.
                 raise FeedAuthenticationError("Kotak TOTP login failed; refresh the daily TOTP/session on the backend") from None
             ws = client.create_websocket(ack_wait_timeout=0, max_reconnect_attempts=0, max_connect_retries=0)
-        tokens = [WsToken(r["segment"], str(r["token"])) for r in contracts]
         try:
             async with ws:
-                await ws.subscribe_depth(tokens)
-                await self.status("connected", f"SFeed subscribed to {len(contracts)} contracts; awaiting actual quotes", subscriptions=len(contracts))
                 try:
+                    async with self._subscription_lock:
+                        self._socket = ws
+                        self._subscribed = {}
+                        self._mapping = {}
+                        # Level-4 touch line retains LTP, OI, volume, original
+                        # timestamps and best bid/ask, without unused full depth.
+                        async with asyncio.timeout(10):
+                            await self._apply_subscriptions(self._desired_contracts)
                     async for message in ws:
-                        quote = parse_sfeed(message, mapping, received_at=utc_now(), received_ns=time.time_ns())
+                        row = message.model_dump() if hasattr(message, "model_dump") else message
+                        if isinstance(row, dict) and row.get("type") in {"scrip", "scrip_lite", "index"}:
+                            key = (str(row.get("exchange_segment", "")), str(row.get("instrument_token", "")))
+                            if key not in self._mapping:
+                                # A previously subscribed token may already be
+                                # queued when a view is removed. Never use it as
+                                # another contract or reconnect the entire feed.
+                                continue
+                        quote = parse_sfeed(row, self._mapping, received_at=utc_now(), received_ns=time.time_ns())
                         if quote:
                             await self.on_quote(quote)
                 finally:
-                    # Best effort unsubscribe on shutdown/reconfiguration. A
-                    # closed socket removes its subscriptions at the broker.
-                    with contextlib.suppress(Exception):
-                        async with asyncio.timeout(2):
-                            await ws.unsubscribe_depth(tokens)
-        except AuthenticationError:
+                    async with self._subscription_lock:
+                        self._socket = None
+                        tokens = [WsToken(*key) for key in sorted(self._subscribed)]
+                        self._subscribed = {}
+                        self._mapping = {}
+                        # Closing a socket also removes subscriptions at the
+                        # broker; explicit unsubscribe is best effort only.
+                        with contextlib.suppress(Exception):
+                            async with asyncio.timeout(2):
+                                if tokens:
+                                    await ws.unsubscribe_scrips(tokens)
+        except AuthenticationError as exc:
+            # An unresponsive authentication endpoint is a transport outage,
+            # not evidence that the owner's daily session was rejected. Let
+            # FeedManager's bounded backoff reconnect rather than stopping the
+            # collector indefinitely. Never expose the raw SDK response.
+            if str(exc) == "Authentication timeout":
+                raise ConnectionError("Kotak SFeed authentication timed out") from None
             raise FeedAuthenticationError("Kotak SFeed session rejected; renew the daily TOTP/session on the backend") from None
         except SubscriptionError:
             raise FeedProtocolError("Kotak rejected SFeed subscriptions; verify token master, permissions and 3000-token limit") from None

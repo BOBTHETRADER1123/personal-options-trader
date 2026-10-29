@@ -1,3 +1,15 @@
+## Kotak feed lag, subscription continuity and chain reference — 29 October 2026
+
+- Complete isolated regression suite: **543 passed**, one existing Starlette/httpx deprecation warning. Strict TypeScript and production builds passed.
+- Normal chain/expiry/position selection updates now change subscriptions in place; retained position tokens keep their socket. Explicit credential replacement still performs a serialized reauthentication.
+- Kotak uses touch-line level 4 instead of unused level-8 depth. The actual kotakneoapi 3.0.9 binary decoder was tested against a synthetic level-4 frame: LTP, best bid/ask, OI, volume and original timestamps were retained. This is protocol verification, not a live-feed capacity result.
+- Unrelated chain quotes no longer copy every saved trade and payoff graph. A local synthetic benchmark with 390 unrelated quotes and four trades measured median 0.282495s before and 0.012731s after (22.19x faster). Hosted CPU improvement has not yet been measured during an open exchange session.
+- The chain subscribes to an exact same-broker, same-exchange master-listed futures reference, labelled separately from cash spot. Fresh reference data can center and highlight the nearby strike. Missing/stale data does not invent ATM or current prices.
+- Latest chain activity no longer inherits the oldest illiquid strike timestamp. Each row retains its own stale flag and original quote timestamp. Overlapping requests, stale responses and full-table repainting on unrelated dashboard updates are prevented.
+- Closed trades can be reversibly removed from website history, counts and performance totals, then restored from Removed trades. Active/pending positions are rejected, and original snapshots and exports remain intact. Owner, CSRF and explicit-confirmation tests passed.
+- On 28 October actual Kotak MCX quote delivery was observed; before this update the hosted CPU had periods around 47–63% and later warning/critical spikes. The 29 October market-closed health check showed process uptime, four open positions and preserved recording state. These observations do not prove uninterrupted future operation.
+- Source-only runtime ZIP: 56 public files plus verified checksum manifest; credentials and workspace data excluded. Open-market sustained load, reconnection and ATM-reference acceptance remain pending after deployment.
+
 ## Kotak-only release and contract-loading repair — 28 October 2026
 
 - Complete offline regression suite: **527 passed**, one existing Starlette/httpx deprecation warning. TypeScript and the production Vite build passed.

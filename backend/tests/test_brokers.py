@@ -293,8 +293,8 @@ def test_kotak_uses_sfeed_current_sdk_and_sanitizes_auth(monkeypatch):
             if self.fail:raise AuthenticationError('PRIVATE SID must not escape')
             return self
         async def __aexit__(self,*args):pass
-        async def subscribe_depth(self,tokens):self.calls.append(('subscribe',tokens))
-        async def unsubscribe_depth(self,tokens):self.calls.append(('unsubscribe',tokens))
+        async def subscribe_scrips(self,tokens):self.calls.append(('subscribe',tokens))
+        async def unsubscribe_scrips(self,tokens):self.calls.append(('unsubscribe',tokens))
         def __aiter__(self):return self
         async def __anext__(self):
             try:return next(self.values)
@@ -329,3 +329,51 @@ def test_fivepaisa_sdk_routing_hint_uses_only_official_allowlisted_hosts():
     assert feed_url(token('B'),'123').startswith('wss://bopenfeed.5paisa.com/')
     assert feed_url(token('https://evil.invalid'),'123').startswith('wss://openfeed.5paisa.com/')
     assert feed_url('malformed-token','123').startswith('wss://openfeed.5paisa.com/')
+
+
+def test_feed_manager_updates_subscriptions_without_restarting_active_socket():
+    async def run():
+        class Adapter:
+            broker="kotak"
+            def __init__(self):self.started=asyncio.Event();self.calls=0;self.stops=0;self.changes=[]
+            def configured(self):return True
+            async def stream(self,contracts):
+                self.calls+=1;self.contracts=contracts;self.started.set()
+                try:await asyncio.Event().wait()
+                finally:self.stops+=1
+            async def reconfigure(self,contracts):self.changes.append(list(contracts))
+        async def quote(value):pass
+        manager=FeedManager(quote);adapter=Adapter();manager._adapters=[adapter]
+        first=contract(token="123");second=contract(token="456")
+        await manager.start([first]);await asyncio.wait_for(adapter.started.wait(),1)
+        original=manager._tasks[0]
+        await manager.reconfigure([first,second])
+        assert manager._tasks[0] is original and adapter.calls==1 and adapter.stops==0
+        assert adapter.contracts==[first,second] and adapter.changes==[[first,second]]
+        await manager.reconfigure([])
+        assert adapter.stops==1 and manager._tasks==[]
+    asyncio.run(run())
+
+
+def test_feed_manager_failed_subscription_change_joins_old_socket_before_recovery():
+    async def run():
+        class Adapter:
+            broker="kotak"
+            def __init__(self):self.started=asyncio.Event();self.restarted=asyncio.Event();self.calls=0;self.active=0;self.peak=0
+            def configured(self):return True
+            async def stream(self,contracts):
+                self.calls+=1;self.active+=1;self.peak=max(self.peak,self.active);self.contracts=list(contracts)
+                (self.started if self.calls==1 else self.restarted).set()
+                try:await asyncio.Event().wait()
+                finally:self.active-=1
+            async def reconfigure(self,contracts):raise ConnectionError("private broker response")
+        async def quote(value):pass
+        manager=FeedManager(quote);adapter=Adapter();manager._adapters=[adapter]
+        first=contract(token="123");second=contract(token="456")
+        await manager.start([first]);await asyncio.wait_for(adapter.started.wait(),1)
+        await manager.reconfigure([first,second]);await asyncio.wait_for(adapter.restarted.wait(),1)
+        assert adapter.peak==1 and adapter.calls==2 and adapter.contracts==[first,second]
+        state=manager.statuses()["kotak"]
+        assert state["reconnect_count"]==1 and "private broker" not in json.dumps(state)
+        await manager.stop()
+    asyncio.run(run())

@@ -57,11 +57,10 @@ def test_subscription_readers_are_closed_before_socket_await(journal,monkeypatch
     caller.get(Setting,'probe')  # Explicit BEGIN + shared read lock.
     calls=[]
     class Manager:
-        async def stop(self):
+        async def reconfigure(self,contracts):
             assert not caller.in_transaction()
             await asyncio.to_thread(external_write,journal)
-            calls.append('stop')
-        async def start(self,contracts):calls.append(('start',contracts[0]['id']))
+            calls.append(('reconfigure',contracts[0]['id']))
     monkeypatch.setattr(main,'feed_manager',Manager())
     async def run():
         loop_thread=threading.get_ident()
@@ -72,7 +71,7 @@ def test_subscription_readers_are_closed_before_socket_await(journal,monkeypatch
     try:
         asyncio.run(run())
         assert len(heartbeat)==8 and heartbeat[-1]-heartbeat[0]>=.05
-        assert calls==['stop',('start','kotak:mcx_fo:123')]
+        assert calls==[('reconfigure','kotak:mcx_fo:123')]
         assert not caller.in_transaction()
         with journal() as check:assert check.get(Setting,'probe').value=={'writes':1}
     finally:caller.close()

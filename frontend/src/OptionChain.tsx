@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRight, Check, ChevronDown, ChevronUp, Clock3, DownloadCloud, Layers, Loader2, Minus, Plus, RefreshCw, Search, Settings2, ShieldCheck, Trash2, X } from 'lucide-react';
 import { api, money, num, time, uid } from './api';
 import type { Row } from './components';
@@ -60,7 +60,7 @@ function buildupTone(value: unknown) {
 }
 function instrumentId(contract: Row) { return String(contract.instrument_id || contract.id || ''); }
 
-export default function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { initialMode?: 'sample' | 'live'; onBuildStrategy: (selection: ChainSelection) => void; onNotify: (message: string, error?: boolean) => void }) {
+function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { initialMode?: 'sample' | 'live'; onBuildStrategy: (selection: ChainSelection) => void; onNotify: (message: string, error?: boolean) => void }) {
   const [mode, setMode] = useState<'sample' | 'live'>(initialMode);
   const [broker, setBroker] = useState('kotak');
   const [exchange, setExchange] = useState('all');
@@ -77,11 +77,11 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   const [clock, setClock] = useState(Date.now());
   const searchRef = useRef<HTMLDivElement>(null), settingsRef = useRef<HTMLDivElement>(null), tableRef = useRef<HTMLDivElement>(null), atmRef = useRef<HTMLTableRowElement>(null);
   const selectedRef = useRef<Underlying | null>(null), universeRequest = useRef(0), chainRequest = useRef(0), lastRefresh = useRef(0);
-  const scopeRef = useRef('sample:kotak'), initialScroll = useRef('');
+  const scopeRef = useRef('sample:kotak'), initialScroll = useRef(''), chainController = useRef<AbortController | null>(null), chainInFlight = useRef(false);
   selectedRef.current = selected;
 
   useEffect(() => { const timer = setTimeout(() => setSearchTerm(query.trim()), 250); return () => clearTimeout(timer); }, [query]);
-  useEffect(() => { const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, []);
+  useEffect(() => { const timer = setInterval(() => { if (document.visibilityState === 'visible') setClock(Date.now()); }, 5000); return () => clearInterval(timer); }, []);
   useEffect(() => {
     const close = (event: PointerEvent) => {
       const target = event.target as Node;
@@ -114,16 +114,22 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
     if (!selected?.key) return;
     const now = Date.now();
     if (manual && now - lastRefresh.current < 3000) return;
+    const scope = `${mode}:${broker}:${selected.key}:${expiry}`;
+    if (chainInFlight.current && scopeRef.current === scope) return;
     lastRefresh.current = now;
-    const request = ++chainRequest.current, scope = `${mode}:${broker}:${selected.key}:${expiry}`;
+    chainController.current?.abort();
+    const controller = new AbortController(), request = ++chainRequest.current;
+    chainController.current = controller; chainInFlight.current = true;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 25000);
     scopeRef.current = scope;
     setChainLoading(true); setChainError('');
     const params = new URLSearchParams({ underlying: selected.key, mode, broker });
     if (expiry) params.set('expiry', expiry);
     try {
-      const result = await api<ChainResponse>(`/api/option-chain?${params}`);
+      const result = await api<ChainResponse>(`/api/option-chain?${params}`, { signal: controller.signal });
       if (request !== chainRequest.current || scopeRef.current !== scope) return;
-      setChain(result);
+      setChain(result); setClock(Date.now());
       if (!expiry && result.expiry) setExpiry(result.expiry);
       const latest = new Map((result.rows || []).flatMap(r => [r.ce, r.pe]).filter((l): l is ChainLeg => Boolean(l)).map(l => [l.instrument_id, l]));
       setBasket(previous => previous.map(item => {
@@ -131,11 +137,11 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
         if (!updated || item.contract.broker !== broker) return item;
         return { ...item, data: updated, quote: result.quotes?.find(q => q.instrument_id === updated.instrument_id && q.broker === broker) || item.quote };
       }));
-    } catch (error) { if (request === chainRequest.current) setChainError((error as Error).message); }
-    finally { if (request === chainRequest.current) setChainLoading(false); }
+    } catch (error) { if (request === chainRequest.current && (timedOut || (error as Error).name !== 'AbortError')) setChainError(timedOut ? 'The option-chain refresh took too long. Existing quotes keep their original timestamps; retry when the service responds.' : (error as Error).message); }
+    finally { clearTimeout(timeout); if (request === chainRequest.current) { chainInFlight.current = false; setChainLoading(false); } }
   }, [selected?.key, expiry, mode, broker]);
 
-  useEffect(() => { setChain(null); void loadChain(); return () => { ++chainRequest.current; }; }, [loadChain]);
+  useEffect(() => { setChain(null); void loadChain(); return () => { ++chainRequest.current; chainController.current?.abort(); chainInFlight.current = false; }; }, [loadChain]);
   useEffect(() => {
     if (!autoRefresh || !selected) return;
     if (mode === 'live' && chain?.status === 'credentials_required') return;
@@ -152,7 +158,7 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
       initialScroll.current = key;
     }, 50);
     return () => clearTimeout(timer);
-  }, [chain?.rows.length, mode, selected?.key, expiry]);
+  }, [chain?.rows.length, chain?.atm_basis, mode, selected?.key, expiry]);
 
   function changeScope(nextMode: 'sample' | 'live', nextBroker = broker) {
     ++chainRequest.current; ++universeRequest.current;
@@ -196,7 +202,10 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
   const updatedAt = chain?.updated_at || chain?.as_of;
   const updatedMs = updatedAt ? Date.parse(updatedAt) : NaN;
   const age = Number.isFinite(updatedMs) ? Math.max(0, Math.floor((clock - updatedMs) / 1000)) : null;
-  const stale = Boolean(chain?.stale) || (mode === 'live' && age !== null && age > 15);
+  const stale = Boolean(chain?.stale) || (mode === 'live' && age !== null && age > Number(chain?.stale_after_seconds || 15));
+  const reference = chain?.price_reference;
+  const displayedReference = finite(chain?.spot) ? chain.spot : reference?.price;
+  const referenceIsFuture = !finite(chain?.spot) && reference?.kind === 'futures_reference';
   const canNormalize = chain?.quantity_unit === 'units';
   const premiumKnown = basket.length > 0 && basket.every(item => finite(item.data.ltp)&&(!item.contract.demo?Boolean(item.contract.price_multiplier)||item.contract.exchange!=='MCX':true));
   const premium = basket.reduce((sum, item) => sum + (item.side === 'BUY' ? -1 : 1) * Number(item.data.ltp || 0) * item.lots * Number(item.contract.lot_size || 1) * Number(item.contract.price_multiplier || 1), 0);
@@ -220,6 +229,10 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
     return <td className="oc-ltp-cell" title={leg?.quote_at?`Received ${time(leg.quote_at,true)} IST`:"No quote received"}><strong>{valueText(leg?.ltp)}</strong>{mode==='live'&&leg?.stale&&<small className="oc-negative">Stale</small>}<small className={changeTone(leg?.ltp_change_percent)}>{percentText(leg?.ltp_change_percent)}</small></td>;
   }
 
+  // Dashboard P&L messages arrive every second; unchanged strike cells do
+  // not need to render again until their chain, controls or basket changes.
+  const optionTable = useMemo(() => (<table className="oc-table"><colgroup>{activeColumns.map(c => <col key={`ce-${c.key}`} style={{ width: c.width }} />)}<col style={{ width: 94 }} /><col style={{ width: 80 }} /><col style={{ width: 108 }} /><col style={{ width: 80 }} /><col style={{ width: 94 }} />{[...activeColumns].reverse().map(c => <col key={`pe-${c.key}`} style={{ width: c.width }} />)}</colgroup><thead><tr className="oc-side-head"><th colSpan={legColumnCount} className="oc-call-heading"><span>CALLS <i>CE</i></span><small>Call OI {compact(summary.total_call_oi)}</small></th><th rowSpan={2} className="oc-strike-heading">Strike price<small>Strike PCR</small></th><th colSpan={legColumnCount} className="oc-put-heading"><span>PUTS <i>PE</i></span><small>Put OI {compact(summary.total_put_oi)}</small></th></tr><tr className="oc-column-head">{activeColumns.map(c => <th key={`ce-${c.key}`} title={c.title}>{c.label}</th>)}<th>LTP <small>chg (%)</small></th><th>Buy / Sell</th><th>Buy / Sell</th><th>LTP <small>chg (%)</small></th>{[...activeColumns].reverse().map(c => <th key={`pe-${c.key}`} title={c.title}>{c.label}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.strike} className={row.atm ? 'oc-atm-row' : ''} ref={row.atm ? atmRef : undefined}>{activeColumns.map(c => renderCell(row.ce, c, 'ce'))}{ltpCell(row.ce)}{actions(row.ce, 'CE')}<th scope="row" className={`oc-strike-cell ${row.atm ? 'atm' : ''}`}><strong>{num(row.strike, row.strike % 1 ? 2 : 0)}</strong><small>{row.atm ? <span>{chain?.atm_basis === 'futures_reference' ? 'Near futures' : 'ATM'} {finite(chain?.atm_price) ? `· ${num(Number(chain?.atm_price))}` : ''}</span> : valueText(row.pcr)}</small></th>{actions(row.pe, 'PE')}{ltpCell(row.pe)}{[...activeColumns].reverse().map(c => renderCell(row.pe, c, 'pe'))}</tr>)}</tbody></table>), [rows, activeColumns, legColumnCount, maxOi, inLots, canNormalize, mode, basket, basketContext, selected, broker, chain, onNotify]);
+
   return <div className="option-chain-page">
     <section className="oc-toolbar" aria-label="Option chain controls">
       <div className="oc-instrument-search" ref={searchRef}>
@@ -242,13 +255,13 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
     </section>
 
     <section className="oc-chain-panel">
-      <div className="oc-chain-heading"><div><div className="oc-title-row"><h2>{selected?.symbol || 'Options'} <span>Option Chain</span></h2><span className={`oc-data-tag ${mode === 'sample' ? 'sample' : stale ? 'stale' : ''}`}><i />{mode === 'sample' ? 'SYNTHETIC SAMPLE' : stale ? 'STALE DATA' : chain?.status === 'connected' || chain?.status === 'live' ? 'MARKET DATA' : 'MARKET CATALOG'}</span></div><p>{selected ? `${selected.name || selected.symbol} · ${selected.exchange}` : 'Choose a stock or index to inspect its calls and puts.'}{mode === 'live' && master.updated_at ? ` · Master ${time(master.updated_at, true)}` : ''}</p></div><div className="oc-spot"><span>{mode === 'sample' ? 'Sample reference' : 'Underlying spot'}</span><strong>{valueText(chain?.spot)}</strong></div></div>
+      <div className="oc-chain-heading"><div><div className="oc-title-row"><h2>{selected?.symbol || 'Options'} <span>Option Chain</span></h2><span className={`oc-data-tag ${mode === 'sample' ? 'sample' : stale ? 'stale' : ''}`}><i />{mode === 'sample' ? 'SYNTHETIC SAMPLE' : stale ? 'STALE DATA' : chain?.status === 'connected' || chain?.status === 'live' ? 'MARKET DATA' : 'MARKET CATALOG'}</span></div><p>{selected ? `${selected.name || selected.symbol} · ${selected.exchange}` : 'Choose a stock or index to inspect its calls and puts.'}{mode === 'live' && master.updated_at ? ` · Master ${time(master.updated_at, true)}` : ''}</p></div><div className="oc-spot" title={referenceIsFuture ? `${reference.symbol} · ${reference.note} · Received ${time(reference.quote_at, true)} IST` : undefined}><span>{mode === 'sample' ? 'Sample reference' : referenceIsFuture ? `Futures reference · ${expiryLabel(reference.expiry)}` : 'Underlying spot'}</span><strong>{valueText(displayedReference)}</strong>{referenceIsFuture && reference.stale && <small className="oc-negative">Stale reference</small>}</div></div>
       <div className="oc-expiry-row"><span className="oc-control-label">Expiry</span><div className="oc-expiry-tabs">{(chain?.expiries || selected?.expiries || []).slice(0, 3).map(date => <button key={date} className={expiry === date ? 'active' : ''} aria-pressed={expiry === date} onClick={() => setExpiry(date)}>{expiryLabel(date)}</button>)}</div><label className="oc-next-expiry"><select aria-label="Select option expiry" value={expiry} disabled={!selected} onChange={e => setExpiry(e.target.value)}>{!(chain?.expiries || selected?.expiries || []).length && <option value="">Choose expiry</option>}{(chain?.expiries || selected?.expiries || []).map(date => <option key={date} value={date}>{expiryLabel(date, true)}</option>)}</select><ChevronDown size={13} /></label><div className="oc-freshness"><Clock3 size={12} />{chainLoading ? 'Refreshing…' : updatedAt ? `Updated ${time(updatedAt)}${age !== null ? ` · ${age}s ago` : ''}` : 'Awaiting data'}</div></div>
       <div className="oc-summary-row"><div><span>ATM IV</span><strong>{finite(summary.atm_iv) ? `${valueText(summary.atm_iv)}%` : '—'}</strong></div><div><span>Days to expiry</span><strong>{valueText(summary.days_to_expiry, 0)}</strong></div><div><span>Market lot</span><strong>{valueText(summary.lot_size || selected?.lot_size, 0)}</strong></div><div><span>Put / call ratio</span><strong>{valueText(summary.pcr)}</strong></div><div className="oc-display-controls"><label title={canNormalize ? 'Divide OI and volume by each contract’s lot size' : 'This source does not declare quantity units'}><input type="checkbox" checked={inLots} disabled={!canNormalize} onChange={e => setInLots(e.target.checked)} />OI & volume in lots</label><label><input type="checkbox" checked={showBuildup} onChange={e => setShowBuildup(e.target.checked)} />Buildup</label><label><input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} />Auto refresh</label></div><div className="oc-action-tools"><button aria-label="Refresh option chain" title="Refresh option chain; minimum three seconds between requests" disabled={chainLoading || !selected || clock - lastRefresh.current < 3000} onClick={() => void loadChain(true)}><RefreshCw className={chainLoading ? 'oc-spin' : ''} size={16} /></button><div className="oc-settings" ref={settingsRef}><button aria-label="Choose option chain columns" aria-expanded={settingsOpen} title="Choose columns" onClick={() => setSettingsOpen(!settingsOpen)}><Settings2 size={17} /></button>{settingsOpen && <div className="oc-column-popover"><strong>Chain columns</strong><p>LTP, strikes and buy/sell controls stay visible.</p>{COLUMNS.map(column => <label key={column.key}><input type="checkbox" checked={columns.includes(column.key)} onChange={e => setColumns(current => e.target.checked ? [...current, column.key] : current.filter(c => c !== column.key))} />{column.label}</label>)}<button onClick={() => setColumns(DEFAULT_COLUMNS)}>Reset columns</button></div>}</div></div></div>
 
       {(mode === 'sample' || chain?.message || chain?.mode_matches_workspace === false || universeError || chainError) && <div className={`oc-notice ${chainError || universeError ? 'error' : ''}`} role={chainError || universeError ? 'alert' : 'status'}><ShieldCheck size={15} /><span>{chainError || universeError || chain?.message || (mode === 'sample' ? 'Fictional practice contracts and prices. Sample metrics are not exchange observations.' : '')}{chain?.mode_matches_workspace === false && <strong> Switch the workspace data mode in Settings before building a strategy from this chain.</strong>}</span>{chainError && <button onClick={() => void loadChain(true)}>Retry</button>}</div>}
       {chainLoading && !chain ? <div className="oc-empty"><Loader2 className="oc-spin" size={26} /><h3>Loading the option chain</h3><p>Matching contracts, strikes and available market fields.</p></div> : !rows.length ? <div className="oc-empty"><Layers size={27} /><h3>{universeLoading ? 'Loading F&O contracts' : selected ? 'No option chain available yet' : 'Choose an F&O stock or index'}</h3><p>{chainError || universeError || chain?.message || 'Search the instrument list, select an expiry, and the calls and puts will appear here.'}</p>{mode === 'live' && <button className="oc-secondary" onClick={updateMaster} disabled={masterLoading}>{masterLoading ? 'Updating…' : 'Refresh contract list'}</button>}</div> : <div className="oc-table-scroll" ref={tableRef} tabIndex={0} aria-label="Scrollable call and put option chain">
-        <table className="oc-table"><colgroup>{activeColumns.map(c => <col key={`ce-${c.key}`} style={{ width: c.width }} />)}<col style={{ width: 94 }} /><col style={{ width: 80 }} /><col style={{ width: 108 }} /><col style={{ width: 80 }} /><col style={{ width: 94 }} />{[...activeColumns].reverse().map(c => <col key={`pe-${c.key}`} style={{ width: c.width }} />)}</colgroup><thead><tr className="oc-side-head"><th colSpan={legColumnCount} className="oc-call-heading"><span>CALLS <i>CE</i></span><small>Call OI {compact(summary.total_call_oi)}</small></th><th rowSpan={2} className="oc-strike-heading">Strike price<small>Strike PCR</small></th><th colSpan={legColumnCount} className="oc-put-heading"><span>PUTS <i>PE</i></span><small>Put OI {compact(summary.total_put_oi)}</small></th></tr><tr className="oc-column-head">{activeColumns.map(c => <th key={`ce-${c.key}`} title={c.title}>{c.label}</th>)}<th>LTP <small>chg (%)</small></th><th>Buy / Sell</th><th>Buy / Sell</th><th>LTP <small>chg (%)</small></th>{[...activeColumns].reverse().map(c => <th key={`pe-${c.key}`} title={c.title}>{c.label}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.strike} className={row.atm ? 'oc-atm-row' : ''} ref={row.atm ? atmRef : undefined}>{activeColumns.map(c => renderCell(row.ce, c, 'ce'))}{ltpCell(row.ce)}{actions(row.ce, 'CE')}<th scope="row" className={`oc-strike-cell ${row.atm ? 'atm' : ''}`}><strong>{num(row.strike, row.strike % 1 ? 2 : 0)}</strong><small>{row.atm ? <span>ATM {finite(chain?.spot) ? `· ${num(Number(chain?.spot))}` : ''}</span> : valueText(row.pcr)}</small></th>{actions(row.pe, 'PE')}{ltpCell(row.pe)}{[...activeColumns].reverse().map(c => renderCell(row.pe, c, 'pe'))}</tr>)}</tbody></table>
+        {optionTable}
       </div>}
       <div className="oc-table-foot"><span><i className="oc-legend-call" />Calls <i className="oc-legend-put" />Puts <span className="oc-foot-divider">·</span> {rows.length} strikes {expiry ? `· ${expiryLabel(expiry, true)}` : ''}</span><span>— = unavailable from source · LTP is premium per unit · {inLots && canNormalize ? 'OI / volume shown in lots' : 'OI / volume shown as received'}</span></div>
     </section>
@@ -257,3 +270,5 @@ export default function OptionChain({ initialMode = 'sample', onBuildStrategy, o
     <p className="oc-safety-note"><ShieldCheck size={13} />Read-only market data. Every strategy and order in this workspace is a paper simulation.</p>
   </div>;
 }
+
+export default memo(OptionChain);

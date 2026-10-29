@@ -571,3 +571,93 @@ def test_expiry_action_rejects_a_contract_that_has_not_expired(db):
     stored['legs'][0]['expiry']='2099-12-31'
     engine.store_trade(db,stored);db.commit()
     with pytest.raises(HTTPException):action(db,stored,'settle_expiry',leg_id=stored['legs'][0]['id'],price=25000)
+
+
+class _UnrelatedHistoryMustNotBeCopied(dict):
+    def __deepcopy__(self,memo):
+        raise AssertionError('A live quote copied unrelated historical payoff data')
+
+
+def test_chain_quote_does_not_copy_or_persist_unrelated_trade_history(db):
+    engine.update_settings(db,{'logging_mode':'full_history'})
+    previous=enter(db,lots=1)['trades'][0]
+    action(db,previous,'exit_strategy')
+    engine.trade_records(db)  # Warm the committed ledger once.
+    cached=engine._cache(db)['trades'][previous['id']]
+    cached['risk']=_UnrelatedHistoryMustNotBeCopied(cached['risk'])
+    c=contract(offset=3)
+    before=db.scalar(select(func.count()).select_from(QuoteEvent))
+    receipt=quote(db,c,price=82)
+    db.commit()
+    assert receipt is None
+    assert db.scalar(select(func.count()).select_from(QuoteEvent))==before
+    assert engine.latest_quote(db,c['id'],'kotak')['ltp']==82
+    assert db.get(Trade,previous['id']).status=='closed'
+
+
+def test_active_quote_only_copies_matching_ledger_records(db):
+    engine.update_settings(db,{'logging_mode':'full_history'})
+    previous=enter(db,lots=1)['trades'][0]
+    action(db,previous,'exit_strategy')
+    active=enter(db,lots=1)['trades'][0]
+    engine.trade_records(db)
+    cached=engine._cache(db)['trades'][previous['id']]
+    cached['risk']=_UnrelatedHistoryMustNotBeCopied(cached['risk'])
+    quote(db,price=113);db.commit()
+    assert db.get(Trade,active['id']).data['unrealized_pnl']==13*50
+    assert db.get(Trade,previous['id']).data['unrealized_pnl']==0
+
+
+def test_hide_closed_history_is_reversible_and_keeps_recording_and_export_data(db):
+    from app.models import PnlSnapshot
+    closed=enter(db,lots=1)['trades'][0]
+    quote(db,price=120)
+    closed=action(db,closed,'exit_strategy')['trade']
+    active=enter(db,lots=1)['trades'][0]
+    stamp=iso_now()
+    db.add(PnlSnapshot(trade_id=closed['id'],snapshot_second=1,timestamp=stamp,
+                       data={'net_pnl':closed['net_pnl'],'timestamp':stamp}))
+    db.commit()
+    timeline_count=db.scalar(select(func.count()).select_from(Timeline).where(Timeline.trade_id==closed['id']))
+    job=db.scalar(select(ExportJob).where(ExportJob.trade_id==closed['id']))
+    assert job is not None
+    removed=engine.set_trade_history_hidden(db,closed['id'],True);db.commit()
+    assert removed['history_hidden'] is True
+    assert [trade['id'] for trade in engine.list_trades(db)]==[active['id']]
+    assert {trade['id'] for trade in engine.list_trades(db,include_hidden=True)}=={active['id'],closed['id']}
+    visible=engine.dashboard(db)
+    assert visible['trade_counts']['executions']==1
+    assert visible['trade_counts']['closed_executions']==0
+    assert visible['summary']['net_pnl']==0
+    assert {trade['id'] for trade in visible['trades']}=={active['id']}
+    assert db.scalar(select(func.count()).select_from(Timeline).where(Timeline.trade_id==closed['id']))==timeline_count
+    assert db.scalar(select(func.count()).select_from(PnlSnapshot).where(PnlSnapshot.trade_id==closed['id']))==1
+    assert db.get(Trade,closed['id']).status=='closed'
+    assert db.get(ExportJob,job.id) is not None
+    engine.set_trade_history_hidden(db,closed['id'],True);db.commit()
+    assert db.scalar(select(func.count()).select_from(Event).where(Event.trade_id==closed['id'],Event.kind=='history_removed'))==1
+    restored=engine.set_trade_history_hidden(db,closed['id'],False);db.commit()
+    assert restored['history_hidden'] is False
+    assert engine.dashboard(db)['summary']['net_pnl']==closed['net_pnl']
+    assert engine.dashboard(db)['trade_counts']['executions']==2
+    assert db.scalar(select(func.count()).select_from(Event).where(Event.trade_id==closed['id'],Event.kind=='history_restored'))==1
+
+
+@pytest.mark.parametrize('pending',[False,True])
+def test_history_cleanup_never_hides_open_or_pending_positions(db,pending):
+    trade=enter(db,lots=1,order_type='LIMIT' if pending else 'MARKET',price=90 if pending else None)['trades'][0]
+    with pytest.raises(HTTPException) as rejected:
+        engine.set_trade_history_hidden(db,trade['id'],True)
+    assert rejected.value.status_code==400
+    assert not db.get(Trade,trade['id']).data.get('history_hidden')
+    assert engine.list_trades(db)[0]['id']==trade['id']
+
+
+def test_history_visibility_change_rolls_back_without_losing_trade(db):
+    trade=enter(db,lots=1)['trades'][0]
+    closed=action(db,trade,'exit_strategy')['trade']
+    engine.set_trade_history_hidden(db,trade['id'],True)
+    db.rollback()
+    assert not db.get(Trade,trade['id']).data.get('history_hidden')
+    assert engine.list_trades(db)[0]['id']==closed['id']
+    assert not db.scalar(select(Event).where(Event.trade_id==trade['id'],Event.kind=='history_removed'))

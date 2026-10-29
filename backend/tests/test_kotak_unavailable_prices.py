@@ -79,13 +79,15 @@ def fake_sdk(monkeypatch, socket):
 def test_stream_continues_after_untraded_strikes(monkeypatch):
     class Socket:
         def __init__(self):
-            self.messages=iter([row(last_traded_price=0), row("456",last_traded_price=45),
+            self.messages=iter([row(last_traded_price=0), row("456",last_traded_price=45, buy=[{"price":44.9}],
+                                    sell=[{"price":45.1}], volume_traded_today=250,
+                                    open_interest=600, last_update_time=1792464001),
                                 row(), row(last_traded_price=12)])
             self.subscribed=[];self.unsubscribed=[]
         async def __aenter__(self):return self
         async def __aexit__(self,*args):pass
-        async def subscribe_depth(self,tokens):self.subscribed.extend(tokens)
-        async def unsubscribe_depth(self,tokens):self.unsubscribed.extend(tokens)
+        async def subscribe_scrips(self,tokens):self.subscribed.extend(tokens)
+        async def unsubscribe_scrips(self,tokens):self.unsubscribed.extend(tokens)
         def __aiter__(self):return self
         async def __anext__(self):
             try:return next(self.messages)
@@ -97,6 +99,11 @@ def test_stream_continues_after_untraded_strikes(monkeypatch):
     asyncio.run(KotakFeed(on_quote,on_status).stream([contract("123"),contract("456")]))
     assert [(q["instrument_id"],q["ltp"]) for q in quotes]==[("kotak:mcx_fo:456",45),("kotak:mcx_fo:123",12)]
     assert socket.subscribed==socket.unsubscribed==[("mcx_fo","123"),("mcx_fo","456")]
+    # The fake deliberately has only touch-line methods, so requesting unused
+    # full depth fails this test. Touch-line still supplies paper-fill inputs.
+    assert quotes[0]["bid"]==44.9 and quotes[0]["ask"]==45.1
+    assert quotes[0]["volume"]==250 and quotes[0]["open_interest"]==600
+    assert quotes[0]["exchange_timestamp"]=="2026-10-20T02:40:01.000000+00:00"
 
 
 @pytest.mark.parametrize("failure",["authentication","subscription"])
@@ -112,3 +119,80 @@ def test_sdk_failures_remain_visible_and_sanitized(monkeypatch,failure):
     with pytest.raises(expected) as error:
         asyncio.run(KotakFeed(on_quote,on_status).stream([contract()]))
     assert "private-sdk-response" not in str(error.value)
+
+
+@pytest.mark.parametrize("sdk_message,expected",[
+    ("Authentication timeout",ConnectionError),
+    ("Session rejected with private-sdk-response",FeedAuthenticationError),
+])
+def test_authentication_timeout_retries_but_actual_rejection_needs_renewal(monkeypatch,sdk_message,expected):
+    class Socket:
+        async def __aenter__(self):raise auth(sdk_message)
+        async def __aexit__(self,*args):pass
+    auth,_=fake_sdk(monkeypatch,Socket())
+    async def on_quote(value):pytest.fail("No unauthenticated quote may be published")
+    async def on_status(*args):pass
+    with pytest.raises(expected) as error:
+        asyncio.run(KotakFeed(on_quote,on_status).stream([contract()]))
+    assert "private-sdk-response" not in str(error.value)
+
+
+def test_live_subscription_changes_keep_position_token_and_ignore_queued_removed_ticks(monkeypatch):
+    async def run():
+        class Socket:
+            def __init__(self):
+                self.messages=asyncio.Queue();self.calls=[];self.ready=asyncio.Event()
+            async def __aenter__(self):return self
+            async def __aexit__(self,*args):pass
+            async def subscribe_scrips(self,tokens):
+                self.calls.append(("subscribe",tokens));self.ready.set()
+            async def unsubscribe_scrips(self,tokens):self.calls.append(("unsubscribe",tokens))
+            def __aiter__(self):return self
+            async def __anext__(self):return await self.messages.get()
+        socket=Socket();fake_sdk(monkeypatch,socket)
+        quotes=[];received=asyncio.Event()
+        async def on_quote(value):quotes.append(value);received.set()
+        async def on_status(*args):pass
+        feed=KotakFeed(on_quote,on_status)
+        task=asyncio.create_task(feed.stream([contract("123"),contract("456")]))
+        await asyncio.wait_for(socket.ready.wait(),1)
+        await feed.reconfigure([contract("456"),contract("789")])
+        assert socket.calls==[("subscribe",[("mcx_fo","123"),("mcx_fo","456")]),
+                              ("unsubscribe",[("mcx_fo","123")]),
+                              ("subscribe",[("mcx_fo","789")])]
+        # 456 is an active position: it is never unsubscribed during this change.
+        await socket.messages.put(row("123",last_traded_price=999))
+        await socket.messages.put(row("789",last_traded_price=20))
+        await asyncio.wait_for(received.wait(),1)
+        assert [(q["instrument_id"],q["ltp"]) for q in quotes]==[("kotak:mcx_fo:789",20)]
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task,return_exceptions=True)
+        assert socket.calls[-1]==("unsubscribe",[("mcx_fo","456"),("mcx_fo","789")])
+    asyncio.run(run())
+
+
+def test_selection_changed_during_authentication_subscribes_only_latest_demand(monkeypatch):
+    async def run():
+        class Socket:
+            def __init__(self):
+                self.entered=asyncio.Event();self.release=asyncio.Event();self.ready=asyncio.Event();self.subscribed=[]
+            async def __aenter__(self):
+                self.entered.set();await self.release.wait();return self
+            async def __aexit__(self,*args):pass
+            async def subscribe_scrips(self,tokens):self.subscribed.extend(tokens);self.ready.set()
+            async def unsubscribe_scrips(self,tokens):pass
+            def __aiter__(self):return self
+            async def __anext__(self):await asyncio.Event().wait()
+        socket=Socket();fake_sdk(monkeypatch,socket)
+        async def on_quote(value):pass
+        async def on_status(*args):pass
+        feed=KotakFeed(on_quote,on_status)
+        task=asyncio.create_task(feed.stream([contract("123")]))
+        await asyncio.wait_for(socket.entered.wait(),1)
+        await feed.reconfigure([contract("456")])
+        socket.release.set()
+        await asyncio.wait_for(socket.ready.wait(),1)
+        assert socket.subscribed==[("mcx_fo","456")]
+        task.cancel();await asyncio.gather(task,return_exceptions=True)
+    asyncio.run(run())

@@ -70,19 +70,36 @@ def _orm_changes_cache(db,flush_context,instances):
         if isinstance(row,Trade) and state['trades'] is not None:state['trades'].pop(row.id,None)
 
 
-def trade_records(db):
-    """The service runs one writer; reuse its ledger instead of rereading JSON."""
+def _sync_trade_cache(db,state):
+    """Caller holds the cache lock; never expose these mutable ledger values."""
+    if state['trades'] is None:
+        state['trades']={row.id:copy.deepcopy(row.data) for row in db.scalars(select(Trade))}
+    # Include direct ORM changes in the caller's transaction (including
+    # maintenance/test imports), without publishing stale cached values.
+    for row in list(db.new)+list(db.dirty):
+        if isinstance(row,Trade):state['trades'][row.id]=copy.deepcopy(row.data)
+    for row in db.deleted:
+        if isinstance(row,Trade):state['trades'].pop(row.id,None)
+
+
+def trade_records(db,predicate=None):
+    """Copy only the requested ledger records, after read-only filtering.
+
+    The service runs one writer. A chain tick must not copy every historical
+    trade and its payoff graph merely to discover it has no open position.
+    """
     state=_cache(db)
     with _cache_lock:
-        if state['trades'] is None:
-            state['trades']={row.id:copy.deepcopy(row.data) for row in db.scalars(select(Trade))}
-        # Include direct ORM changes in the caller's transaction (including
-        # maintenance/test imports), without publishing stale cached values.
-        for row in list(db.new)+list(db.dirty):
-            if isinstance(row,Trade):state['trades'][row.id]=copy.deepcopy(row.data)
-        for row in db.deleted:
-            if isinstance(row,Trade):state['trades'].pop(row.id,None)
-        return copy.deepcopy(list(state['trades'].values()))
+        _sync_trade_cache(db,state)
+        values=state['trades'].values()
+        return copy.deepcopy([trade for trade in values if predicate is None or predicate(trade)])
+
+
+def _quote_has_position(db,quote,settings):
+    state=_cache(db)
+    with _cache_lock:
+        _sync_trade_cache(db,state)
+        return any(_trade_uses_quote(trade,quote,settings) for trade in state['trades'].values())
 
 def set_catalog(value):
     global catalog
@@ -527,7 +544,7 @@ def record_quote(db,quote,process=True):
     if contract:
         for key in ('underlying','exchange','segment','symbol','expiry','strike','option_type'):quote.setdefault(key,contract.get(key))
     settings=get_settings(db);compact=settings['logging_mode'] in {'summary','full_history'}
-    interested=not compact or any(_trade_uses_quote(trade,quote,settings) for trade in trade_records(db))
+    interested=not compact or _quote_has_position(db,quote,settings)
     if not interested:
         cache_quote(db,quote,persist=False)
         return None
@@ -576,8 +593,7 @@ def revalue_quote(db,entry):
     quote={**entry.data,'event_id':entry.id}
     settings=get_settings(db)
     failed=False
-    for trade in trade_records(db):
-        if not _trade_uses_quote(trade,quote,settings):continue
+    for trade in trade_records(db,lambda value:_trade_uses_quote(value,quote,settings)):
         if trade.get('_last_quote_event_id',0)>=entry.id:continue
         changed=False
         try:
@@ -842,10 +858,32 @@ def take_snapshots(db,now=None,calendar=None,lease=None):
         _queue_chart_point(db,trade['id'],payload)
     return result
 
-def list_trades(db,demo=None):
+def set_trade_history_hidden(db,trade_id,hidden):
+    """Reversibly remove a finished paper trade from website performance.
+
+    The durable trade, quotes, snapshots and generated exports remain intact.
+    An open or pending position can never disappear through history cleanup.
+    """
+    if not isinstance(hidden,bool):raise HTTPException(422,'Choose whether the trade should be removed from history.')
+    row=db.get(Trade,trade_id)
+    if row is None:raise HTTPException(404,'Trade not found.')
+    trade=copy.deepcopy(row.data)
+    if row.status not in {'closed','cancelled'} or trade.get('status') not in {'closed','cancelled'} or any(
+            leg.get('open_lots',0)>0 or leg.get('status')=='pending' for leg in trade.get('legs',[])):
+        raise HTTPException(400,'Only a finished paper trade can be removed from history. Open positions must remain visible.')
+    if bool(trade.get('history_hidden'))!=hidden:
+        at=iso_now();trade['history_hidden']=hidden;trade['history_visibility_changed_at']=at
+        event(db,trade,'history_removed' if hidden else 'history_restored',
+              {'history_hidden':hidden,'records_preserved':True,'note':'Owner requested a reversible change to website trade history and performance.'},at)
+        store_trade(db,trade)
+    return public_trade(trade,get_settings(db))
+
+
+def list_trades(db,demo=None,include_hidden=False):
     settings=get_settings(db)
     demo=settings['demo_mode'] if demo is None else demo
-    return [public_trade(t,settings) for t in trade_records(db) if bool(t.get('demo'))==bool(demo)][::-1]
+    return [public_trade(t,settings) for t in trade_records(db,lambda value:
+            bool(value.get('demo'))==bool(demo) and (include_hidden or not value.get('history_hidden')))][::-1]
 
 def _dashboard_quotes(db,settings):
     state=_cache(db)
@@ -875,7 +913,7 @@ def dashboard(db,statuses=None):
     # Summaries use small ledger headers. Only open positions and 50 recent
     # closed trades cross the WebSocket; old risk graphs are not copied/sent.
     with _cache_lock:
-        source=[t for t in state['trades'].values() if bool(t.get('demo'))==bool(settings['demo_mode'])]
+        source=[t for t in state['trades'].values() if bool(t.get('demo'))==bool(settings['demo_mode']) and not t.get('history_hidden')]
         trades=[{**{k:v for k,v in t.items() if k not in {'risk','legs'}},'legs':[{'open_lots':l.get('open_lots',0)} for l in t.get('legs',[])]} for t in source]
         visible=[t for t in source if t['status'] in ('open','pending')]+sorted([t for t in source if t['status'] not in ('open','pending')],key=lambda t:t.get('created_at',''),reverse=True)[:50]
         visible_trades=[public_trade(t,settings) for t in visible]

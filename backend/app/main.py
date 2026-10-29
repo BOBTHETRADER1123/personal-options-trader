@@ -143,8 +143,12 @@ async def refresh_selected_feeds(db,force=False):
             contracts=[c for c in contracts if exchange_calendar.state(c,now)['open']]
         identities=frozenset((c['id'],c['broker']) for c in contracts)
         if force or identities!=_feed_contract_ids:
-            await feed_manager.stop()
-            await feed_manager.start(contracts)
+            if force:
+                # A saved credential change needs a new authenticated socket.
+                await feed_manager.stop()
+                await feed_manager.start(contracts)
+            else:
+                await feed_manager.reconfigure(contracts)
             _feed_contract_ids=identities
 
 def demo_quote(contract,broker,now=None):
@@ -561,14 +565,14 @@ def logout(response:Response,current=Depends(require_session),db=Depends(get_db)
 def get_dashboard(db=Depends(get_db)):return engine.dashboard(db,feed_manager.statuses() if feed_manager else feed_status)
 
 @app.get('/api/trades',dependencies=[Depends(require_session)])
-def trades(demo:bool|None=None,status:str|None=None,offset:int=Query(default=0,ge=0),limit:int=Query(default=100,ge=1,le=200),db=Depends(get_db)):
+def trades(demo:bool|None=None,status:str|None=None,hidden:bool=False,offset:int=Query(default=0,ge=0),limit:int=Query(default=100,ge=1,le=200),db=Depends(get_db)):
     mode=engine.get_settings(db)['demo_mode'] if demo is None else demo
     query=select(Trade)
     if status=='closed':query=query.where(Trade.status.in_(['closed','cancelled']))
     elif status=='active':query=query.where(Trade.status.in_(['open','pending']))
     # Portable keyset-sized page; the date in each trade is retained rather
     # than reinterpreting this as a daily-only trade count.
-    rows=sorted([r.data for r in db.scalars(query) if bool(r.data.get('demo'))==bool(mode)],key=lambda t:t.get('created_at',''),reverse=True)
+    rows=sorted([r.data for r in db.scalars(query) if bool(r.data.get('demo'))==bool(mode) and bool(r.data.get('history_hidden'))==hidden],key=lambda t:t.get('created_at',''),reverse=True)
     return [engine.public_trade(t,engine.get_settings(db)) for t in rows[offset:offset+limit]]
 
 @app.post('/api/trades',dependencies=[Depends(require_session)])
@@ -598,6 +602,21 @@ def get_trade(trade_id:str,include_history:bool=True,history_limit:int=Query(def
     return {'trade':engine.public_trade(row.data,engine.get_settings(db)),'events':events,'timeline':timeline,
             'history_limit':history_limit,'next_before_second':snapshots[-1].snapshot_second if len(snapshots)==history_limit else None,
             'recording_gaps':[{'start_second':g.start_second,'end_second':g.end_second,'reason':g.reason} for g in db.scalars(select(RecordingGap).where(RecordingGap.trade_id==trade_id).limit(100))] if include_history else []}
+
+class HistoryVisibilityInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    hidden:bool=Field(strict=True)
+    confirmed:Literal[True]
+
+@app.post('/api/trades/{trade_id}/history-visibility',dependencies=[Depends(require_session)])
+async def trade_history_visibility(trade_id:str,payload:HistoryVisibilityInput,db=Depends(get_db)):
+    async with write_lock:
+        await ensure_writer(db)
+        def persist():
+            result=engine.set_trade_history_hidden(db,trade_id,payload.hidden)
+            db.commit()
+            return result
+        return await asyncio.to_thread(persist)
 
 @app.post('/api/trades/{trade_id}/actions',dependencies=[Depends(require_session)])
 async def trade_action(trade_id:str,payload:ActionInput,db=Depends(get_db)):
