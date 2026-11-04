@@ -280,7 +280,11 @@ def create_test_strategy(db,**settings):
     contracts=[{'id':f'kotak:nse_fo:{index}','instrument_id':f'kotak:nse_fo:{index}',
                 'broker':'kotak','exchange':'NSE','segment':'nse_fo','underlying':'NIFTY',
                 'symbol':f'TEST_{index}_CE','strike':23000+index*50,'expiry':'2027-01-01',
-                'option_type':'CE','lot_size':50,'price_multiplier':1,'spot':23000,'demo':False}
+                'option_type':'CE','lot_size':50,'price_multiplier':1,'spot':23000,'demo':False,
+                # Explicit provenance for this isolated synthetic master fixture;
+                # production never bypasses fresh official-master validation.
+                'master_active':True,'master_refresh_at':iso_now(),
+                'master_source_date':datetime.now(__import__('zoneinfo').ZoneInfo('Asia/Kolkata')).date().isoformat()}
                for index in (1,2)]
     class FixtureCatalog:
         def find(self,identity,*args):return next((c for c in contracts if c['id']==identity),None)

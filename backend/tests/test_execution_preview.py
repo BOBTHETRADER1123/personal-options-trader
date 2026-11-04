@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from app import engine
@@ -41,7 +43,10 @@ def case(side='BUY',**overrides):
     now=datetime.now(timezone.utc)
     contract={'id':'kotak:nse_fo:123','broker':'kotak','instrument_id':'kotak:nse_fo:123',
         'exchange':'NSE','segment':'nse_fo','lot_size':50,'price_multiplier':1,
-        'expiry':'2035-10-29','underlying':'NIFTY','option_type':'CE','strike':25000,'symbol':'TEST','demo':False}
+        'expiry':'2035-10-29','underlying':'NIFTY','option_type':'CE','strike':25000,'symbol':'TEST','demo':False,
+        # Isolated synthetic catalog provenance, never a live-master bypass.
+        'master_active':True,'master_refresh_at':now.isoformat(),
+        'master_source_date':now.astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat()}
     value={'contract':contract,'leg':{'side':side,'lots':2,'order_type':'MARKET','price':1},
         'quote':{'broker':'kotak','instrument_id':contract['id'],'ltp':100,'bid':99,'ask':101,
                  'received_at':now.isoformat(),'demo':False},
@@ -66,6 +71,8 @@ def test_frontend_fill_prices_match_actual_backend_orders(monkeypatch):
     for item,preview in zip(cases,results,strict=True):
         contract=item['contract'];quote=item['quote'];settings=item['settings']
         monkeypatch.setattr(engine,'contract_for',lambda *args,contract=contract:contract)
+        monkeypatch.setattr(engine,'catalog',SimpleNamespace(find=lambda identity,*args,contract=contract:
+            contract if identity==contract['id'] else None))
         monkeypatch.setattr(engine,'resolve_quote',lambda *args,quote=quote:copy.deepcopy(quote))
         request={**item['leg'],'instrument_id':contract['id']}
         actual=engine.new_leg(None,request,'kotak',settings,quote['received_at'])

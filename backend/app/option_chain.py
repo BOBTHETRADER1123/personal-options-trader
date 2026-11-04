@@ -7,13 +7,11 @@ Legacy chain tables remain defined so historical databases load without loss.
 from __future__ import annotations
 
 import asyncio
-import csv
-import io
 import json
+import logging
 import math
 import os
 import time
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -24,11 +22,15 @@ from sqlalchemy import JSON, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from . import engine
-from .database import Base, get_db, iso_now
-from .instruments import BROKERS, IST, normalize_row
+from .database import Base, get_db, iso_now, bounded_read
+from .instruments import BROKERS, IST, normalize_row, ContractCatalog
 from .security import require_session
-from .models import LatestQuote
+from .models import LatestQuote, Trade
 from .brokers import KotakFeed
+from .master_diagnostics import safe_master_traceback
+from .kotak_master import download as official_master_download, MasterRefreshError, SEGMENTS
+
+log=logging.getLogger('personal_options_trader.master')
 
 router = APIRouter(prefix='/api/option-chain', tags=['Read-only option chain'], dependencies=[Depends(require_session)])
 _write_lock = asyncio.Lock()
@@ -37,6 +39,7 @@ _refresh_feeds = None
 _requested: dict[str, tuple[float, set[str]]] = {}
 _attempts: dict[str, float] = {}
 _universes = WeakKeyDictionary()
+_refresh_states = WeakKeyDictionary()
 MIN_INTERVAL = 3.0
 MASTER_REFRESH_SECONDS = 300
 CHAIN_SUBSCRIPTION_SECONDS = 600
@@ -175,81 +178,182 @@ def live_universe(broker):
     return groups
 
 
+def _refresh_state(broker):
+    if engine.catalog is None:
+        return {}
+    states = _refresh_states.setdefault(engine.catalog, {})
+    if broker not in states:
+        try:
+            saved = json.loads(engine.catalog.path.with_suffix('.refresh-status.json').read_text(encoding='utf-8'))
+            # This app-created sidecar contains structured diagnostics only.
+            states[broker] = saved.get(broker, {}) if isinstance(saved, dict) else {}
+        except (OSError, ValueError, TypeError):
+            states[broker] = {}
+    return states[broker]
+
+
 def master_status(db=None, broker='kotak'):
+    validate_broker(broker)
     rows = live_universe(broker)
-    dates = [row['updated_at'] for row in rows.values() if row.get('updated_at')]
-    stamp = min(dates, default=None)
-    return {'status': 'ready' if rows else 'not_loaded', 'broker': broker, 'updated_at': stamp,
+    metadata = (getattr(engine.catalog, 'master_metadata', {}) or {}).get(broker, {})
+    state = _refresh_state(broker)
+    stamp = metadata.get('last_successful_refresh_at')
+    legacy_stamp = min((row['updated_at'] for row in rows.values() if row.get('updated_at')), default=None)
+    segments = metadata.get('segments', {})
+    today = datetime.now(IST).date().isoformat()
+    verified = bool(stamp and age(stamp) <= 86400 and set(segments) == set(SEGMENTS)
+                    and all(value.get('source_date') == today for value in segments.values()))
+    return {'status': 'ready' if rows else 'not_loaded', 'broker': broker,
+            'updated_at': stamp or legacy_stamp, 'last_successful_refresh_at': stamp,
+            'last_attempt_at': state.get('last_attempt_at'), 'last_error': state.get('last_error'),
+            'refresh_in_progress': _master_lock.locked(), 'segment_status': segments,
+            'sources': [{'segment': segment, **details} for segment, details in segments.items()],
             'source': 'selected_broker_instrument_master', 'underlying_count': len(rows),
-            'stale': bool(stamp and age(stamp) > 86400), 'read_only': True}
+            'stale': not verified, 'new_trades_allowed': verified, 'read_only': True}
 
 
 def download_master(broker):
     validate_broker(broker)
-    segments = ('nse_fo', 'bse_fo', 'mcx_fo')
-    os.environ['NEO_LOG_LEVEL'] = 'NOLOG'
-    os.environ['NEO_LOG_FILE_ENABLED'] = 'false'
-    from neo_api_client import NeoAPI
-    from neo_api_client.logger import setup_logging
-    setup_logging(level='NOLOG', file_enabled=False)
-    if not os.getenv('KOTAK_CONSUMER_KEY'):
-        raise ValueError('Kotak consumer key required for official instrument master')
-    client = NeoAPI(consumer_key=os.environ['KOTAK_CONSUMER_KEY'], environment='prod', timeout=30)
-    result = []
-    total = 0
-    for segment in segments:
-        url = client.scrip_master(exchange_segment=segment)
-        if not isinstance(url, str) or not url.startswith('https://'):
-            raise ValueError('Broker did not return an HTTPS master URL')
-        with urllib.request.urlopen(url, timeout=90) as response:
-            raw = response.read(100 * 1024 * 1024 + 1)
-        total += len(raw)
-        if total > 100 * 1024 * 1024:
-            raise ValueError('Broker master exceeds 100 MiB bounded download size')
-        for row in csv.DictReader(io.StringIO(raw.decode('utf-8-sig'))):
-            try:
-                result.append(normalize_row(broker, row, segment))
-            except ValueError as exc:
-                if str(exc) not in {'Not an option contract', 'Unsupported derivative segment'}:
-                    raise
-    if not result:
-        raise ValueError('No validated current derivatives found; previous master retained')
-    return result
+    return official_master_download()
 
 
-def save_master(broker, contracts):
+def prepare_master(broker, contracts, retained_ids=None):
+    """Validate a complete replacement before atomic publication; no trade writes."""
     path = engine.catalog.path
     path.parent.mkdir(parents=True, exist_ok=True)
-    previous = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {'instruments': []}
-    old = previous.get('instruments', []) if isinstance(previous, dict) else previous
-    rows = [r for r in old if r.get('broker') != broker] + contracts
-    encoded = json.dumps({'updated_at': iso_now(), 'instruments': rows}, separators=(',', ':'))
-    if len(encoded.encode('utf-8')) > 256 * 1024 * 1024:
-        raise ValueError('Instrument cache exceeds 256 MiB bound')
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(encoded, encoding='utf-8')
+    retained_ids = set(retained_ids or ())
+    imported = list(contracts)
+    if not imported:
+        raise MasterRefreshError('empty_master', 'cache_validation')
+    new_ids = {row['id'] for row in imported}
+    if len(new_ids) != len(imported):
+        raise MasterRefreshError('duplicate_contract_id', 'cache_validation')
+    # Saved journal legs are immutable history. Missing old identities can still
+    # be marked/exited, but must not certify a new exposure after a refresh.
+    previous = engine.catalog._live
+    retained = [{**row, 'master_active': False} for row in previous
+                if row.get('broker') == broker and row['id'] in retained_ids and row['id'] not in new_ids]
+    rows = [row for row in previous if row.get('broker') != broker] + imported + retained
+    metadata = dict(getattr(engine.catalog, 'master_metadata', {}) or {})
+    metadata[broker] = dict(getattr(contracts, 'metadata', {}))
+    payload = {'updated_at': iso_now(), 'instruments': rows, 'master_refresh': metadata}
+    encoded = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    if len(encoded) > 256 * 1024 * 1024:
+        raise MasterRefreshError('cache_size_limit', 'cache_validation')
+    temporary = path.with_suffix('.candidate.json')
+    try:
+        with temporary.open('wb') as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        candidate = ContractCatalog(temporary)
+        if candidate.error:
+            raise MasterRefreshError('invalid_normalized_cache', 'cache_validation')
+        return candidate
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _assert_active_identities(candidate, trades):
+    current = {row['id']: row for row in candidate._live}
+    keys = ('expiry', 'underlying', 'exchange', 'segment', 'option_type', 'strike', 'lot_size')
+    for trade in trades:
+        if trade.get('demo') is not False or trade.get('status') not in {'open', 'pending'}:
+            continue
+        for leg in trade.get('legs', []):
+            if leg.get('status') not in {'open', 'pending'}:
+                continue
+            row = current.get(leg.get('instrument_id'))
+            if row and any(leg.get(key) != row.get(key) for key in keys):
+                raise MasterRefreshError('active_contract_identity_changed', 'cache_validation')
+
+
+def publish_master(candidate):
+    candidate.path.replace(engine.catalog.path)
+    # The expensive encoding, fsync and validation already happened outside
+    # the writer lock. Publication is one rename plus reference replacement.
+    engine.catalog._live = candidate._live
+    engine.catalog.master_metadata = candidate.master_metadata
+    engine.catalog.error = None
+    engine.catalog.revision += 1
+
+
+def save_master(broker, contracts, retained_ids=None):
+    candidate = prepare_master(broker, contracts, retained_ids)
+    publish_master(candidate)
+
+
+def _referenced_trades(db, broker):
+    with bounded_read(db):
+        return db.scalars(select(Trade.data).where(Trade.broker == broker)).all()
+
+
+def _persist_refresh_state(broker, state):
+    # Persist only sanitized, bounded app-generated diagnostics, never payloads.
+    path = engine.catalog.path.with_suffix('.refresh-status.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps({broker: state}, separators=(',', ':')).encode('utf-8')
+    if len(data) > 8192:
+        raise ValueError('Master diagnostic state exceeds bound')
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('wb') as output:
+        output.write(data); output.flush(); os.fsync(output.fileno())
     temporary.replace(path)
-    engine.catalog.reload()
 
 
 async def refresh_master(db, force=False, broker='kotak'):
     validate_broker(broker)
+    if _master_lock.locked():
+        return {**master_status(db, broker), 'message': 'An official contract refresh is already in progress.'}
     async with _master_lock:
-        state = master_status(db, broker)
-        if state['updated_at'] and age(state['updated_at']) < (MASTER_REFRESH_SECONDS if force else 86400):
-            return state
+        current = master_status(db, broker)
+        if current['new_trades_allowed'] and current['updated_at'] and age(current['updated_at']) < (MASTER_REFRESH_SECONDS if force else 86400):
+            return {**current, 'refresh_in_progress': False}
         if time.monotonic() - _attempts.get(broker, -MASTER_REFRESH_SECONDS) < MASTER_REFRESH_SECONDS:
-            return {**state, 'message': 'Refresh is rate limited to one attempt per five minutes.'}
+            return {**current, 'refresh_in_progress': False, 'message': 'Refresh is rate limited to one attempt per five minutes.'}
         _attempts[broker] = time.monotonic()
-        db.rollback()  # Do not hold a Neon transaction during a master download.
+        state = _refresh_state(broker)
+        state.update(last_attempt_at=iso_now(), last_error=None)
+        db.rollback()  # Release reader before network work or acquiring writer.
         try:
             contracts = await asyncio.to_thread(download_master, broker)
-            async with _write_lock:
-                await asyncio.to_thread(save_master, broker, contracts)
-            return master_status(db, broker)
+            for publication_attempt in range(3):
+                saved = _referenced_trades(db, broker)
+                retained = {leg.get('instrument_id') for trade in saved for leg in trade.get('legs', [])}
+                candidate = await asyncio.to_thread(prepare_master, broker, contracts, retained)
+                try:
+                    async with _write_lock:
+                        # Recheck trades created while staging, releasing the
+                        # read transaction before the atomic file publication.
+                        latest = _referenced_trades(db, broker)
+                        required = {leg.get('instrument_id') for trade in latest for leg in trade.get('legs', [])}
+                        available = {row['id'] for row in candidate._live}
+                        previous = {row['id'] for row in engine.catalog._live}
+                        if (required & previous) - available:
+                            continue
+                        _assert_active_identities(candidate, latest)
+                        publish_master(candidate)
+                        break
+                finally:
+                    candidate.path.unlink(missing_ok=True)
+            else:
+                raise MasterRefreshError('catalog_changed_during_refresh', 'cache_publication')
+            state['last_error'] = None
         except Exception as exc:
-            return {**state, 'status': 'cached' if state['underlying_count'] else 'unavailable',
-                    'message': f'Official {broker} master unavailable ({type(exc).__name__}); existing contracts retained.'}
+            details = exc.details if isinstance(exc, MasterRefreshError) else {'code': 'unexpected_refresh_error', 'stage': 'refresh', 'exception_type': type(exc).__name__}
+            state['last_error'] = {**details, 'at': iso_now()}
+            log.error('Official Kotak master refresh failed; existing contracts retained. diagnostic=%s\n%s',
+                      json.dumps(state['last_error'], sort_keys=True), safe_master_traceback(exc))
+        try:
+            await asyncio.to_thread(_persist_refresh_state, broker, dict(state))
+        except OSError as exc:
+            log.error('Could not persist safe master diagnostics.\n%s', safe_master_traceback(exc))
+        result = {**master_status(db, broker), 'refresh_in_progress': False}
+        if state['last_error']:
+            result.update(status='cached' if result['underlying_count'] else 'unavailable',
+                          message='Official Kotak master refresh failed; existing contracts and paper-trade history retained. See the safe failure stage.')
+        return result
 
 
 def ensure_sample_stocks(catalog):
@@ -399,15 +503,20 @@ def underlyings(q: str = Query('', max_length=100), mode: Literal['sample','live
     rows.sort(key=lambda r: (r['kind'] != 'index', r['exchange'] != 'NSE', r['symbol']))
     return {'underlyings': rows, 'total': len(groups), 'filtered_total': len(rows), 'mode': selected_mode,
             'demo': selected_mode == 'sample', 'master': master_status(db, broker), 'configured': configured(broker),
-            'message': 'Import or refresh this broker’s official master to list every entitled NSE/BSE/MCX option. Missing live fields remain unavailable.'}
+            'message': 'Import or refresh this brokerÃ¢â‚¬â„¢s official master to list every entitled NSE/BSE/MCX option. Missing live fields remain unavailable.'}
+
+
+@router.get('/master/status')
+def get_master_status(broker: Literal['kotak'] = 'kotak'):
+    return master_status(broker=broker)
 
 
 @router.post('/master/refresh')
 async def reload_master(broker: Literal['kotak'] = 'kotak', db: Session = Depends(get_db)):
     result = await refresh_master(db, force=True, broker=broker)
-    if _refresh_feeds:
-        await _refresh_feeds(db)
-    return {'ok': result['status'] in {'ready', 'cached'}, 'master': result}
+    # A contract refresh never logs in to Kotak or restarts a healthy feed.
+    # Owner-selected subscriptions are reconciled by the background scheduler.
+    return {'ok': bool(result['new_trades_allowed'] and not result.get('last_error')), 'master': result}
 
 
 def cached_live_data(db, contracts, expiry, stale_after, reference_contract=None):
@@ -496,11 +605,11 @@ async def option_chain(underlying: str = Query(..., min_length=1, max_length=180
         metadata = {k:v for k,v in group.items() if k not in {'contracts', 'reference_futures'}} if group else None
         contracts = group['contracts'] if group else []
     if not metadata:
-        raise HTTPException(404, 'Choose an underlying from this broker’s instrument catalog. Refresh its master if missing.')
+        raise HTTPException(404, 'Choose an underlying from this brokerÃ¢â‚¬â„¢s instrument catalog. Refresh its master if missing.')
     metadata = {**metadata, 'broker': broker}
     expiry = expiry or metadata['expiries'][0]
     if expiry not in metadata['expiries']:
-        raise HTTPException(422, 'Choose an active expiry from this underlying’s master.')
+        raise HTTPException(422, 'Choose an active expiry from this underlyingÃ¢â‚¬â„¢s master.')
     selected = [c for c in contracts if c['expiry'] == expiry]
     if demo:
         result = build_chain(metadata, selected, expiry, demo=True, stamp=iso_now())
@@ -521,10 +630,10 @@ async def option_chain(underlying: str = Query(..., min_length=1, max_length=180
         result = await asyncio.to_thread(live_chain_result,db,metadata,selected,expiry,settings['stale_after_seconds'],reference_contract)
         fresh = [q for row in result['rows'] for q in (row['ce'], row['pe']) if q and q['ltp'] is not None and not q['stale']]
         result.update(status='connected' if fresh else 'stale' if result['quotes'] else 'awaiting_quotes' if configured(broker) else 'credentials_required',
-                      stale=not bool(fresh), trading_enabled=workspace_matches and bool(fresh),
+                      stale=not bool(fresh), trading_enabled=workspace_matches and bool(fresh) and master_status(db, broker)['new_trades_allowed'],
                       message='Prices are from Kotak Neo only. A labelled nearest futures reference is used to locate nearby strikes when available; it is not cash spot. Unavailable fields stay blank and stale rows keep their original timestamps.',
                       capabilities={'ltp': True, 'bid_ask': True, 'open_interest': True, 'spot': False, 'greeks': False,
                                     'futures_reference': reference_contract is not None,
                                     'greeks_note': 'Kotak SFeed messages do not carry Greeks; unavailable values remain blank.'})
-    result.update(read_only=True, mode_matches_workspace=workspace_matches)
+    result.update(read_only=True, mode_matches_workspace=workspace_matches, master=master_status(db, broker))
     return result

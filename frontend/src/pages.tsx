@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, Check, CheckCheck, Clock3, FileSpreadsheet, FolderCheck, Laptop, Loader2, RefreshCw, ShieldCheck, WifiOff, ExternalLink, ChevronRight, KeyRound } from 'lucide-react';
 import { api, API_BASE, brokers, brokerLabel, money, time } from './api';
 import { Badge, Empty, Help, Modal, Panel, Stat } from './components';
 import type { Row } from './components';
+import { contractRequest, contractMasterBlocked, contractMasterDiagnostic, contractMasterSources } from './OptionChain';
 
 export async function downloadReport(job:Row,kind:'xlsx'|'csv_gz'='xlsx'){
  let filename=job.filename||`Trade_${job.trade_id}.xlsx`,checksum=job.checksum;
@@ -51,9 +52,16 @@ export function ConnectionsPage({accounts,quotes,onRefresh,notify}:{accounts:Row
  const emptyKotak=()=>({consumer_key:'',mobile_number:'',ucc:'',mpin:'',totp_secret:''});
  const [help,setHelp]=useState(false),[busy,setBusy]=useState(''),[setupOpen,setSetupOpen]=useState(false),[kotakForm,setKotakForm]=useState(emptyKotak),[setupStatus,setSetupStatus]=useState<Row|null>(null),[statusError,setStatusError]=useState('');
  const [connectionHealth,setConnectionHealth]=useState<Row|null>(null),[healthError,setHealthError]=useState(false),[healthRefresh,setHealthRefresh]=useState(0);
+ const [masterStatus,setMasterStatus]=useState<Row|null>(null),[masterStatusError,setMasterStatusError]=useState('');
+ const masterController=useRef<AbortController|null>(null),masterInFlight=useRef(false);
  const documentation='https://github.com/Kotak-Neo/kotak-neo-python';
- async function refreshConfiguration(){try{setSetupStatus(await api('/api/brokers/kotak/setup'));setStatusError('');}catch{setStatusError('Kotak connection settings could not be loaded. Refresh the status or sign in to your workspace again.');}}
- useEffect(()=>{let active=true;api('/api/brokers/kotak/setup').then(value=>{if(active){setSetupStatus(value);setStatusError('');}}).catch(()=>{if(active)setStatusError('Kotak connection settings could not be loaded. Refresh the status or sign in to your workspace again.');});return()=>{active=false;};},[]);
+ async function refreshConfiguration(signal?:AbortSignal,isActive=()=>true){
+  await Promise.allSettled([
+   contractRequest('/api/brokers/kotak/setup',{signal}).then(value=>{if(isActive()){setSetupStatus(value);setStatusError('');}}).catch(error=>{if(isActive()&&error.name!=='AbortError')setStatusError('Kotak connection settings could not be loaded. Refresh the status or sign in to your workspace again.');}),
+   contractRequest('/api/option-chain/master/status?broker=kotak',{signal}).then(value=>{if(isActive()){setMasterStatus(value);setMasterStatusError('');}}).catch(error=>{if(isActive()&&error.name!=='AbortError')setMasterStatusError('Contract refresh status could not be loaded. Check status before starting another refresh.');})
+  ]);
+ }
+ useEffect(()=>{let active=true;const controller=new AbortController();void refreshConfiguration(controller.signal,()=>active);return()=>{active=false;controller.abort();masterController.current?.abort();};},[]);
  useEffect(()=>{
   let active=true,controller:AbortController|null=null,timer:number|undefined;
   async function poll(){
@@ -82,7 +90,24 @@ export function ConnectionsPage({accounts,quotes,onRefresh,notify}:{accounts:Row
  },[healthRefresh]);
  function closeSetup(){setSetupOpen(false);setKotakForm(emptyKotak());}
  async function saveKotak(){setBusy('kotak-setup');try{const result=await api('/api/brokers/kotak/setup',{method:'POST',body:JSON.stringify(kotakForm)});setSetupStatus(result);closeSetup();onRefresh();notify('Kotak details saved privately. Refresh contracts and select an instrument to check the market feed.');}catch(error){setKotakForm(emptyKotak());notify((error as Error).message,true);}finally{setBusy('');}}
- async function reload(){setBusy('kotak');try{const result=await api('/api/option-chain/master/refresh?broker=kotak',{method:'POST'});await api('/api/instruments/reload?broker=kotak',{method:'POST'});await refreshConfiguration();onRefresh();notify(result.master?.message||'Kotak Neo contracts refreshed.',result.ok===false);}catch(error){notify((error as Error).message,true);}finally{setBusy('');}}
+ async function reload(){
+  if(masterInFlight.current)return;
+  masterInFlight.current=true;setBusy('kotak');
+  const controller=new AbortController();masterController.current=controller;
+  try{
+   const status=await contractRequest('/api/option-chain/master/status?broker=kotak',{signal:controller.signal});setMasterStatus(status);setMasterStatusError('');
+   if(status.refresh_in_progress){notify('A contract refresh is already running. Check status before starting another.');return;}
+   const result=await contractRequest('/api/option-chain/master/refresh?broker=kotak',{method:'POST',signal:controller.signal},90000);
+   if(result.master)setMasterStatus(result.master);
+   if(result.ok!==false)onRefresh();
+   notify(result.master?.message||(result.ok===false?contractMasterDiagnostic(result.master||{})||'Contract refresh failed. Existing contracts are retained.':'Kotak Neo contracts refreshed.'),result.ok===false);
+  }catch(error){
+   if((error as Error).name==='AbortError')return;
+   notify((error as Error).message,true);
+   // Only check status after an uncertain result; never submit a duplicate job.
+   try{setMasterStatus(await contractRequest('/api/option-chain/master/status?broker=kotak',{signal:controller.signal}));setMasterStatusError('');}catch{setMasterStatusError('Contract refresh status is unavailable. Check status before retrying the refresh.');}
+  }finally{masterInFlight.current=false;masterController.current=null;setBusy('');}
+ }
  const account=accounts.find(a=>a.id==='kotak')||{},own=quotes.filter(q=>q.broker==='kotak'),last=own.reduce((a,b)=>new Date(a?.received_at||0)>new Date(b.received_at)?a:b,{} as Row),state=account.status||'disconnected',allStale=own.length>0&&own.every(q=>q.stale);
  const sessionLegs:Row[]=(connectionHealth?.exchange_sessions||[]).filter((trade:Row)=>trade.broker==='kotak').flatMap((trade:Row)=>trade.legs||[]);
  const sessionsKnown=sessionLegs.length>0&&sessionLegs.every(leg=>leg.known===true),sessionsClosed=sessionsKnown&&sessionLegs.every(leg=>leg.open===false),openSessions=sessionLegs.filter(leg=>leg.known===true&&leg.open===true).length;
@@ -98,7 +123,9 @@ export function ConnectionsPage({accounts,quotes,onRefresh,notify}:{accounts:Row
  return <>
   <div className="banner"><ShieldCheck size={17}/><div><strong>Kotak Neo market data. Paper orders stay inside this app.</strong><span>Quotes retain their original broker timestamps. Broker secrets stay on the backend.</span></div></div>
   {statusError&&<div className="inline-error" role="status">{statusError}<button className="text-btn" disabled={Boolean(busy)} onClick={()=>void refreshConfiguration()}>Refresh connection status<RefreshCw size={14}/></button></div>}
-  <div className="connection-grid"><section className="panel connection-card"><div className="connection-title"><span className="broker-logo kotak">K</span><Badge tone={statusTone}>{statusLabel}</Badge></div><h2>Kotak Neo</h2><p>Live broker quotes for simulated trades</p><div className="connection-data"><div><span>Latest quote received</span><strong>{time(account.feed?.last_quote_at||last.received_at)}</strong></div><div><span>Subscribed contracts</span><strong>{account.feed?.subscriptions??(state==='demo'?new Set(own.map(q=>q.instrument_id)).size:'—')}</strong></div><div><span>Reconnect attempts</span><strong>{account.feed?.reconnect_count??'—'}</strong></div><div><span>Broker margin</span><strong>Broker margin unavailable</strong></div><div><span>Trading sessions</span><strong>{connectionHealth?sessionSummary:healthError?'Status unavailable':'Checking verified schedule…'}</strong></div></div>
+  <div className="connection-grid"><section className="panel connection-card"><div className="connection-title"><span className="broker-logo kotak">K</span><Badge tone={statusTone}>{statusLabel}</Badge></div><h2>Kotak Neo</h2><p>Live broker quotes for simulated trades</p><div className="connection-data"><div><span>Latest quote received</span><strong>{time(account.feed?.last_quote_at||last.received_at)}</strong></div><div><span>Subscribed contracts</span><strong>{account.feed?.subscriptions??(state==='demo'?new Set(own.map(q=>q.instrument_id)).size:'—')}</strong></div><div><span>Reconnect attempts</span><strong>{account.feed?.reconnect_count??'—'}</strong></div><div><span>Broker margin</span><strong>Broker margin unavailable</strong></div><div><span>Trading sessions</span><strong>{connectionHealth?sessionSummary:healthError?'Status unavailable':'Checking verified schedule…'}</strong></div><div><span>Last successful contract refresh</span><strong>{masterStatus?.last_successful_refresh_at||masterStatus?.updated_at?`${time(masterStatus.last_successful_refresh_at||masterStatus.updated_at,true)} IST`:masterStatus?'Never completed':'Status unavailable'}</strong></div><div><span>Contract master</span><strong>{masterStatus?.refresh_in_progress?'Refresh in progress':masterStatus?contractMasterBlocked(masterStatus)?'Stale / unverified · new trades blocked':'Current verified contracts':'Status unavailable'}</strong></div></div>
+   {masterStatusError&&<div className="inline-error" role="status">{masterStatusError}<button className="text-btn" disabled={Boolean(busy)} onClick={()=>void refreshConfiguration()}>Check refresh status<RefreshCw size={14}/></button></div>}
+   {masterStatus&&(contractMasterBlocked(masterStatus)||masterStatus.last_error)&&<Help>{contractMasterBlocked(masterStatus)&&'New paper trades require current verified contracts. Existing positions and one-second history are preserved. '}{contractMasterDiagnostic(masterStatus)}{contractMasterSources(masterStatus)&&` Source CSV dates: ${contractMasterSources(masterStatus)}.`}</Help>}
    <Help>{!setupStatus?'Loading private setup status…':setupStatus.stored?'Your Kotak setup is saved in encrypted server storage. Existing values are never displayed here.':setupStatus?.configured?'Kotak connection details are configured privately on the server.':'Add your Kotak application and registered authenticator details to enable its market feed.'}</Help>
    {feedDetail&&<div className={['error','authentication_required'].includes(state)?'inline-error':'help-note'}>{feedDetail}</div>}
    {healthError&&<Help>The trading schedule is temporarily unavailable. Check the connection status and quote times before placing a paper trade.</Help>}

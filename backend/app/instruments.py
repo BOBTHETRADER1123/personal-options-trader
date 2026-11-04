@@ -48,6 +48,58 @@ def _date(value: object) -> str:
     raise ValueError(f"Unrecognized expiry format: {text!r}; use an ISO expiry in a normalized CSV")
 
 
+
+def _kotak_native_expiry(value: object, segment: str, column: str) -> str:
+    """Decode current and legacy native expiry schemas without guessing epochs.
+
+    Official v3.0.13 (2026-10-28) uses direct UTC seconds for pExpiryDate in
+    all supported *_fo segments. Preserve the separately documented legacy
+    lExpiryDate NSE offset for old imports. Never apply that legacy offset to
+    the current field. Normalized date values retain their published date.
+    Integral decimal CSV values (for example 1793743200.0) are valid.
+    """
+    text = str(value).strip()
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+        return _date(text)
+    try:
+        number = Decimal(text)
+        if not number.is_finite() or number != number.to_integral_value() or number <= 0:
+            raise ValueError("Invalid Kotak native expiry seconds")
+        legacy_shift = column == "lExpiryDate" and segment == "nse_fo"
+        seconds = int(number) + (315511200 if legacy_shift else 0)
+        moment = datetime.fromtimestamp(seconds, IST if legacy_shift else timezone.utc)
+        if moment.year <= 1970:
+            raise ValueError("Invalid Kotak native expiry date")
+        return moment.date().isoformat()
+    except (InvalidOperation, OverflowError, OSError):
+        raise ValueError("Invalid Kotak native expiry seconds") from None
+
+
+def contract_master_status(contract: dict, now: datetime | None = None) -> dict:
+    """New live exposure requires provenance from today's validated master.
+
+    History and exit valuation do not call this guard. We deliberately do not
+    infer holidays or allow yesterday's file on an assumed exchange holiday.
+    """
+    blocked = {"ready": False, "reason": "Contract master unavailable or stale; refresh contracts before opening or increasing a paper position."}
+    if contract.get("master_active") is not True:
+        return blocked
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("Master validation needs an aware timestamp")
+    try:
+        source = date.fromisoformat(str(contract.get("master_source_date", "")))
+        stamp = datetime.fromisoformat(str(contract.get("master_refresh_at", "")).replace("Z", "+00:00"))
+        if stamp.tzinfo is None or stamp.utcoffset() is None:
+            return blocked
+        age = (moment.astimezone(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds()
+        if source != moment.astimezone(IST).date() or not -5 <= age <= 86400:
+            return blocked
+    except (ValueError, TypeError, OverflowError):
+        return blocked
+    return {"ready": True, "reason": None}
+
+
 def _positive(value: object, integer: bool = False) -> float | int:
     result = float(str(value).strip())
     if not math.isfinite(result) or result <= 0 or (integer and not result.is_integer()):
@@ -182,14 +234,10 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
         exchange = {"nse_fo": "NSE", "bse_fo": "BSE", "mcx_fo": "MCX"}.get(segment.lower(), _pick(row, "exchange"))
         symbol = _pick(row, "pTrdSymbol", "trading_symbol", "symbol")
         underlying = _pick(row, "pSymbolName", "pUnderlying", "underlying")
-        expiry = _pick(row, "expiry", "lExpiryDate", "pExpiryDate")
-        if "lExpiryDate" in row and "expiry" not in row and str(expiry).isdigit():
-            # Official instrument docs specify the NSE/CDE epoch offset. The
-            # SDK formats direct BSE/MCX epochs as UTC business dates; their
-            # end-of-day timestamps must not roll into tomorrow in IST.
-            shifted = segment in {"nse_fo", "cde_fo"}
-            seconds = int(expiry) + (315511200 if shifted else 0)
-            expiry = datetime.fromtimestamp(seconds, IST if shifted else timezone.utc).date().isoformat()
+        expiry = _pick(row, "expiry")
+        if not expiry:
+            native_column = "pExpiryDate" if _pick(row, "pExpiryDate") else "lExpiryDate"
+            expiry = _kotak_native_expiry(_pick(row, native_column), segment, native_column)
         strike = _kotak_native_price(row, "dStrikePrice", "strike")
         option_type = _pick(row, "pOptionType", "option_type")
         lot = _pick(row, "lLotSize", "lot_size")
@@ -274,6 +322,7 @@ class ContractCatalog:
         self.path = Path(path or os.environ.get("INSTRUMENT_MASTER_PATH", DEFAULT_PATH))
         self.revision = 0
         self._live: list[dict] = []
+        self.master_metadata: dict = {}
         self.error: str | None = None
         self._demo = demo_contracts()
         self.reload()
@@ -283,11 +332,15 @@ class ContractCatalog:
         self.error = None
         if not self.path.exists():
             self._live = []
+            self.master_metadata = {}
             self.revision += 1
             return
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             rows = payload.get("instruments", []) if isinstance(payload, dict) else payload
+            metadata = payload.get("master_refresh", {}) if isinstance(payload, dict) else {}
+            if not isinstance(metadata, dict):
+                raise ValueError("Invalid master refresh metadata")
             for row in rows:
                 if isinstance(row, dict) and row.get("broker") in LEGACY_BROKERS:
                     continue  # Saved history remains in SQL; legacy feeds cannot be reactivated.
@@ -320,6 +373,7 @@ class ContractCatalog:
 
         else:
             self._live = pending
+            self.master_metadata = metadata
         finally:
             self.revision += 1
 
@@ -417,6 +471,7 @@ class ContractCatalog:
     def restore_live_contracts(self, trades: list[dict]) -> int:
         """Active journal legs retain their original master identity on restart."""
         contracts = []
+        present = {(row['id'], row['broker']) for row in self._live}
         required = {'id','broker','token','underlying','exchange','segment','symbol','expiry','strike','option_type','lot_size'}
         for trade in trades:
             if trade.get('broker') not in BROKERS or trade.get('demo') is not False or trade.get('status') not in {'open','pending'}:
@@ -426,8 +481,15 @@ class ContractCatalog:
                     continue
                 contract = dict(leg)
                 contract['id'] = leg.get('instrument_id')
-                if required.issubset(contract):
+                contract['broker'] = trade['broker']
+                identity = (contract['id'], contract['broker'])
+                if required.issubset(contract) and identity not in present:
+                    # Journal recovery restores identity for marking/exits;
+                    # saved leg metadata cannot certify a current master or
+                    # overwrite a validated fresh catalog row after restart.
+                    contract.update(master_active=False, restored_from_trade=True)
                     contracts.append(contract)
+                    present.add(identity)
         return self.merge_live_contracts(contracts)
 
     def _lookup_indexes(self):

@@ -1,6 +1,8 @@
 """MCX physical quantity is counted once in an isolated paper ledger."""
 import copy
 import json
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -19,6 +21,11 @@ def test_one_rupee_move_uses_physical_quantity_once(tmp_path,symbol,quantity,sid
         'pTrdSymbol':'TEST FUTURE','pOptionType':'XX','lExpiryDate':'2030-10-29','dStrikePrice':'0',
         'lLotSize':str(quantity),'dTickSize':'5','lPrecision':'2','lMultiplier':'-1',
         'pPriceUnits':unit,'pTrdUnits':unit,'pDeliveryUnits':unit,'dPriceQuatation':'1'})
+    # Certify only this isolated synthetic master fixture for the current test;
+    # production still requires validated current official source metadata.
+    now=datetime.now(timezone.utc)
+    contract.update(master_active=True,master_refresh_at=now.isoformat(),
+                    master_source_date=now.astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat())
     path=tmp_path/'master.json';path.write_text(json.dumps({'instruments':[contract]}))
     old_catalog=engine.catalog;catalog=ContractCatalog(path);engine.set_catalog(catalog)
     sql=create_engine(f'sqlite:///{tmp_path / "ledger.db"}');configure_sqlite(sql)

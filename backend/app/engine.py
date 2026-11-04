@@ -26,6 +26,7 @@ from .models import (Setting, Trade, Event, Timeline, QuoteEvent, ActionRecord,
 from .payoff import strategy_risk
 from .margin import unavailable_for_basket
 from .exchange_margin import exchange_margin_status
+from .instruments import contract_master_status
 
 BROKERS={'kotak':'Kotak Neo'}
 DEFAULT_SETTINGS={'brokerage_per_order':20.0,'charges_percent':0.05,'slippage_bps':0.0,'fill_basis':'bid_ask','logging_mode':'full_history','recording_policy_version':3,'preferred_feed':'broker','stale_after_seconds':10,'demo_mode':True,'paper_capital':1000000.0,'unlimited_paper_buying_power':False,'trade_count_definition':'strategies','delete_after_local_save':False,'auto_delete_online':False}
@@ -223,6 +224,18 @@ def validate_new_exposure(contract,settings):
     except ValueError:raise HTTPException(422,'The contract needs a valid exchange expiry date.') from None
     if expiry<datetime.now(timezone.utc).astimezone(ZoneInfo('Asia/Kolkata')).date():
         raise HTTPException(409,'This contract expired. Record an explicit paper settlement before opening a separately linked contract.')
+    # Check the current catalog rather than provenance frozen on an old leg.
+    # Broker tokens can be recycled; never increase an unrelated historical
+    # contract merely because its token occurs in today's master.
+    identifier=contract.get('instrument_id') or contract.get('id')
+    current=catalog.find(identifier,contract.get('broker')) if catalog is not None and identifier else None
+    if current is None or contract_identity(current)!=contract_identity(contract):
+        raise HTTPException(409,'Contract master unavailable or stale; refresh contracts before opening or increasing a paper position.')
+    if (int(current.get('lot_size',0))!=int(contract.get('lot_size',0))
+            or current.get('price_multiplier')!=contract.get('price_multiplier')):
+        raise HTTPException(409,'The contract units changed in the current master. Open a separately identified paper leg instead of increasing the historical leg.')
+    status=contract_master_status(current)
+    if not status['ready']:raise HTTPException(409,status['reason'])
 
 
 def execution_price(db,contract,side,broker,settings,manual=None,quote_override=None,limit_price=None):
@@ -452,9 +465,9 @@ def new_leg(db,request,broker,settings,at):
     if contract.get('exchange')=='MCX' and not settings['demo_mode'] and (not contract.get('price_multiplier') or not contract.get('monetary_conversion_source')):
         raise HTTPException(422,'This MCX contract needs verified quantity and price units. Refresh the broker contracts before paper execution.')
     contract_id=contract.get('instrument_id',contract['id'])
+    validate_new_exposure(contract,settings)
     quote=resolve_quote(db,contract,broker,settings)
     if not quote:raise HTTPException(409,f'No quote for {contract["symbol"]}; wait for the feed.')
-    validate_new_exposure(contract,settings)
     # Pending limits require the same valid/fresh quote as immediate fills.
     execution_price(db,contract,item['side'],broker,settings,quote_override=quote)
     pending=False
@@ -467,7 +480,7 @@ def new_leg(db,request,broker,settings,at):
         price,quote,slip=execution_price(db,contract,item['side'],broker,settings,
             limit_price=item['price'] if item.get('order_type')=='LIMIT' else None)
     lots=int(item['lots']);quantity=lots*int(contract['lot_size'])*float(contract.get('price_multiplier') or 1)
-    leg={k:contract.get(k) for k in ('symbol','underlying','exchange','segment','expiry','strike','option_type','lot_size','price_multiplier','multiplier_verified','monetary_conversion_source','broker_quantity_multiplier','token','source')}
+    leg={k:contract.get(k) for k in ('symbol','underlying','exchange','segment','expiry','strike','option_type','lot_size','price_multiplier','multiplier_verified','monetary_conversion_source','broker_quantity_multiplier','token','source','broker','master_active','master_refresh_at','master_source_date')}
     leg.update({'id':ident('leg'),'instrument_id':contract_id,'side':item['side'],'lots':lots,'filled_lots':0 if pending else lots,'open_lots':0 if pending else lots,'order_type':item.get('order_type','MARKET'),'limit_price':item.get('price'),'entry_price':price,'current_price':float(quote['ltp']),'exit_price':None,'entry_at':None if pending else at,'exit_at':None,'realized_pnl':0.0,'unrealized_pnl':0.0,'charges':0.0 if pending else charges(price,quantity,settings),'slippage_cost':0 if pending else slip*quantity,'status':'pending' if pending else 'open','stop_loss':item.get('stop_loss'),'target':item.get('target'),'quote_at':quote.get('received_at'),'exchange_quote_at':quote.get('exchange_timestamp'),'exchange_timestamp_basis':quote.get('exchange_timestamp_basis'),'quote_event_id':quote.get('event_id'),'quote_source':quote.get('broker',broker),'bid':quote.get('bid'),'ask':quote.get('ask'),'demo':settings['demo_mode']})
     return leg
 
@@ -665,7 +678,21 @@ def _trade_uses_quote(trade,quote,settings):
         for leg in trade['legs'])
 
 
+
+def _pending_master_permitted(db,trade,leg,settings,at):
+    try:validate_new_exposure(leg,settings)
+    except HTTPException as error:
+        reason=str(error.detail)
+        if leg.get('master_blocked')!=reason:
+            event(db,trade,'limit_waiting_for_current_master',{'leg_id':leg['id'],'note':reason},at)
+        leg['master_blocked']=reason
+        return False
+    leg.pop('master_blocked',None)
+    return True
+
+
 def _pending_fill_permitted(db,trade,leg,settings,fill,at):
+    if not _pending_master_permitted(db,trade,leg,settings,at):return False
     candidate=copy.deepcopy(trade)
     selected=next(item for item in candidate['legs'] if item['id']==leg['id'])
     selected.update(entry_price=fill,open_lots=selected['lots'],filled_lots=selected['lots'],status='open')
@@ -703,6 +730,7 @@ def revalue_quote(db,entry):
                         price=fill_reference(quote,leg['side'],settings)
                         crossed=price<=leg['limit_price'] if leg['side']=='BUY' else price>=leg['limit_price']
                         if crossed:
+                            if not _pending_master_permitted(db,trade,leg,settings,quote['received_at']):continue
                             fill,_,slip=execution_price(db,leg,leg['side'],trade['broker'],settings,quote_override=quote,limit_price=leg['limit_price'])
                             if not _pending_fill_permitted(db,trade,leg,settings,fill,quote['received_at']):continue
                             leg['entry_price']=fill;leg['entry_at']=quote['received_at'];leg['open_lots']=leg['lots'];leg['filled_lots']=leg['lots'];leg['status']='open';leg['charges']+=charges(fill,leg['lots']*monetary_units(leg),settings);leg['slippage_cost']+=slip*leg['lots']*monetary_units(leg);trade['net_premium']+=premium_cash_flow(leg,leg['filled_lots'],fill);event(db,trade,'limit_filled',{'leg_id':leg['id'],'price':fill,'quote_event_id':entry.id,'processed_at':iso_now()},quote['received_at'])
