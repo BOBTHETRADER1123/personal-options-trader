@@ -1,7 +1,7 @@
 """Add private broker credential storage and one-use daily sign-in state."""
 from alembic import op
 from app.broker_setup import PrivateBrokerCredential
-from app.broker_auth import FivepaisaCredential, FivepaisaOAuthState, FivepaisaOAuthSlot
+from app.models import FivepaisaCredential, FivepaisaOAuthState, FivepaisaOAuthSlot
 revision='0006_private_broker_auth'
 down_revision='0005_google_accounts'
 branch_labels=None

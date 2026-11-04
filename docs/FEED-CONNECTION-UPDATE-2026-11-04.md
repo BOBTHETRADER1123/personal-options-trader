@@ -182,7 +182,7 @@ Preserves the pending calculation audit: analytical combined expiry risk, unlimi
 
 | Check | Tested here | Still required |
 |---|---|---|
-| Full requested backend suite | **734 passed, 0 failed**, 1 test-library deprecation warning; 35.90 s | None for this recorded local run |
+| Full requested backend suite | Initial connection/calculation run: **734 passed**. Final run after approved retired-code cleanup: **691 passed, 0 failed**, 1 test-library warning; 62.72 s | Live market acceptance remains separate |
 | ZIP feed fixes | Mocked 4xx vs 429/5xx/network errors, backoff reset, malformed ticks, TOTP-window reuse | Owner starts Kotak and observes real reconnects |
 | Stream/auth delay | Real temporary DELETE-journal exclusive writer returns retry in **under 0.8 s** in regression, rather than waiting 30 s; tickets/accept do not wait for global writer lock | Production response timing under actual load |
 | Shared dashboard | 10 concurrent viewers -> **1 build per second**, unchanged ages do not force resend; stale flips still change payload | Production CPU/RAM comparison |
@@ -231,12 +231,26 @@ The full suite used the existing pure-Python SQLAlchemy test fallback because Wi
 
 Look up the official NSE and BSE equity-derivatives Muhurat circulars, the MCX energy-product Muhurat circular and seasonal commodity close schedule, and each exchange's official 2027 trading-holiday/session circulars. Verify date, exchange/segment, contract group, timezone, session start/end, holiday exceptions and effective period; retain the circular URL/number and owner verification date. Do not copy cash-market hours into derivatives or invent 2027 entries. Existing source links are listed in that JSON file. No calendar dates or hours were changed in this release.
 
-## Retired 5paisa files — retained pending permission
+## Retired 5paisa implementation — cleanup approved
 
 - `backend/app/broker_auth.py`
 - `backend/app/brokers/fivepaisa.py`
 
-These remain for retired code/tests and are not active broker integrations. `broker_auth.py` is still imported by main, so removing the file alone would break startup. Delete only after explicit approval and coordinated removal of imports/dependencies/tests. Historical trades, encrypted records and exports must remain preserved. **May these retired modules and their unused references be removed in a separate change?**
+The owner explicitly approved removing these modules and unused references on 4 November. The implementation files and their obsolete auth/feed-only tests have been removed. Main, maintenance and migration imports now register historical table definitions from `backend/app/models.py`. The migration revision ID remains unchanged so already-migrated databases remain valid. No stored tables, encrypted records, trades or exports are deleted.
+
+Additional changed files for this cleanup are `backend/app/models.py`, `backend/app/maintenance.py`, `backend/migrations/env.py`, `backend/migrations/versions/0006_private_broker_auth.py`, `backend/tests/test_brokers.py`, and new `backend/tests/test_retired_module_cleanup.py`. Deleted obsolete tests are `backend/tests/test_broker_auth.py` and `backend/tests/test_fivepaisa_unavailable_prices.py`. Tests that ensure retired routes stay disabled and old trade history remains readable are retained. The changed-files ZIP includes an explicit removed-file manifest instead of restoring deleted code.
+
+### Additional cleanup file summaries
+
+`backend/app/models.py` now owns the three historical 5paisa table definitions only. Their names and columns are preserved for recovery; no authentication, token refresh, feed or order service remains.
+
+`backend/app/maintenance.py` and `backend/migrations/env.py` remove the deleted service import and obtain the same historical schema through the existing models import. They do not drop or rewrite records.
+
+`backend/migrations/versions/0006_private_broker_auth.py` imports the historical definitions from models. Its already-applied revision identity and non-destructive behavior stay intact.
+
+`backend/tests/test_brokers.py` removes obsolete 5paisa network/parser-service tests while retaining Kotak tests, the no-real-order check and historical metadata tests.
+
+`backend/tests/test_retired_module_cleanup.py` proves that deleted implementation modules cannot be imported and that a real temporary SQLite migration preserves legacy encrypted rows and a historical paper trade.
 
 ## Make the repository private
 
@@ -248,4 +262,6 @@ Send the approximate drop time including IST date, RamNaym application/error log
 
 ## Release status
 
-Local tests/build/package passed as stated above. GitHub and cloud deployment completion must be verified separately; no live broker test is claimed by this document.
+The connection/calculation update was pushed as commit `d11fda2be4bf8e96e72c3e877525e54d1d710223`. Vercel deployment [5hJq6KEFasSA5ssjJPTgfdaKrar8](https://vercel.com/paper-trading1/personal-options-trader/5hJq6KEFasSA5ssjJPTgfdaKrar8) showed Ready. The verified 343,174-byte runtime ZIP was uploaded to existing RamNaym #1606; its liveness and readiness endpoints both returned HTTP 200. The website retained 12 saved broker executions (11 closed and one open), and its footer showed Backend connected. The public compiled JavaScript contains the correct RamNaym WSS URL. No broker login or live quote acceptance test was performed.
+
+After the approved removal of obsolete 5paisa API tests and addition of history-preservation checks, the final full suite passed **691 tests, 0 failures**, with one test-library warning, in 62.72 seconds. The earlier 734-pass result is retained as evidence of the complete connection/calculation run before that cleanup. The cleanup source ZIP is rebuilt separately for the same existing server; production acceptance still requires the owner to test a current contract during its verified market session.

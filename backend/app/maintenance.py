@@ -18,7 +18,7 @@ from pathlib import Path
 import uuid
 from sqlalchemy import select,delete,text
 from .database import Base,engine,iso_now
-from . import models,reporting,cloud_backup,daily_reports,sheets_sync,archival,google_accounts,broker_auth,broker_setup  # Register tables without starting feeds.
+from . import models,reporting,cloud_backup,daily_reports,sheets_sync,archival,google_accounts,broker_setup  # Register tables without starting feeds.
 
 FORMAT='personal-options-trader-journal-v1'
 

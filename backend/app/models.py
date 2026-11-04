@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer, BigInteger, Float, JSON, Text, UniqueConstraint
+from sqlalchemy import Boolean, String, Integer, BigInteger, Float, JSON, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base, iso_now
 
@@ -129,3 +129,31 @@ class SchedulerLease(Base):
     owner: Mapped[str] = mapped_column(String(64))
     generation: Mapped[int] = mapped_column(BigInteger)
     expires_at: Mapped[float] = mapped_column(Float)
+
+
+# Retired broker data schema only. No authentication, decryption, feed or API
+# service uses these classes; retain existing tables for non-destructive recovery.
+class FivepaisaCredential(Base):
+    __tablename__ = 'fivepaisa_credentials'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    encrypted_credentials: Mapped[str] = mapped_column(Text)
+    config_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[float] = mapped_column(Float)
+    connected_at: Mapped[float] = mapped_column(Float)
+
+
+class FivepaisaOAuthState(Base):
+    __tablename__ = 'fivepaisa_oauth_states'
+    state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_hash: Mapped[str] = mapped_column(String(64))
+    config_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[float] = mapped_column(Float)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class FivepaisaOAuthSlot(Base):
+    """Latest-start fence remains present while the broker HTTP request runs."""
+    __tablename__ = 'fivepaisa_oauth_slot'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    current_state_hash: Mapped[str] = mapped_column(String(64))
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)

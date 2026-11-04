@@ -35,7 +35,7 @@ from . import cloud_backup, resource_health, maintenance, reporting, daily_repor
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
-from . import broker_auth, broker_setup
+from . import broker_setup
 
 from .log_safety import install as install_safe_logs
 install_safe_logs()

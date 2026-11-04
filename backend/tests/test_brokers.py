@@ -8,7 +8,6 @@ import pytest
 
 from app.brokers import FeedManager
 from app.brokers.base import FeedAuthenticationError, FeedProtocolError
-from app.brokers.fivepaisa import parse_message, tick_timestamp
 from app.brokers.kotak import parse_sfeed
 from app.instruments import ContractCatalog, demo_contracts, import_master, market_session, normalize_row
 
@@ -19,28 +18,12 @@ def contract(broker="kotak", token="123", segment=None):
             "symbol": "EXAMPLE OPTION", "expiry": "2030-10-29", "strike": 25000.0, "option_type": "CE", "lot_size": 50, "demo": False}
 
 
-def test_fivepaisa_preserves_actual_fields_and_null_missing_timestamp():
-    mapping = {("N", "D", "123"): contract("fivepaisa")}
-    data = [{"Exch": "N", "ExchType": "D", "Token": 123, "LastRate": 60.5, "BidRate": 60, "OffRate": 61, "TotalQty": 200,
-             "Time": 35950, "TickDt": "/Date(-62135596800000)/"}]
-    result = parse_message(json.dumps(data), mapping)[0]
-    assert result["ltp"] == 60.5 and result["bid"] == 60 and result["ask"] == 61
-    assert result["exchange_timestamp"] is None and result["exchange_time_raw"] == 35950
-    assert result["raw_message"] == data[0]
 
 
-def test_fivepaisa_dotnet_epoch_milliseconds():
-    assert tick_timestamp("/Date(1792464000123)/") == "2026-10-20T02:40:00.123000+00:00"
 
 
-def test_fivepaisa_duplicate_prices_retained_as_distinct_events():
-    row = {"Exch": "N", "ExchType": "D", "Token": 123, "LastRate": 60.5}
-    assert len(parse_message([row, row], {("N", "D", "123"): contract("fivepaisa")})) == 2
 
 
-def test_fivepaisa_authentication_failure():
-    with pytest.raises(FeedAuthenticationError):
-        parse_message({"Message": "Token expired"}, {})
 
 
 def test_kotak_sfeed_scaled_prices_not_divided_again():
@@ -225,36 +208,8 @@ def test_native_future_master_not_mislabelled_as_call(broker,raw):
     assert result['option_type']=='FUT' and result['instrument_type']=='future' and result['strike']==0
 
 
-def test_fivepaisa_oi_updates_do_not_fabricate_new_price_timestamp():
-    mapping={('N','D','123'):contract('fivepaisa')};oi={}
-    received='2026-10-24T01:00:00+00:00'
-    assert parse_message({'Exch':'N','ExchType':'D','Token':123,'OpenInterest':1000},mapping,received_at=received,open_interest=oi)==[]
-    quote=parse_message({'Exch':'N','ExchType':'D','Token':123,'LastRate':100},mapping,received_at='2026-10-24T01:00:01+00:00',open_interest=oi)[0]
-    assert quote['open_interest']==1000 and quote['open_interest_received_at']==received
-    assert quote['received_at']=='2026-10-24T01:00:01+00:00'
 
 
-def test_fivepaisa_stream_subscribes_and_unsubscribes_read_only_channels(monkeypatch):
-    from app.brokers.fivepaisa import FivepaisaFeed
-    import websockets.asyncio.client
-    monkeypatch.setenv('FIVEPAISA_CLIENT_CODE','test-client');monkeypatch.setenv('FIVEPAISA_ACCESS_TOKEN','not-real-test-token')
-    class Socket:
-        def __init__(self):self.sent=[];self.values=iter([json.dumps([{'Exch':'N','ExchType':'D','Token':123,'LastRate':101}])])
-        async def __aenter__(self):return self
-        async def __aexit__(self,*args):pass
-        async def send(self,value):self.sent.append(json.loads(value))
-        def __aiter__(self):return self
-        async def __anext__(self):
-            try:return next(self.values)
-            except StopIteration:raise StopAsyncIteration
-    socket=Socket()
-    monkeypatch.setattr(websockets.asyncio.client,'connect',lambda *args,**kwargs:socket)
-    received=[]
-    async def quote(value):received.append(value)
-    async def status(*args):pass
-    asyncio.run(FivepaisaFeed(quote,status).stream([contract('fivepaisa')]))
-    assert len(received)==1 and received[0]['broker']=='fivepaisa'
-    assert [(m['Method'],m['Operation']) for m in socket.sent]==[('MarketFeedV3','Subscribe'),('GetScripInfoForFuture','Subscribe'),('MarketFeedV3','Unsubscribe'),('GetScripInfoForFuture','Unsubscribe')]
 
 
 def test_feed_manager_retries_transport_but_stops_expired_session(monkeypatch):
@@ -321,14 +276,6 @@ def test_kotak_uses_sfeed_current_sdk_and_sanitizes_auth(monkeypatch):
     assert 'PRIVATE SID' not in str(error.value)
 
 
-def test_fivepaisa_sdk_routing_hint_uses_only_official_allowlisted_hosts():
-    import base64
-    from app.brokers.fivepaisa import feed_url
-    def token(value):return 'header.'+base64.urlsafe_b64encode(json.dumps({'RedirectServer':value}).encode()).decode().rstrip('=')+'.signature'
-    assert feed_url(token('A'),'123').startswith('wss://aopenfeed.5paisa.com/')
-    assert feed_url(token('B'),'123').startswith('wss://bopenfeed.5paisa.com/')
-    assert feed_url(token('https://evil.invalid'),'123').startswith('wss://openfeed.5paisa.com/')
-    assert feed_url('malformed-token','123').startswith('wss://openfeed.5paisa.com/')
 
 
 def test_feed_manager_updates_subscriptions_without_restarting_active_socket():
