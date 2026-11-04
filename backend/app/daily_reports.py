@@ -272,7 +272,7 @@ def _row(t,s,l,day_end):
   l.get('latest_price',l.get('ltp')),l.get('quote_received_at',l.get('quote_at')),l.get('exchange_quote_at'),l.get('quote_age_seconds'),l.get('quote_reused'),
   l.get('stale'),l.get('data_freshness'),l.get('unrealized_pnl'),l.get('realized_pnl'),l.get('gross_pnl'),l.get('net_pnl'),l.get('charges'),
   s.get('unrealized_pnl'),s.get('realized_pnl'),s.get('gross_pnl'),s.get('charges'),s.get('net_pnl'),s.get('mfe'),s.get('mae'),
-  risk.get('estimated_initial_margin'),s.get('hedge_benefit',risk.get('hedge_benefit')),s.get('margin_estimate',risk.get('estimated_margin')),s.get('net_premium'),
+  'Broker margin unavailable','Broker margin unavailable','Broker margin unavailable',s.get('net_premium'),
   'Unlimited' if risk.get('profit_unlimited') else risk.get('max_profit'),'Unlimited' if risk.get('loss_unlimited') else risk.get('max_loss'),
   risk.get('breakevens'),qty*(1 if l.get('side')=='BUY' else -1),exposure,t.get('close_reason') if exit_at else None,
   'Generated locally; remote verification is tracked in app',l.get('session'),bool(t.get('demo'))]

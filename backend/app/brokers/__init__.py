@@ -21,6 +21,10 @@ class FeedManager:
             self._states[adapter.broker] = {"broker": adapter.broker, "status": "not_configured", "configured": bool(adapter.configured()),
                                            "detail": "Add backend market-data credentials", "last_quote_at": None, "source": "live", "received_events": 0, "reconnect_count": 0}
 
+    async def margin_required(self, contract, **inputs):
+        """Owner-triggered single-order diagnostic on the existing Kotak session."""
+        return await self._adapters[0].margin_required(contract, **inputs)
+
     def statuses(self) -> dict[str, dict]:
         return {key: dict(value) for key, value in self._states.items()}
 
@@ -91,7 +95,9 @@ class FeedManager:
 
     async def _run(self, adapter, contracts):
         attempt = 0
+        state = self._states[adapter.broker]
         while not self._stopping:
+            received_before = state["received_events"]
             try:
                 await self._status(adapter.broker, {"status": "connecting", "detail": "Connecting read-only market feed"})
                 await adapter.stream(contracts)
@@ -107,11 +113,23 @@ class FeedManager:
                 # Protocol/configuration errors need operator correction.
                 return
             except Exception as exc:
+                if state["received_events"] > received_before:
+                    # A connection delivered actual quotes: the next drop is a
+                    # fresh outage, not another attempt in the previous outage.
+                    attempt = 0
                 attempt += 1
                 self._states[adapter.broker]["reconnect_count"] += 1
                 delay = min(60, 2 ** min(attempt, 6)) + random.uniform(0, 1)
                 await self._status(adapter.broker, {"status": "reconnecting", "detail": f"Connection interrupted ({type(exc).__name__}); retrying", "retry_in_seconds": round(delay, 1)})
                 await asyncio.sleep(delay)
+
+    async def mark_market_closed(self):
+        """Label verified-session idling without concealing a genuine fault."""
+        for adapter in self._adapters:
+            state = self._states[adapter.broker]
+            if state["configured"] and state["status"] not in {"authentication_required", "error"}:
+                await self._status(adapter.broker, {"status": "market_closed", "retry_in_seconds": None,
+                    "detail": "No selected contract is inside a verified exchange session; the feed is idle by design."})
 
     async def stop(self):
         self._stopping = True

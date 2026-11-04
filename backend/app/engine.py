@@ -14,6 +14,7 @@ import logging
 import threading
 import weakref
 from collections import OrderedDict
+from decimal import Decimal
 from datetime import datetime, timezone
 from sqlalchemy import select, delete, update, func, event as sqlalchemy_event
 from sqlalchemy.orm import Session
@@ -23,6 +24,8 @@ from .models import (Setting, Trade, Event, Timeline, QuoteEvent, ActionRecord,
                      PendingQuote, LatestQuote, QuoteReceiptCounter, CompactQuoteReceipt,
                      PnlSnapshot, RecordingCursor, RecordingGap)
 from .payoff import strategy_risk
+from .margin import unavailable_for_basket
+from .exchange_margin import exchange_margin_status
 
 BROKERS={'kotak':'Kotak Neo'}
 DEFAULT_SETTINGS={'brokerage_per_order':20.0,'charges_percent':0.05,'slippage_bps':0.0,'fill_basis':'bid_ask','logging_mode':'full_history','recording_policy_version':3,'preferred_feed':'broker','stale_after_seconds':10,'demo_mode':True,'paper_capital':1000000.0,'unlimited_paper_buying_power':False,'trade_count_definition':'strategies','delete_after_local_save':False,'auto_delete_online':False}
@@ -145,7 +148,8 @@ def age_seconds(timestamp,at=None):
     try:
         value=datetime.fromisoformat(timestamp.replace('Z','+00:00'))
         if not value.tzinfo:value=value.replace(tzinfo=timezone.utc)
-        return max(0,((at or datetime.now(timezone.utc))-value).total_seconds())
+        age=((at or datetime.now(timezone.utc))-value).total_seconds()
+        return None if age < -5 else max(0,age)
     except (ValueError,TypeError):return None
 
 def contract_identity(value):
@@ -211,6 +215,16 @@ def fill_reference(quote,side,settings):
     if settings['fill_basis']=='bid_ask':price=(quote.get('ask') if side=='BUY' else quote.get('bid')) or price
     return float(price)
 
+def validate_new_exposure(contract,settings):
+    if settings.get('demo_mode'):return
+    from datetime import date
+    from zoneinfo import ZoneInfo
+    try:expiry=date.fromisoformat(str(contract.get('expiry','')))
+    except ValueError:raise HTTPException(422,'The contract needs a valid exchange expiry date.') from None
+    if expiry<datetime.now(timezone.utc).astimezone(ZoneInfo('Asia/Kolkata')).date():
+        raise HTTPException(409,'This contract expired. Record an explicit paper settlement before opening a separately linked contract.')
+
+
 def execution_price(db,contract,side,broker,settings,manual=None,quote_override=None,limit_price=None):
     if broker not in BROKERS and manual is None:raise HTTPException(409,'This broker is retired. No new market-price fills are available.')
     if manual is not None:
@@ -224,7 +238,13 @@ def execution_price(db,contract,side,broker,settings,manual=None,quote_override=
     age=age_seconds(quote.get('received_at'))
     if age is None or age>settings['stale_after_seconds']:
         raise HTTPException(409,'The selected market-data quote is stale. Reconnect before recording a paper fill.')
+    exchange_age=age_seconds(quote.get('exchange_timestamp'))
+    if quote.get('exchange_timestamp_basis')=='last_update_time' and (exchange_age is None or exchange_age>settings['stale_after_seconds']):
+        raise HTTPException(409,'The exchange update is stale despite a recent server receipt. Wait for a current broker update.')
+    if quote.get('broker') not in (None,broker):raise HTTPException(409,"A paper fill cannot use another broker's quote.")
+    if quote.get('bid') and quote.get('ask') and quote['bid']>quote['ask']:raise HTTPException(409,'The quote has a crossed bid/ask. Wait for a consistent market quote.')
     price=fill_reference(quote,side,settings)
+    if not math.isfinite(price) or price<=0:raise HTTPException(409,'No valid positive market price is available for this paper fill.')
     slip=price*settings['slippage_bps']/10000
     effective=max(.01,price+(slip if side=='BUY' else -slip))
     if limit_price is not None:
@@ -232,7 +252,7 @@ def execution_price(db,contract,side,broker,settings,manual=None,quote_override=
     return effective,quote,abs(effective-price)
 
 def charges(price,quantity,settings):
-    return settings['brokerage_per_order']+price*quantity*settings['charges_percent']/100
+    return float(Decimal(str(settings['brokerage_per_order']))+Decimal(str(price))*Decimal(str(quantity))*Decimal(str(settings['charges_percent']))/100)
 
 def monetary_units(leg):
     return leg['lot_size']*float(leg.get('price_multiplier') or 1)
@@ -243,14 +263,65 @@ def premium_cash_flow(leg,lots=None,price=None):
     return -(1 if leg['side']=='BUY' else -1)*(leg.get('filled_lots',0) if lots is None else lots)*monetary_units(leg)*(leg['entry_price'] if price is None else price)
 
 
+RISK_VERSION=4
+
+
+def paper_cash_reserve(trade):
+    """Known net option premium and paid charges only; never broker margin."""
+    active=[leg for leg in trade.get('legs',[]) if leg.get('open_lots',0)>0]
+    if not active:return 0.0
+    debit=-sum((Decimal(str(premium_cash_flow(leg,leg['open_lots']))) for leg in active),Decimal(0))
+    return float(max(Decimal(0),debit)+Decimal(str(trade.get('charges',0))))
+
+
+def refresh_trade_risk(trade):
+    """Version derived results without altering any saved contract or fill.
+
+    Expiry risk changes with exposure, average fill, realized results or costs,
+    not each market tick. Cache those inputs to keep one-second P&L inexpensive.
+    """
+    active=[leg for leg in trade.get('legs',[]) if leg.get('open_lots',0)>0]
+    fields=('instrument_id','broker','exchange','underlying','expiry','side','option_type',
+            'strike','entry_price','lots','open_lots','lot_size','price_multiplier','demo')
+    inputs={'version':RISK_VERSION,'legs':[{key:leg.get(key) for key in fields if key in leg} for leg in active],
+            'broker':trade.get('broker'),'spot':trade.get('spot'),'charges':trade.get('charges',0),
+            'realized_pnl':trade.get('realized_pnl',0)}
+    signature=hashlib.sha256(json.dumps(inputs,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    if trade.get('_risk_signature')==signature and trade.get('broker_margin'):return trade
+    try:
+        risk=strategy_risk(active,trade.get('spot'),trade.get('charges',0),trade.get('realized_pnl',0))
+    except (ValueError,TypeError,KeyError) as error:
+        risk={'supported':False,'reason':str(error),'max_profit':None,'max_loss':None,
+              'profit_unlimited':False,'loss_unlimited':False,'breakevens':[],'points':[],
+              'estimated_margin':None,'hedge_benefit':None}
+    risk['validation_warnings']=risk.get('premium_warnings',[])
+    trade['risk']=risk
+    trade['margin_estimate']=None
+    trade['hedge_benefit']=None
+    trade['open_net_premium']=sum(premium_cash_flow(leg,leg['open_lots']) for leg in active)
+    try:
+        trade['broker_margin']=unavailable_for_basket(active,trade.get('broker','kotak'),net_premium=trade['open_net_premium'])
+    except ValueError:
+        trade['broker_margin']={'status':'unavailable','verified':False,'label':'Broker margin unavailable',
+            'reason':'Saved contracts require validation before a margin assessment.','total_margin':None}
+    trade['exchange_margin']=exchange_margin_status(active)
+    trade['paper_cash_reserve']=round(paper_cash_reserve(trade),2)
+    trade['paper_capital_check']='premium_cash_only'
+    trade['paper_capital_notice']='Only known net option premium and paid charges are checked against simulated capital. Broker margin and final capital are unavailable; a paper fill does not establish real account buying power.'
+    trade['_risk_signature']=signature
+    trade['calculation_version']=RISK_VERSION
+    return trade
+
+
 def enforce_paper_buying_power(db,trade,settings):
-    """Simulated capital is broker-independent; the margin remains an estimate."""
+    """Enforce known simulated cash costs; do not invent a margin constraint."""
     if settings.get('unlimited_paper_buying_power'):return
-    reserved=sum(float(other.get('margin_estimate') or 0) for other in trade_records(db)
+    reserved=sum(paper_cash_reserve(other) for other in trade_records(db)
                  if other['id']!=trade['id'] and other['broker']==trade['broker'] and
                  other['status']=='open' and bool(other.get('demo'))==bool(trade.get('demo')))
-    if reserved+float(trade.get('margin_estimate') or 0)>float(settings['paper_capital'])+.005:
-        raise HTTPException(409,'Estimated margin exceeds the configured simulated capital for this broker. Reduce lots or enable unlimited paper buying power. This is not broker-provided money.')
+    if reserved+paper_cash_reserve(trade)>float(settings['paper_capital'])+.005:
+        raise HTTPException(409,'Known premium and charges exceed the configured simulated capital for this broker. Reduce lots or enable unlimited paper buying power. Broker margin is unavailable; this is not broker-provided money.')
+
 
 def recalculate(trade,at=None):
     at=at or iso_now()
@@ -271,14 +342,14 @@ def recalculate(trade,at=None):
         leg['quantity']=leg['lots']*leg['lot_size']
         leg['open_quantity']=leg['open_lots']*leg['lot_size']
         leg['valuation_quantity']=leg['open_lots']*monetary_units(leg)
-        leg['unrealized_pnl']=round(direction*(leg['current_price']-leg['entry_price'])*leg['valuation_quantity'],8)
+        leg['unrealized_pnl']=float(Decimal(direction)*(Decimal(str(leg['current_price']))-Decimal(str(leg['entry_price'])))*Decimal(str(leg['valuation_quantity'])))
         leg['gross_pnl']=round(leg['realized_pnl']+leg['unrealized_pnl'],8)
         leg['net_pnl']=round(leg['gross_pnl']-leg['charges'],8)
-    trade['realized_pnl']=sum(l['realized_pnl'] for l in trade['legs'])
-    trade['unrealized_pnl']=sum(l['unrealized_pnl'] for l in trade['legs'])
+    trade['realized_pnl']=float(sum((Decimal(str(l['realized_pnl'])) for l in trade['legs']),Decimal(0)))
+    trade['unrealized_pnl']=float(sum((Decimal(str(l['unrealized_pnl'])) for l in trade['legs']),Decimal(0)))
     trade['gross_pnl']=trade['realized_pnl']+trade['unrealized_pnl']
-    trade['charges']=sum(l['charges'] for l in trade['legs'])
-    trade['net_pnl']=trade['gross_pnl']-trade['charges']
+    trade['charges']=float(sum((Decimal(str(l['charges'])) for l in trade['legs']),Decimal(0)))
+    trade['net_pnl']=float(Decimal(str(trade['gross_pnl']))-Decimal(str(trade['charges'])))
     if trade.get('mfe') is None or trade['net_pnl']>trade['mfe']:
         trade['mfe']=trade['net_pnl'];trade['mfe_at']=at
     if trade.get('mae') is None or trade['net_pnl']<trade['mae']:
@@ -290,11 +361,7 @@ def recalculate(trade,at=None):
     elif pending:trade['status']='pending'
     else:trade['status']='closed' if any(l['filled_lots']>0 for l in trade['legs']) else 'cancelled'
     if trade['status'] in ('closed','cancelled') and not trade.get('closed_at'):trade['closed_at']=at
-    risk=strategy_risk(active,trade.get('spot'),trade['charges'])
-    if active:trade['risk']=risk
-    trade['margin_estimate']=risk.get('estimated_margin',0)
-    trade['hedge_benefit']=risk.get('hedge_benefit',0)
-    trade['open_net_premium']=sum(premium_cash_flow(leg,leg['open_lots']) for leg in active)
+    refresh_trade_risk(trade)
     trade['updated_at']=at
     return trade
 
@@ -317,7 +384,7 @@ def store_trade(db,trade):
         if state['trades'] is not None:state['trades'][trade['id']]=copy.deepcopy(trade)
 
 def public_trade(trade,settings=None):
-    result=copy.deepcopy(trade)
+    result=refresh_trade_risk(copy.deepcopy(trade))
     result['broker_retired']=trade.get('broker') not in BROKERS
     if result['broker_retired']:result['broker_status']='Retired broker · preserved history'
     for leg in result['legs']:
@@ -326,6 +393,12 @@ def public_trade(trade,settings=None):
         age=age_seconds(leg.get('quote_at'))
         leg['feed_age']=None if age is None else round(age,3)
         leg['stale']=age is None or age>(settings or DEFAULT_SETTINGS)['stale_after_seconds']
+        exchange_age=age_seconds(leg.get('exchange_quote_at'))
+        leg['exchange_quote_age']=None if exchange_age is None else round(exchange_age,3)
+        leg['exchange_quote_stale']=None if not leg.get('exchange_quote_at') else exchange_age is None or exchange_age>(settings or DEFAULT_SETTINGS)['stale_after_seconds']
+        if leg['exchange_quote_stale']:
+            leg['quote_warning']='Original exchange timestamp is old. '+('The last exchange update is stale.' if leg.get('exchange_timestamp_basis')=='last_update_time' else 'It may describe the last trade rather than the current bid/ask; check its source.')
+        if leg.get('exchange_timestamp_basis')=='last_update_time' and leg['exchange_quote_stale']:leg['stale']=True
     result['valuation_stale']=bool(result.get('valuation_error')) or any(l['stale'] for l in result['legs'] if l['open_lots']>0)
     for key in ('realized_pnl','unrealized_pnl','gross_pnl','net_pnl','charges','mfe','mae','net_premium','profit_giveback','margin_estimate','hedge_benefit'):
         if result.get(key) is not None:result[key]=round(result[key],2)
@@ -381,6 +454,9 @@ def new_leg(db,request,broker,settings,at):
     contract_id=contract.get('instrument_id',contract['id'])
     quote=resolve_quote(db,contract,broker,settings)
     if not quote:raise HTTPException(409,f'No quote for {contract["symbol"]}; wait for the feed.')
+    validate_new_exposure(contract,settings)
+    # Pending limits require the same valid/fresh quote as immediate fills.
+    execution_price(db,contract,item['side'],broker,settings,quote_override=quote)
     pending=False
     if item.get('order_type','MARKET')=='LIMIT':
         if not item.get('price'):raise HTTPException(422,'Set a limit price.')
@@ -392,7 +468,7 @@ def new_leg(db,request,broker,settings,at):
             limit_price=item['price'] if item.get('order_type')=='LIMIT' else None)
     lots=int(item['lots']);quantity=lots*int(contract['lot_size'])*float(contract.get('price_multiplier') or 1)
     leg={k:contract.get(k) for k in ('symbol','underlying','exchange','segment','expiry','strike','option_type','lot_size','price_multiplier','multiplier_verified','monetary_conversion_source','broker_quantity_multiplier','token','source')}
-    leg.update({'id':ident('leg'),'instrument_id':contract_id,'side':item['side'],'lots':lots,'filled_lots':0 if pending else lots,'open_lots':0 if pending else lots,'order_type':item.get('order_type','MARKET'),'limit_price':item.get('price'),'entry_price':price,'current_price':float(quote['ltp']),'exit_price':None,'entry_at':None if pending else at,'exit_at':None,'realized_pnl':0.0,'unrealized_pnl':0.0,'charges':0.0 if pending else charges(price,quantity,settings),'slippage_cost':0 if pending else slip*quantity,'status':'pending' if pending else 'open','stop_loss':item.get('stop_loss'),'target':item.get('target'),'quote_at':quote.get('received_at'),'exchange_quote_at':quote.get('exchange_timestamp'),'quote_event_id':quote.get('event_id'),'quote_source':quote.get('broker',broker),'bid':quote.get('bid'),'ask':quote.get('ask'),'demo':settings['demo_mode']})
+    leg.update({'id':ident('leg'),'instrument_id':contract_id,'side':item['side'],'lots':lots,'filled_lots':0 if pending else lots,'open_lots':0 if pending else lots,'order_type':item.get('order_type','MARKET'),'limit_price':item.get('price'),'entry_price':price,'current_price':float(quote['ltp']),'exit_price':None,'entry_at':None if pending else at,'exit_at':None,'realized_pnl':0.0,'unrealized_pnl':0.0,'charges':0.0 if pending else charges(price,quantity,settings),'slippage_cost':0 if pending else slip*quantity,'status':'pending' if pending else 'open','stop_loss':item.get('stop_loss'),'target':item.get('target'),'quote_at':quote.get('received_at'),'exchange_quote_at':quote.get('exchange_timestamp'),'exchange_timestamp_basis':quote.get('exchange_timestamp_basis'),'quote_event_id':quote.get('event_id'),'quote_source':quote.get('broker',broker),'bid':quote.get('bid'),'ask':quote.get('ask'),'demo':settings['demo_mode']})
     return leg
 
 def idempotent(db,key,payload):
@@ -439,7 +515,7 @@ def close_leg(db,trade,leg,lots,settings,manual=None,kind='exit',quote_override=
     leg['exit_price']=((leg['exit_price'] or 0)*previous_closed+price*lots)/(previous_closed+lots)
     leg['open_lots']-=lots;leg['current_price']=price;leg['charges']+=charges(price,quantity,settings);leg['slippage_cost']+=slip*quantity
     trade['net_premium']=trade.get('net_premium',0)-premium_cash_flow(leg,lots,price)
-    leg['quote_at']=quote.get('received_at');leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['quote_source']=quote.get('broker',quote.get('source',trade['broker']))
+    leg['quote_at']=quote.get('received_at');leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['exchange_timestamp_basis']=quote.get('exchange_timestamp_basis');leg['quote_source']=quote.get('broker',quote.get('source',trade['broker']))
     if not leg['open_lots']:leg['status']='closed';leg['exit_at']=at
     event(db,trade,kind,{'leg_id':leg['id'],'lots':lots,'price':price,'fill_source':leg['quote_source'],'quote_event_id':quote.get('event_id'),'trigger_quote':copy.deepcopy(quote),'processed_at':iso_now(),'accounting_method':'weighted_average'},at)
 
@@ -498,9 +574,10 @@ def apply_action(db,trade_id,payload):
             if not leg or leg['status']!='open':raise HTTPException(422,'Select an open leg.')
             lots=payload.get('lots')
             if not lots:raise HTTPException(422,'Choose lots to add.')
+            validate_new_exposure(leg,settings)
             price,quote,slip=execution_price(db,leg,leg['side'],trade['broker'],settings,payload.get('price'))
             leg['entry_price']=(leg['entry_price']*leg['open_lots']+price*lots)/(leg['open_lots']+lots)
-            leg['lots']+=lots;leg['filled_lots']+=lots;leg['open_lots']+=lots;leg['charges']+=charges(price,lots*monetary_units(leg),settings);leg['slippage_cost']+=slip*lots*monetary_units(leg);leg['current_price']=quote['ltp'];leg['quote_at']=quote.get('received_at');leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['quote_event_id']=quote.get('event_id');trade['net_premium']+=premium_cash_flow(leg,lots,price);event(db,trade,'added_lots',{'leg_id':leg['id'],'lots':lots,'price':price,'average_entry_price':leg['entry_price'],'quote_event_id':quote.get('event_id')})
+            leg['lots']+=lots;leg['filled_lots']+=lots;leg['open_lots']+=lots;leg['charges']+=charges(price,lots*monetary_units(leg),settings);leg['slippage_cost']+=slip*lots*monetary_units(leg);leg['current_price']=quote['ltp'];leg['quote_at']=quote.get('received_at');leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['exchange_timestamp_basis']=quote.get('exchange_timestamp_basis');leg['quote_event_id']=quote.get('event_id');trade['net_premium']+=premium_cash_flow(leg,lots,price);event(db,trade,'added_lots',{'leg_id':leg['id'],'lots':lots,'price':price,'average_entry_price':leg['entry_price'],'quote_event_id':quote.get('event_id')})
         elif action in ('partial_exit','exit_leg'):
             if not leg:raise HTTPException(422,'Select a leg.')
             close_leg(db,trade,leg,payload.get('lots') or 0 if action=='partial_exit' else leg['open_lots'],settings,payload.get('price'),action)
@@ -535,8 +612,24 @@ def apply_action(db,trade_id,payload):
     db.add(ActionRecord(key=payload['idempotency_key'],request_hash=fingerprint,result=result))
     db.flush();return result
 
+def validate_quote(quote):
+    """Reject corrupt prices/times while retaining crossed-quote diagnostics."""
+    for field in ('ltp','bid','ask'):
+        if quote.get(field) is None and field!='ltp':continue
+        value=quote.get(field)
+        if isinstance(value,bool):raise ValueError('Quote prices must be finite nonnegative numbers.')
+        try:number=float(value)
+        except (ValueError,TypeError):raise ValueError('Invalid quote price.') from None
+        if not math.isfinite(number) or number<0:raise ValueError('Invalid quote price.')
+    if quote.get('received_at') is not None and age_seconds(quote['received_at']) is None:
+        raise ValueError('Quote receipt timestamp is invalid or in the future.')
+    if quote.get('exchange_timestamp') is not None and age_seconds(quote['exchange_timestamp']) is None:
+        raise ValueError('Exchange quote timestamp is invalid or in the future.')
+    return quote
+
+
 def record_quote(db,quote,process=True):
-    quote=copy.deepcopy(quote)
+    quote=validate_quote(copy.deepcopy(quote))
     if quote.get('broker') not in BROKERS or not quote.get('instrument_id'):raise ValueError('Quote requires known broker and instrument_id.')
     if not math.isfinite(float(quote.get('ltp',-1))) or float(quote.get('ltp',-1))<0:raise ValueError('Invalid quote price.')
     quote.setdefault('received_at',iso_now());quote.setdefault('receive_ns',time.time_ns());quote.setdefault('demo',False)
@@ -576,12 +669,13 @@ def _pending_fill_permitted(db,trade,leg,settings,fill,at):
     candidate=copy.deepcopy(trade)
     selected=next(item for item in candidate['legs'] if item['id']==leg['id'])
     selected.update(entry_price=fill,open_lots=selected['lots'],filled_lots=selected['lots'],status='open')
+    selected['charges']+=charges(fill,selected['lots']*monetary_units(selected),settings)
     recalculate(candidate,at)
     try:enforce_paper_buying_power(db,candidate,settings)
     except HTTPException:
         if not leg.get('buying_power_blocked'):
             event(db,trade,'limit_waiting_for_paper_buying_power',{'leg_id':leg['id'],
-                'note':'Trigger received; simulated fill waits for configured paper buying power.'},at)
+                'note':'Trigger received; known premium and entry charges exceed the configured simulated cash allowance. Broker margin remains unavailable.'},at)
         leg['buying_power_blocked']=True
         return False
     leg.pop('buying_power_blocked',None)
@@ -604,7 +698,7 @@ def revalue_quote(db,entry):
                     if leg['status'] not in ('open','pending'):continue
                     matches=leg['instrument_id']==quote['instrument_id'] or contract_identity(leg)==contract_identity(quote)
                     if not matches:continue
-                    changed=True;leg['current_price']=float(quote['ltp']);leg['quote_at']=quote['received_at'];leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['quote_event_id']=entry.id;leg['quote_source']=quote['broker'];leg['bid']=quote.get('bid');leg['ask']=quote.get('ask')
+                    changed=True;leg['current_price']=float(quote['ltp']);leg['quote_at']=quote['received_at'];leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['exchange_timestamp_basis']=quote.get('exchange_timestamp_basis');leg['quote_event_id']=entry.id;leg['quote_source']=quote['broker'];leg['bid']=quote.get('bid');leg['ask']=quote.get('ask')
                     if leg['status']=='pending' and fresh:
                         price=fill_reference(quote,leg['side'],settings)
                         crossed=price<=leg['limit_price'] if leg['side']=='BUY' else price>=leg['limit_price']
@@ -655,7 +749,7 @@ def buffer_quote(quote):
         raise ValueError('Quote requires a supported broker and instrument identity.')
     if not math.isfinite(float(quote.get('ltp',-1))) or float(quote.get('ltp',-1))<0:
         raise ValueError('Invalid quote price.')
-    value=copy.deepcopy(quote)
+    value=validate_quote(copy.deepcopy(quote))
     value.setdefault('received_at',iso_now());value.setdefault('receive_ns',time.time_ns())
     key=(value['broker'],value['instrument_id'])
     with _quote_buffer_lock:
@@ -913,7 +1007,7 @@ def dashboard(db,statuses=None):
     # Summaries use small ledger headers. Only open positions and 50 recent
     # closed trades cross the WebSocket; old risk graphs are not copied/sent.
     with _cache_lock:
-        source=[t for t in state['trades'].values() if bool(t.get('demo'))==bool(settings['demo_mode']) and not t.get('history_hidden')]
+        source=[refresh_trade_risk(t) for t in state['trades'].values() if bool(t.get('demo'))==bool(settings['demo_mode']) and not t.get('history_hidden')]
         trades=[{**{k:v for k,v in t.items() if k not in {'risk','legs'}},'legs':[{'open_lots':l.get('open_lots',0)} for l in t.get('legs',[])]} for t in source]
         visible=[t for t in source if t['status'] in ('open','pending')]+sorted([t for t in source if t['status'] not in ('open','pending')],key=lambda t:t.get('created_at',''),reverse=True)[:50]
         visible_trades=[public_trade(t,settings) for t in visible]
@@ -939,13 +1033,13 @@ def dashboard(db,statuses=None):
                 baseline=prior_value if prior_value is not None else 0.0
                 if prior_value is None:daily_complete=False
         today_pnl+=trade['net_pnl']-baseline
-    summary={'net_pnl':round(sum(t['net_pnl'] for t in trades),2),'total_pnl':round(sum(t['net_pnl'] for t in trades),2),'realized_pnl':round(sum(t['realized_pnl'] for t in trades),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in trades),2),'today_pnl':round(today_pnl,2),'today_pnl_complete':daily_complete,'charges':round(sum(t['charges'] for t in trades),2),'active_trades':len(open_trades),'active_positions':sum(sum(l['open_lots']>0 for l in t['legs']) for t in trades),'margin_estimate':round(sum(t.get('margin_estimate',0) for t in open_trades),2),'paper_capital':settings['paper_capital'],'available_paper_capital':settings['paper_capital']-sum(t.get('margin_estimate',0) for t in open_trades)}
+    summary={'net_pnl':round(sum(t['net_pnl'] for t in trades),2),'total_pnl':round(sum(t['net_pnl'] for t in trades),2),'realized_pnl':round(sum(t['realized_pnl'] for t in trades),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in trades),2),'today_pnl':round(today_pnl,2),'today_pnl_complete':daily_complete,'charges':round(sum(t['charges'] for t in trades),2),'active_trades':len(open_trades),'active_positions':sum(sum(l['open_lots']>0 for l in t['legs']) for t in trades),'margin_estimate':None if open_trades else 0,'broker_margin_status':'unavailable' if open_trades else 'not_required','paper_capital':settings['paper_capital'],'available_paper_capital':None if open_trades else settings['paper_capital'],'paper_cash_reserved':round(sum(t.get('paper_cash_reserve',0) for t in open_trades),2),'available_paper_cash_capital':round(settings['paper_capital']-sum(t.get('paper_cash_reserve',0) for t in open_trades),2),'paper_capital_check':'premium_cash_only'}
     trade_counts={'strategies':len({t.get('strategy_id') or t.get('action_id') or t['id'] for t in trades}),'executions':len(trades),'active_strategies':len({t.get('strategy_id') or t.get('action_id') or t['id'] for t in open_trades}),'closed_executions':sum(t['status']=='closed' for t in trades),'definition':settings.get('trade_count_definition','strategies')}
     summary['all_time_trade_count']=trade_counts[trade_counts['definition']]
     brokers=[]
     for broker,name in BROKERS.items():
         items=[t for t in trades if t['broker']==broker];status=(statuses or {}).get(broker,{})
-        brokers.append({'id':broker,'name':name,'net_pnl':round(sum(t['net_pnl'] for t in items),2),'realized_pnl':round(sum(t['realized_pnl'] for t in items),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in items),2),'active_trades':sum(t['status']=='open' for t in items),'margin_estimate':round(sum(t.get('margin_estimate',0) for t in items if t['status']=='open'),2),'available_broker_margin':None,'status':'demo' if settings['demo_mode'] else status.get('status','disconnected'),'feed':status,'demo':settings['demo_mode']})
+        brokers.append({'id':broker,'name':name,'net_pnl':round(sum(t['net_pnl'] for t in items),2),'realized_pnl':round(sum(t['realized_pnl'] for t in items),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in items),2),'active_trades':sum(t['status']=='open' for t in items),'margin_estimate':None if any(t['status']=='open' for t in items) else 0,'broker_margin_status':'unavailable' if any(t['status']=='open' for t in items) else 'not_required','available_broker_margin':None,'status':'demo' if settings['demo_mode'] else status.get('status','disconnected'),'feed':status,'demo':settings['demo_mode']})
     quotes=_dashboard_quotes(db,settings)
     if settings['logging_mode']=='summary':
         # A small live chart lives in memory only. Recorded trade extrema and

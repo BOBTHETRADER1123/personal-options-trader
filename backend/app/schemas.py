@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -17,12 +17,12 @@ class PasswordInput(StrictModel):
 class LegInput(StrictModel):
     instrument_id: str = Field(min_length=1, max_length=150)
     side: Literal['BUY', 'SELL']
-    lots: int = Field(ge=1, le=1000)
+    lots: int = Field(ge=1, le=1000,strict=True)
     order_type: Literal['MARKET', 'LIMIT'] = 'MARKET'
-    price: float | None = Field(default=None, gt=0, le=1e9)
+    price: float | None = Field(default=None, gt=0, le=1e9,strict=True)
     enabled: bool = True
-    stop_loss: float | None = Field(default=None, gt=0)
-    target: float | None = Field(default=None, gt=0)
+    stop_loss: float | None = Field(default=None, gt=0,le=1e9,strict=True)
+    target: float | None = Field(default=None, gt=0,le=1e9,strict=True)
 
 class TradeInput(StrictModel):
     name: str = Field(min_length=1, max_length=100)
@@ -43,12 +43,12 @@ class ActionInput(StrictModel):
     idempotency_key: str = Field(min_length=8, max_length=150)
     confirmed: bool
     leg_id: str | None = None
-    lots: int | None = Field(default=None, ge=1, le=1000)
-    price: float | None = Field(default=None, gt=0, le=1e9)
+    lots: int | None = Field(default=None, ge=1, le=1000,strict=True)
+    price: float | None = Field(default=None, gt=0, le=1e9,strict=True)
     leg: LegInput | None = None
     name: str | None = Field(default=None, min_length=1,max_length=100)
-    stop_loss: float | None = Field(default=None, gt=0)
-    target: float | None = Field(default=None, gt=0)
+    stop_loss: float | None = Field(default=None, gt=0,le=1e9,strict=True)
+    target: float | None = Field(default=None, gt=0,le=1e9,strict=True)
 
 class SettingsInput(StrictModel):
     trade_count_definition: Literal['strategies','executions'] | None = None
@@ -71,22 +71,40 @@ class RiskLegInput(BaseModel):
     expiry: str = Field(min_length=1)
     side: Literal['BUY','SELL']
     option_type: Literal['CE','PE','FUT']
-    strike: float = Field(ge=0)
-    lot_size: int = Field(ge=1)
-    lots: int = Field(default=1,ge=0)
-    open_lots: int | None = Field(default=None,ge=0)
-    entry_price: float | None = Field(default=None,ge=0)
-    price: float | None = Field(default=None,ge=0)
-    price_multiplier: float | None = Field(default=None,gt=0)
+    strike: float = Field(ge=0,le=1e9,strict=True)
+    lot_size: int = Field(ge=1,le=100000000,strict=True)
+    lots: int = Field(default=1,ge=0,le=1000,strict=True)
+    open_lots: int | None = Field(default=None,ge=0,le=1000,strict=True)
+    entry_price: float | None = Field(default=None,ge=0,le=1e9,strict=True)
+    price: float | None = Field(default=None,ge=0,le=1e9,strict=True)
+    price_multiplier: float | None = Field(default=None,gt=0,le=1e9,strict=True)
     enabled: bool = True
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_boolean_amounts(cls,value):
+        if isinstance(value,dict):
+            for field in ('strike','entry_price','price','price_multiplier'):
+                if isinstance(value.get(field),bool):raise ValueError('Financial amounts cannot be boolean values.')
+        return value
+
+    @field_validator('expiry')
+    @classmethod
+    def valid_expiry(cls,value):
+        from datetime import date
+        if len(value)!=10 or date.fromisoformat(value).isoformat()!=value:raise ValueError('Expiry must be YYYY-MM-DD.')
+        return value
 
     @model_validator(mode='after')
     def require_price(self):
         if self.entry_price is None and self.price is None:
             raise ValueError('Each risk leg needs an entry price.')
+        if self.option_type!='FUT' and self.strike<=0:raise ValueError('Option strikes must be positive.')
+        if self.open_lots is not None and self.open_lots>self.lots:raise ValueError('Open lots cannot exceed lots.')
         return self
 
 class RiskInput(StrictModel):
     legs: list[RiskLegInput] = Field(min_length=1,max_length=20)
-    spot: float | None = Field(default=None,gt=0)
-    charges: float = Field(default=0,ge=0)
+    spot: float | None = Field(default=None,gt=0,le=1e9,strict=True)
+    charges: float = Field(default=0,ge=0,le=1e15,strict=True)
+    realized_pnl: float = Field(default=0,ge=-1e18,le=1e18,strict=True)

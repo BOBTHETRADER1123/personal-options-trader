@@ -14,6 +14,39 @@ import time
 from .base import FeedAuthenticationError, FeedProtocolError, ReadOnlyFeed, epoch_timestamp, normalized_quote, optional_price, utc_now
 
 
+def is_transient_network_error(exc: BaseException) -> bool:
+    """Classify public status metadata/transport causes, never broker message text.
+
+    The pinned SDK wraps httpx transport failures in ApiException(status=0),
+    preserving the original exception as a cause. Explicit 4xx rejections win
+    over a transport cause so incorrect credentials are not retried in a loop.
+    """
+    try:
+        import httpx
+        transports = (httpx.TransportError,)
+    except ImportError:
+        transports = ()
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(current, "status_code", None)
+        if status is None:
+            status = getattr(current, "status", None)
+        if isinstance(status, str) and status.isdigit():
+            status = int(status)
+        if isinstance(status, int) and not isinstance(status, bool) and 400 <= status <= 599:
+            return status == 429 or status >= 500
+        if isinstance(current, (TimeoutError, ConnectionError, OSError) + transports):
+            return True
+        current = (getattr(current, "original_exception", None)
+                   or getattr(current, "__cause__", None))
+    return False
+
+
 def parse_sfeed(message, contracts: dict, *, received_at=None, received_ns=None) -> dict | None:
     row = message.model_dump() if hasattr(message, "model_dump") else message
     if not isinstance(row, dict):
@@ -38,12 +71,19 @@ def parse_sfeed(message, contracts: dict, *, received_at=None, received_ns=None)
     if price is None:
         return None
     buy, sell = row.get("buy") or [], row.get("sell") or []
-    bid = optional_price(buy[0].get("price")) if buy else None
-    ask = optional_price(sell[0].get("price")) if sell else None
+    bid_raw = buy[0].get("price") if buy else None
+    ask_raw = sell[0].get("price") if sell else None
+    if isinstance(bid_raw, bool) or isinstance(ask_raw, bool):
+        raise FeedProtocolError("Invalid market-feed depth price")
+    bid = optional_price(bid_raw)
+    ask = optional_price(ask_raw)
+    updated_at = epoch_timestamp(row.get("last_update_time"))
+    traded_at = epoch_timestamp(row.get("last_trade_time")) if updated_at is None else None
+    timestamp_basis = "last_update_time" if updated_at is not None else "last_trade_time" if traded_at is not None else "unavailable"
     return normalized_quote("kotak", contract, price, received_at=received_at,
                             received_ns=received_ns, bid=bid, ask=ask,
                             volume=row.get("volume_traded_today"), open_interest=row.get("open_interest"),
-                            exchange_timestamp=epoch_timestamp(row.get("last_update_time") or row.get("last_trade_time")),
+                            exchange_timestamp=updated_at or traded_at, exchange_timestamp_basis=timestamp_basis,
                             previous_close=row.get("close_price"), sequence=None, event_kind=f"sfeed_{row['type']}", raw_message=row)
 
 
@@ -57,6 +97,16 @@ class KotakFeed(ReadOnlyFeed):
         self._desired_contracts = []
         self._subscribed = {}
         self._mapping = {}
+        self._last_totp_step = None
+        self._rejected_ticks = 0
+        self._last_rejected_warning_at = None
+        self._margin_client = None
+        from ..kotak_margin import ReadOnlyKotakMargin
+        self._margin_service = ReadOnlyKotakMargin(lambda: self._margin_client)
+
+    async def margin_required(self, contract, **inputs):
+        """Explicit read-only single-order diagnostic, never a paper basket sum."""
+        return await asyncio.to_thread(self._margin_service.check, contract, **inputs)
 
     async def _apply_subscriptions(self, contracts):
         from neo_api_client.websocket.feed import WsToken
@@ -120,6 +170,7 @@ class KotakFeed(ReadOnlyFeed):
         if len(contracts) > 3000:
             raise FeedProtocolError("Kotak SFeed subscriptions exceed 3000; narrow the watchlist")
         self._desired_contracts = list(contracts)
+        self._margin_client = None
         if os.environ.get("KOTAK_SID"):
             ws = SFeedWebSocket(user=os.environ["KOTAK_UCC"], auth=os.environ["KOTAK_SID"],
                                ack_wait_timeout=0, max_reconnect_attempts=0, max_connect_retries=0)
@@ -127,19 +178,41 @@ class KotakFeed(ReadOnlyFeed):
             totp = os.environ.get("KOTAK_TOTP")
             if os.environ.get("KOTAK_TOTP_SECRET"):
                 import pyotp
-                totp = pyotp.TOTP(os.environ["KOTAK_TOTP_SECRET"]).now()
+                # A fast reconnect must not resend the just-consumed one-time
+                # code. Sleep asynchronously until the next 30-second window.
+                instant = time.time()
+                step = int(instant // 30)
+                if self._last_totp_step == step:
+                    await asyncio.sleep(30 - (instant % 30) + 1)
+                    instant = time.time()
+                    step = int(instant // 30)
+                self._last_totp_step = step
+                # Tie the generated code to the sampled step even if the wall
+                # clock crosses a boundary while generation is running.
+                totp = pyotp.TOTP(os.environ["KOTAK_TOTP_SECRET"]).at(instant)
             client = NeoAPI(consumer_key=os.environ["KOTAK_CONSUMER_KEY"], environment="prod", timeout=20)
             try:
-                await asyncio.to_thread(client.totp_login, mobile_number=os.environ["KOTAK_MOBILE_NUMBER"],
-                                        ucc=os.environ["KOTAK_UCC"], totp=totp)
+                # The official SDK normally returns HTTP error responses. Its
+                # existing REST policy exposes status-bearing ApiException so
+                # an outage cannot be confused with a rejected TOTP/MPIN.
+                rest = getattr(getattr(client, "api_client", None), "rest_client", None)
+                if rest is not None and hasattr(rest, "raise_on_error"):
+                    rest.raise_on_error = True
+                login = await asyncio.to_thread(client.totp_login, mobile_number=os.environ["KOTAK_MOBILE_NUMBER"],
+                                                ucc=os.environ["KOTAK_UCC"], totp=totp)
+                if isinstance(login, dict) and any(str(key).lower() == "error" for key in login):
+                    raise ValueError("Authentication was not accepted")
                 await asyncio.to_thread(client.totp_validate, mpin=os.environ["KOTAK_MPIN"])
                 if not getattr(client.configuration, "edit_sid", None):
                     raise ValueError("Authentication did not establish a valid session")
             except Exception as exc:
+                if is_transient_network_error(exc):
+                    raise ConnectionError("Kotak login endpoint unreachable; retrying with bounded backoff") from None
                 # SDK exceptions can contain login responses. Surface a fixed
                 # explanation instead of returning secrets to the dashboard.
                 raise FeedAuthenticationError("Kotak TOTP login failed; refresh the daily TOTP/session on the backend") from None
             ws = client.create_websocket(ack_wait_timeout=0, max_reconnect_attempts=0, max_connect_retries=0)
+            self._margin_client = client
         try:
             async with ws:
                 try:
@@ -152,15 +225,26 @@ class KotakFeed(ReadOnlyFeed):
                         async with asyncio.timeout(10):
                             await self._apply_subscriptions(self._desired_contracts)
                     async for message in ws:
-                        row = message.model_dump() if hasattr(message, "model_dump") else message
-                        if isinstance(row, dict) and row.get("type") in {"scrip", "scrip_lite", "index"}:
-                            key = (str(row.get("exchange_segment", "")), str(row.get("instrument_token", "")))
-                            if key not in self._mapping:
-                                # A previously subscribed token may already be
-                                # queued when a view is removed. Never use it as
-                                # another contract or reconnect the entire feed.
-                                continue
-                        quote = parse_sfeed(row, self._mapping, received_at=utc_now(), received_ns=time.time_ns())
+                        try:
+                            row = message.model_dump() if hasattr(message, "model_dump") else message
+                            if isinstance(row, dict) and row.get("type") in {"scrip", "scrip_lite", "index"}:
+                                key = (str(row.get("exchange_segment", "")), str(row.get("instrument_token", "")))
+                                if key not in self._mapping:
+                                    # Removed-token ticks may already be queued.
+                                    continue
+                            quote = parse_sfeed(row, self._mapping, received_at=utc_now(), received_ns=time.time_ns())
+                        except (FeedProtocolError, TypeError, AttributeError, KeyError, ValueError, IndexError, OverflowError):
+                            # One corrupt tick cannot tear down all other tokens.
+                            # Keep its previous quote/time unchanged; no price is
+                            # invented. Fixed diagnostics are limited to one per
+                            # 30 seconds even if malformed messages arrive fast.
+                            self._rejected_ticks += 1
+                            now = time.monotonic()
+                            if self._last_rejected_warning_at is None or now - self._last_rejected_warning_at >= 30:
+                                self._last_rejected_warning_at = now
+                                await self.status("connected", f"Ignored {self._rejected_ticks} malformed market messages; other contracts continue",
+                                                  subscriptions=len(self._subscribed), malformed_messages=self._rejected_ticks)
+                            continue
                         if quote:
                             await self.on_quote(quote)
                 finally:
@@ -185,3 +269,5 @@ class KotakFeed(ReadOnlyFeed):
             raise FeedAuthenticationError("Kotak SFeed session rejected; renew the daily TOTP/session on the backend") from None
         except SubscriptionError:
             raise FeedProtocolError("Kotak rejected SFeed subscriptions; verify token master, permissions and 3000-token limit") from None
+        finally:
+            self._margin_client = None

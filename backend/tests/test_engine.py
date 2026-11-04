@@ -278,7 +278,7 @@ def test_payoff_rejects_nonfinite_or_invalid_contracts():
     with pytest.raises(ValueError):strategy_risk([{**leg,'side':'INVALID'}])
     with pytest.raises(ValueError):strategy_risk([{**leg,'lots':1.5}])
 
-def test_calendar_payoff_unsupported_but_standalone_margin_not_zero(db):
+def test_calendar_payoff_is_grouped_and_margin_is_unavailable(db):
     trade=enter(db,lots=1)['trades'][0]
     current=copy.deepcopy(db.get(Trade,trade['id']).data)
     short=copy.deepcopy(current['legs'][0])
@@ -286,22 +286,23 @@ def test_calendar_payoff_unsupported_but_standalone_margin_not_zero(db):
     current['legs'].append(short)
     engine.recalculate(current)
     units=current['legs'][0]['lot_size']
-    expected=(100+current['spot']*.2)*units
     assert current['risk']['supported'] is False
     assert current['risk']['points']==[]
-    assert current['margin_estimate']==pytest.approx(expected)
-    assert current['risk']['estimated_initial_margin']==pytest.approx(expected)
-    assert current['risk']['hedge_benefit']==0
+    assert current['margin_estimate'] is None
+    assert current['risk']['estimated_initial_margin'] is None
+    assert current['risk']['hedge_benefit'] is None
+    assert len(current['risk']['groups'])==2
     assert current['risk']['net_premium']==-20*units
-    assert 'No cross-expiry' in current['risk']['assumptions']
+    assert 'no cross-expiry' in current['risk']['assumptions'].lower()
 
 def test_mixed_underlying_margin_uses_each_leg_reference_and_multiplier():
     legs=[{'underlying':'NIFTY','expiry':'2027-01-01','lot_size':50,'lots':1,'strike':24000,'entry_price':100,'side':'SELL','option_type':'CE'},
           {'underlying':'GOLD','expiry':'2027-02-01','lot_size':1,'lots':2,'strike':75000,'spot':76000,'entry_price':100,'side':'SELL','option_type':'CE','price_multiplier':100}]
     risk=strategy_risk(legs,spot=25000)
     assert risk['supported'] is False
-    assert risk['estimated_margin']==24000*.2*50+76000*.2*200
-    assert risk['hedge_benefit']==0
+    assert risk['estimated_margin'] is None
+    assert risk['hedge_benefit'] is None
+    assert len(risk['groups'])==2
     assert risk['net_premium']==100*50+100*200
 
 def test_today_pnl_uses_ist_midnight_baseline(db):
@@ -661,3 +662,55 @@ def test_history_visibility_change_rolls_back_without_losing_trade(db):
     assert not db.get(Trade,trade['id']).data.get('history_hidden')
     assert engine.list_trades(db)[0]['id']==closed['id']
     assert not db.scalar(select(Event).where(Event.trade_id==trade['id'],Event.kind=='history_removed'))
+
+
+def test_pending_limit_rejects_stale_receipt_before_queueing(db):
+    c=contract()
+    quote(db,c,100,received_at=(datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat())
+    with pytest.raises(HTTPException,match='stale'):
+        engine.new_leg(db,{'instrument_id':c['id'],'side':'BUY','lots':1,'order_type':'LIMIT','price':90},'kotak',engine.get_settings(db),iso_now())
+    assert db.scalar(select(func.count()).select_from(Trade))==0
+
+
+def test_expired_contract_cannot_add_lots_through_manual_fill(db):
+    trade=enter(db,lots=1)['trades'][0]
+    stored=copy.deepcopy(db.get(Trade,trade['id']).data)
+    stored['demo']=False
+    stored['legs'][0]['demo']=False
+    stored['legs'][0]['expiry']='2020-01-01'
+    engine.store_trade(db,stored)
+    engine.update_settings(db,{'demo_mode':False})
+    db.commit()
+    with pytest.raises(HTTPException,match='expired'):
+        action(db,stored,'add_lots',leg_id=stored['legs'][0]['id'],lots=1,price=100)
+    assert db.get(Trade,trade['id']).data['legs'][0]['open_lots']==1
+
+
+def test_pending_limit_cash_guard_includes_entry_charges(db):
+    engine.update_settings(db,{'brokerage_per_order':20,'paper_capital':1000,'unlimited_paper_buying_power':False})
+    trade=enter(db,lots=1,order_type='LIMIT',price=20)['trades'][0]
+    quote(db,price=20)
+    blocked=db.get(Trade,trade['id']).data
+    assert blocked['status']=='pending' and blocked['legs'][0]['buying_power_blocked']
+    assert blocked['legs'][0]['charges']==0
+    engine.update_settings(db,{'paper_capital':1020})
+    quote(db,price=20)
+    filled=db.get(Trade,trade['id']).data
+    assert filled['status']=='open' and filled['charges']==20
+    assert filled['paper_cash_reserve']==1020
+
+
+def test_old_exchange_update_is_rejected_but_last_trade_time_is_labelled(db):
+    c=contract();stale=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    q={'broker':'kotak','ltp':100,'bid':99,'ask':101,'received_at':iso_now(),
+       'exchange_timestamp':stale,'exchange_timestamp_basis':'last_update_time'}
+    settings=engine.get_settings(db)
+    with pytest.raises(HTTPException,match='exchange update is stale'):
+        engine.execution_price(db,c,'BUY','kotak',settings,quote_override=q)
+    q['exchange_timestamp_basis']='last_trade_time'
+    assert engine.execution_price(db,c,'BUY','kotak',settings,quote_override=q)[0]==100
+    trade=enter(db,lots=1)['trades'][0]
+    trade['legs'][0].update(exchange_quote_at=stale,exchange_timestamp_basis='last_trade_time')
+    public=engine.public_trade(trade)
+    assert public['legs'][0]['exchange_quote_stale'] and public['legs'][0]['quote_warning']
+    assert not public['legs'][0]['stale']

@@ -73,17 +73,20 @@ def session_from_cookie(request, db):
         return session
     return None
 
-def require_session(request: Request, db=Depends(get_db)):
-    session = session_from_cookie(request, db)
+def validate_session_request(request, session):
     if not session:
         raise HTTPException(401, 'Please sign in.')
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         validate_origin(request)
         if not hmac.compare_digest(request.headers.get('x-csrf-token', ''), session.csrf_token):
             raise HTTPException(403, 'Your security token expired. Refresh and sign in again.')
-    # Authentication must release its read transaction before an async route
-    # waits for the app write lock, otherwise a rollback-journal writer can
-    # wait for the very reader which is waiting for that writer.
+    return session
+
+
+def require_session(request: Request, db=Depends(get_db)):
+    session=validate_session_request(request,session_from_cookie(request,db))
+    # End the auth read before waiting for the writer, avoiding DELETE-journal
+    # reader/writer lock inversion. Stream routes use their own bounded read.
     if db.get_bind().dialect.name=='sqlite':db.commit()
     return session
 

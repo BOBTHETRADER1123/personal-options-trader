@@ -1,5 +1,6 @@
 """One transactional journal shared by paper execution, feed capture and exports."""
 import os
+from contextlib import contextmanager
 import sqlite3
 import time
 from pathlib import Path
@@ -33,6 +34,9 @@ def configure_sqlite(target, journal_mode=None):
     @event.listens_for(target, 'connect')
     def sqlite_pragmas(connection, _):
         connection.isolation_level=None
+        # Opening a new connection must not wait thirty seconds just to read
+        # the existing journal setting during an exclusive writer commit.
+        connection.execute('PRAGMA busy_timeout=150')
         connection.execute('PRAGMA journal_mode='+mode)
         connection.execute('PRAGMA busy_timeout=30000')
         connection.execute('PRAGMA synchronous=FULL')
@@ -113,3 +117,38 @@ def get_db():
         except Exception:
             db.rollback()
             raise
+
+
+@contextmanager
+def bounded_read(db, timeout_ms=150):
+    """A short read-only stream/auth snapshot, ended before any async wait.
+
+    Keep DELETE/FULL and the writer's normal busy timeout unchanged. Connection
+    pragmas are restored before returning this checked-out connection to its pool.
+    No failed write is retried here and no session/read lock crosses an await.
+    """
+    if db.new or db.dirty or db.deleted:
+        raise RuntimeError('A stream read cannot contain pending changes.')
+    connection=db.connection()
+    sqlite=connection.dialect.name=='sqlite'
+    previous_timeout=previous_query_only=None
+    if sqlite:
+        previous_timeout=connection.exec_driver_sql('PRAGMA busy_timeout').scalar()
+        previous_query_only=connection.exec_driver_sql('PRAGMA query_only').scalar()
+        connection.exec_driver_sql('PRAGMA busy_timeout='+str(int(timeout_ms)))
+        connection.exec_driver_sql('PRAGMA query_only=ON')
+    try:
+        yield db
+    finally:
+        try:
+            if sqlite and not connection.closed and not connection.invalidated:
+                connection.exec_driver_sql('PRAGMA query_only='+str(int(previous_query_only)))
+                connection.exec_driver_sql('PRAGMA busy_timeout='+str(int(previous_timeout)))
+        finally:
+            if db.in_transaction():
+                if db.new or db.dirty or db.deleted:
+                    db.rollback()
+                    raise RuntimeError('A stream read attempted to modify trading state.')
+                # Read commits retain the in-memory quote cache; rollbacks are
+                # reserved for errors by the owning Session context/dependency.
+                db.commit()

@@ -11,6 +11,7 @@ import { ConnectionsPage, ExportsPage, SettingsPage } from './pages';
 import { CloudServicesPanel } from './CloudServices';
 import DailyReports from './DailyReports';
 import { executionPreview, reviewNeedsAnotherConfirmation } from './executionPreview';
+import { brokerMarginValue } from './tradeMath';
 import PaperTradeReview from './PaperTradeReview';
 const navItems=[{id:'overview',label:'Overview',icon:Layers},{id:'positions',label:'Positions & trades',icon:Activity},{id:'chain',label:'Option chain',icon:ChartNoAxesCombined},{id:'market',label:'Market watch',icon:Radio},{id:'daily',label:'Daily Excel Downloads',icon:CalendarDays},{id:'exports',label:'Trade reports',icon:FileSpreadsheet}];
 const title:Record<string,string>={overview:'Trading overview',builder:'Strategy builder',positions:'Positions & trades',history:'Trade history',chain:'Options chain',market:'Market watch',exports:'Trade reports',daily:'Daily Excel Downloads',connections:'Broker connections',settings:'Data & settings'};
@@ -34,17 +35,65 @@ export default function App(){
  const checkSession=useCallback(async()=>{try{const s=await api('/api/session');setSession(s);setCsrf(s.csrf_token||'');setAuthError('');}catch(error){setSession(null);const reason=error instanceof Error?error.message:'';setAuthError(reason&&!/fetch|network|load failed/i.test(reason)?reason:laptopWorkspace?'Your laptop workspace could not be reached. Start the app, then check the connection.':'The online service could not be reached. Try again once the service is restored.');}},[]);
  useEffect(()=>{checkSession();const changed=()=>checkSession();window.addEventListener('pot-session-changed',changed);return()=>window.removeEventListener('pot-session-changed',changed);},[checkSession]);
  const refresh=useCallback(async(full=false)=>{try{const d=await api('/api/dashboard');setDashboard(d);setAuthError('');if(full){const results=await Promise.allSettled([api('/api/settings'),api('/api/exports')]);if(results[0].status==='fulfilled')setSettings(results[0].value);if(results[1].status==='fulfilled')setJobs(results[1].value.jobs||results[1].value);}}catch(e){setAuthError((e as Error).message);if((e as Error).message.includes('sign in')){setSession({authenticated:false});setCsrf('');}}finally{setLoading(false);}},[]);
- useEffect(()=>{if(!session?.authenticated)return;refresh(true);let stopped=false,reconnect:ReturnType<typeof setTimeout>;let received=0;
-  async function connect(){if(stopped||!pageVisible()||(wsRef.current&&wsRef.current.readyState<2))return;const env=(import.meta as unknown as {env:Record<string,string>}).env;const url=env.VITE_WS_URL||(API_BASE?`${API_BASE.replace(/^http/,'ws')}/ws`:`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/ws`);try{const ticket=await api('/api/ws-ticket',{method:'POST'});if(stopped||!pageVisible())return;const socket=new WebSocket(`${url}${url.includes('?')?'&':'?'}ticket=${encodeURIComponent(ticket.ticket)}`);wsRef.current=socket;socket.onmessage=e=>{try{const msg=JSON.parse(e.data);if(msg.type==='dashboard'&&msg.data){setDashboard(msg.data);setConnection(true);setAuthError('');setLoading(false);received=Date.now();}}catch{}};socket.onclose=()=>{setConnection(false);if(!stopped)reconnect=setTimeout(connect,10000);};socket.onerror=()=>socket.close();}catch{setConnection(false);if(!stopped)reconnect=setTimeout(connect,10000);}}
-  connect();
-  const poll=setInterval(()=>{if(document.visibilityState==='visible'&&Date.now()-received>6000)refresh();},10000);
-  const reportPoll=setInterval(()=>{if(document.visibilityState==='visible')api('/api/exports').then(j=>setJobs(j.jobs||j)).catch(()=>{});},30000);
-  const visibility=()=>{clearTimeout(reconnect);if(document.visibilityState==='hidden'){wsRef.current?.close();setConnection(false);}else{refresh();connect();}};
+ useEffect(()=>{
+  if(!session?.authenticated)return;
+  refresh(true);
+  let stopped=false,connecting=false,failures=0,generation=0,received=Date.now();
+  let reconnect:ReturnType<typeof setTimeout>|undefined,openingTimeout:ReturnType<typeof setTimeout>|undefined;
+  let pending:AbortController|null=null;
+  const scheduleReconnect=()=>{
+   clearTimeout(reconnect);
+   if(stopped||!pageVisible())return;
+   const delay=Math.min(60000,1000*2**Math.min(failures++,6))*(.75+Math.random()*.25);
+   reconnect=setTimeout(()=>{reconnect=undefined;void connect();},delay);
+  };
+  async function connect(){
+   if(stopped||!pageVisible()||connecting||(wsRef.current&&wsRef.current.readyState<2))return;
+   connecting=true;
+   const attempt=++generation,controller=new AbortController();pending=controller;
+   const ticketTimeout=setTimeout(()=>controller.abort(),8000);
+   try{
+    const env=(import.meta as unknown as {env:Record<string,string>}).env;
+    const url=env.VITE_WS_URL||(API_BASE?`${API_BASE.replace(/\/$/,'').replace(/^http/,'ws')}/ws`:`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/ws`);
+    const ticket=await api('/api/ws-ticket',{method:'POST',signal:controller.signal});
+    if(stopped||attempt!==generation||!pageVisible())return;
+    const socket=new WebSocket(`${url}${url.includes('?')?'&':'?'}ticket=${encodeURIComponent(ticket.ticket)}`);wsRef.current=socket;received=Date.now();
+    openingTimeout=setTimeout(()=>{if(socket.readyState===0)socket.close();},8000);
+    socket.onopen=()=>{clearTimeout(openingTimeout);};
+    socket.onmessage=e=>{
+     if(stopped||attempt!==generation)return;
+     try{const msg=JSON.parse(e.data);
+      if(msg.type==='dashboard'&&msg.data){setDashboard(msg.data);setAuthError('');setLoading(false);}
+      if((msg.type==='dashboard'&&msg.data)||msg.type==='heartbeat'){received=Date.now();failures=0;setConnection(true);}
+     }catch{}
+    };
+    socket.onclose=()=>{
+     clearTimeout(openingTimeout);
+     if(stopped||attempt!==generation)return;
+     if(wsRef.current===socket)wsRef.current=null;
+     setConnection(false);scheduleReconnect();
+    };
+    socket.onerror=()=>socket.close();
+   }catch{
+    if(!stopped&&attempt===generation){setConnection(false);scheduleReconnect();}
+   }finally{clearTimeout(ticketTimeout);if(pending===controller)pending=null;if(attempt===generation)connecting=false;}
+  }
+  const suspend=()=>{
+   ++generation;pending?.abort();pending=null;connecting=false;
+   clearTimeout(reconnect);clearTimeout(openingTimeout);
+   const socket=wsRef.current;wsRef.current=null;
+   if(socket){socket.onclose=null;socket.onerror=null;socket.onmessage=null;socket.close();}
+   setConnection(false);
+  };
+  void connect();
+  const poll=setInterval(()=>{if(pageVisible()&&Date.now()-received>20000){refresh();if(wsRef.current?.readyState===1&&Date.now()-received>30000)wsRef.current.close();}},10000);
+  const reportPoll=setInterval(()=>{if(pageVisible())api('/api/exports').then(j=>setJobs(j.jobs||j)).catch(()=>{});},30000);
+  const visibility=()=>{if(!pageVisible())suspend();else{refresh();void connect();}};
   document.addEventListener('visibilitychange',visibility);
-  return()=>{stopped=true;clearTimeout(reconnect);clearInterval(poll);clearInterval(reportPoll);document.removeEventListener('visibilitychange',visibility);wsRef.current?.close();wsRef.current=null;};
+  return()=>{stopped=true;suspend();clearInterval(poll);clearInterval(reportPoll);document.removeEventListener('visibilitychange',visibility);};
  },[session?.authenticated,refresh]);
  const trades:Row[]=(dashboard.trades||[]).map(normalized),active=trades.filter(t=>['OPEN','PENDING'].includes(t.status)),closed=[...new Map([...trades.filter(t=>['CLOSED','CANCELLED'].includes(t.status)),...olderTrades].map(t=>[t.id,t])).values()],summary=dashboard.summary||{},accounts:Row[]=(dashboard.brokers||[]).filter((account:Row)=>Boolean(brokers[account.id])),quotes:Row[]=(dashboard.quotes||[]).filter((quote:Row)=>Boolean(brokers[quote.broker]));
- const net=Number(summary.net_pnl||summary.total_pnl||0),margin=Number(summary.margin_estimate||0),capital=Number(summary.paper_capital||0),demo=Boolean(dashboard.demo);
+ const net=Number(summary.net_pnl||summary.total_pnl||0),margin=brokerMarginValue(summary),capital=Number(summary.paper_capital||0),demo=Boolean(dashboard.demo);
  const graph=useMemo(()=>{const rows:Row[]=dashboard.portfolio_timeline||[];const day=new Date(Date.now()+19800000).toISOString().slice(0,10);const start=chartRange==='Today'?Date.parse(day+'T00:00:00+05:30'):chartRange==='1W'?Date.now()-7*86400000:0;return rows.filter(p=>new Date(p.timestamp).getTime()>=start).map(p=>({x:p.timestamp,y:Number(p.net_pnl||0)}));},[dashboard.portfolio_timeline,chartRange]);
  async function loadOlderTrades(){setHistoryBusy(true);try{const rows:Row[]=await api(`/api/trades?status=closed&offset=${closed.length}&limit=100`);setOlderTrades(previous=>[...previous,...rows.map(normalized)]);setHistoryMore(rows.length===100);}catch(error){notify((error as Error).message,true);}finally{setHistoryBusy(false);}}
  function navigate(id:string){setShowRemoved(false);setPage(id);setMobileNav(false);setBrokerFilter('all');setSearch('');}
@@ -77,7 +126,8 @@ export default function App(){
   const newLegData=payload.legs.map((leg:Row,index:number)=>({...selectedContracts[index],...leg,entry_price:previews[index].previewPrice}));
   const legData=addingTo?[...addingTo.legs.filter((leg:Row)=>leg.open_lots>0),...newLegData]:newLegData;
   const reference=instruments.find(row=>row.underlying===payload.underlying)?.spot;
-  const risk=await api('/api/risk',{method:'POST',body:JSON.stringify({legs:legData,...(reference?{spot:reference}:{})}),signal:controller.signal});
+  const riskCharges=Number(addingTo?.charges||0)+previews.reduce((total,item)=>total+Number(item.estimatedCharges||0),0);
+  const risk=await api('/api/risk',{method:'POST',body:JSON.stringify({legs:legData,charges:riskCharges,realized_pnl:Number(addingTo?.realized_pnl||0),...(reference?{spot:reference}:{})}),signal:controller.signal});
   return {payload,analysis:{...analysis,...risk},previews,quoted_at:new Date(now).toISOString(),demo:mode,fill_basis:currentSettings.fill_basis||'bid_ask',slippage_bps:Number(currentSettings.slippage_bps||0),brokerage_per_order:Number(currentSettings.brokerage_per_order??20),charges_percent:Number(currentSettings.charges_percent??.05)};
   }finally{clearTimeout(timeout);}
  }
@@ -129,7 +179,7 @@ export default function App(){
     {loading?<div className="loading-main"><Loader2 size={27} className="spin"/>Preparing your trading desk…</div>:<>
     {page==='overview'&&<>
      <div className="overview-terminal">
-      <section className="terminal-balance"><div className="terminal-label"><span>{demo?'SAMPLE PAPER PORTFOLIO':'YOUR PAPER PORTFOLIO'}</span><Badge tone="green">INR</Badge></div><div className="terminal-amount"><span>Net paper P&amp;L</span><strong className={net<0?'negative':'positive'}>{money(net)}</strong><small>Realized + unrealized · estimated charges deducted</small></div><div className="terminal-mini-stats"><div><span>Open positions</span><strong>{active.length}</strong></div><div><span>Closed positions</span><strong>{closed.length}</strong></div><div><span>Estimated margin</span><strong>{money(margin)}</strong></div></div></section>
+      <section className="terminal-balance"><div className="terminal-label"><span>{demo?'SAMPLE PAPER PORTFOLIO':'YOUR PAPER PORTFOLIO'}</span><Badge tone="green">INR</Badge></div><div className="terminal-amount"><span>Net paper P&amp;L</span><strong className={net<0?'negative':'positive'}>{money(net)}</strong><small>Realized + unrealized · estimated charges deducted</small></div><div className="terminal-mini-stats"><div><span>Open positions</span><strong>{active.length}</strong></div><div><span>Closed positions</span><strong>{closed.length}</strong></div><div><span>Broker margin</span><strong>{margin==null?'Broker margin unavailable':money(margin)}</strong></div></div></section>
       <section className="terminal-count"><div className="terminal-card-title"><h3>All-time saved trades</h3><BookOpen size={18}/></div><label className="count-definition">Count by<select aria-label="All-time trade count definition" value={countDefinition} onChange={event=>void changeCountDefinition(event.target.value)}><option value="strategies">Strategies · mirrored trades count once</option><option value="executions">Broker executions · each account counts</option></select></label><div className="lifetime-count">{allTimeCount==null?'—':num(Number(allTimeCount),0)}<small>{countDefinition==='executions'?'broker-specific paper trades':'underlying strategies'}</small></div><div className="lifetime-breakdown"><span><i/>{counts.strategies==null?'Unavailable':num(Number(counts.strategies),0)} strategies</span><span><i/>{counts.executions==null?'Unavailable':num(Number(counts.executions),0)} broker executions</span></div><p>Saved in this workspace since the first {demo?'sample ':''}trade. Saved executions retain their original strategy IDs. {demo?'These are saved sample trades. Switch sample mode off for genuine broker-data paper trades.':'These counts cover genuine broker-data paper trades. Preserved sample trades are available separately in Sample mode.'}</p></section>
       <section className="terminal-quick"><span className="eyebrow">YOUR TRADING DESK</span><button className="btn primary" onClick={newTrade}><Plus size={19}/>Create paper strategy<ArrowRight size={16}/></button><button onClick={()=>navigate('connections')}><Radio size={17}/><span>Connect market data<small>Kotak Neo</small></span><ChevronRight size={16}/></button><button onClick={()=>navigate('daily')}><FileSpreadsheet size={17}/><span>Daily Excel Downloads<small>Full history &amp; verified files</small></span><ChevronRight size={16}/></button><button onClick={()=>navigate('settings')}><ShieldCheck size={17}/><span>Backup &amp; system health<small>Recording, storage &amp; Google</small></span><ChevronRight size={16}/></button></section>
      </div>
@@ -141,7 +191,7 @@ export default function App(){
     </>}
     {page==='chain'&&<OptionChain initialMode={settings.demo_mode===false?'live':'sample'} onBuildStrategy={buildFromChain} onNotify={notify}/>}
     {page==='builder'&&<Builder executionSettings={settings} reviewLoading={previewLoading} onContractsLoaded={setInstruments} catalogMode={settings.demo_mode!==false} staleAfterSeconds={Number(settings.stale_after_seconds||10)} preferredFeed={settings.preferred_feed||'broker'} instruments={instruments} quotes={quotes} onReview={reviewTrade} addingTo={addingTo} onCancelAdd={()=>setAddingTo(null)} initialSelection={chainSelection} onSelectionConsumed={()=>setChainSelection(null)}/>}
-    {(page==='positions'||page==='history')&&<><div className="positions-tabs"><button className={page==='positions'?'active':''} onClick={()=>navigate('positions')}>Open positions <Badge>{active.length}</Badge></button><button className={page==='history'?'active':''} onClick={()=>navigate('history')}>Trade history <Badge>{closed.length}</Badge></button><button className="text-btn" onClick={newTrade}><Plus size={15}/>Strategy builder</button></div><div className="position-summary"><div><span>{page==='history'?'Completed trades':'Active strategies'}</span><strong>{page==='history'?closed.length:active.length}</strong></div><div><span>{page==='history'?'Realized gross P&L':'Unrealized gross P&L'}</span><strong><Pnl value={page==='history'?summary.realized_pnl:summary.unrealized_pnl}/></strong></div><div><span>{page==='history'?'Estimated charges · all trades':'Estimated margin · all active'}</span><strong>{money(page==='history'?summary.charges:margin)}</strong></div></div>{page==='history'&&<div className="range-buttons"><button className={!showRemoved?'active':''} onClick={()=>setShowRemoved(false)}>Saved history</button><button className={showRemoved?'active':''} onClick={()=>void loadRemovedTrades()}>Removed trades</button></div>}<Panel title={page==='history'?(showRemoved?'Removed paper trades · restorable':'Completed paper trades'):'Open paper trades'} action={<div className="table-controls"><div className="search-box"><Search size={15}/><input aria-label="Search trades" value={search} onChange={event=>setSearch(event.target.value)} placeholder="Search trades…"/></div><select aria-label="Filter by broker" value={brokerFilter} onChange={event=>setBrokerFilter(event.target.value)}><option value="all">All brokers</option>{Object.entries(brokers).map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></div>}><TradeTable trades={visible} search={search} onSelect={setSelected} onNew={newTrade} history={page==='history'}/>{page==='history'&&!showRemoved&&dashboard.history_has_more&&historyMore&&<button className="btn secondary" onClick={loadOlderTrades} disabled={historyBusy}>{historyBusy?'Loading saved trades…':'Load older saved trades'}</button>}</Panel></>}
+    {(page==='positions'||page==='history')&&<><div className="positions-tabs"><button className={page==='positions'?'active':''} onClick={()=>navigate('positions')}>Open positions <Badge>{active.length}</Badge></button><button className={page==='history'?'active':''} onClick={()=>navigate('history')}>Trade history <Badge>{closed.length}</Badge></button><button className="text-btn" onClick={newTrade}><Plus size={15}/>Strategy builder</button></div><div className="position-summary"><div><span>{page==='history'?'Completed trades':'Active strategies'}</span><strong>{page==='history'?closed.length:active.length}</strong></div><div><span>{page==='history'?'Realized gross P&L':'Unrealized gross P&L'}</span><strong><Pnl value={page==='history'?summary.realized_pnl:summary.unrealized_pnl}/></strong></div><div><span>{page==='history'?'Estimated charges · all trades':'Broker margin · active portfolio'}</span><strong>{page==='history'?money(summary.charges):margin==null?'Broker margin unavailable':money(margin)}</strong></div></div>{page==='history'&&<div className="range-buttons"><button className={!showRemoved?'active':''} onClick={()=>setShowRemoved(false)}>Saved history</button><button className={showRemoved?'active':''} onClick={()=>void loadRemovedTrades()}>Removed trades</button></div>}<Panel title={page==='history'?(showRemoved?'Removed paper trades · restorable':'Completed paper trades'):'Open paper trades'} action={<div className="table-controls"><div className="search-box"><Search size={15}/><input aria-label="Search trades" value={search} onChange={event=>setSearch(event.target.value)} placeholder="Search trades…"/></div><select aria-label="Filter by broker" value={brokerFilter} onChange={event=>setBrokerFilter(event.target.value)}><option value="all">All brokers</option>{Object.entries(brokers).map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></div>}><TradeTable trades={visible} search={search} onSelect={setSelected} onNew={newTrade} history={page==='history'}/>{page==='history'&&!showRemoved&&dashboard.history_has_more&&historyMore&&<button className="btn secondary" onClick={loadOlderTrades} disabled={historyBusy}>{historyBusy?'Loading saved trades…':'Load older saved trades'}</button>}</Panel></>}
     {page==='market'&&<Panel className="market-watch-page" title={demo?'Sample quote watch':'Received market quotes'} subtitle="Prices retain their original broker source and received time." action={<div className="table-controls"><div className="search-box"><Search size={15}/><input aria-label="Search market watch" placeholder="Search contracts…" value={search} onChange={event=>setSearch(event.target.value)}/></div><select aria-label="Market watch broker" value={brokerFilter} onChange={event=>setBrokerFilter(event.target.value)}><option value="all">All brokers</option>{Object.entries(brokers).map(([id,name])=><option key={id} value={id}>{name}</option>)}</select><button className="icon-btn" aria-label="Refresh market watch" onClick={()=>refresh(true)}><RefreshCw size={17}/></button></div>}>{watchTable(marketRows)}</Panel>}
     {page==='daily'&&<DailyReports notify={notify}/>}
     {page==='exports'&&<ExportsPage jobs={jobs} onRefresh={()=>refresh(true)} notify={notify}/>}

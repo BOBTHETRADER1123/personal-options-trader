@@ -336,7 +336,9 @@ def test_finite_simulated_capital_and_unlimited_option_keep_margin(journal):
         result=engine.create_trades(db,{'name':'Unlimited paper only','underlying':'NIFTY','brokers':['kotak'],
             'legs':[{'instrument_id':contracts[0]['id'],'side':'BUY','lots':1,'enabled':True}],
             'idempotency_key':'fixture-unlimited-open','confirmed':True});db.commit()
-        assert result['trades'][0]['margin_estimate']==5000
+        assert result['trades'][0]['margin_estimate'] is None
+        assert result['trades'][0]['paper_cash_reserve']==5000
+        assert result['trades'][0]['broker_margin']['status']=='unavailable'
 
 
 def test_verified_pruning_gate_retains_all_source_rows_until_drive_matches(journal):

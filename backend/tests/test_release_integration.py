@@ -14,7 +14,7 @@ def test_futures_are_linear_and_have_margin_without_option_premium():
     long=strategy_risk([future()],100);short=strategy_risk([future('SELL')],100)
     assert long['max_loss']==5000 and long['profit_unlimited'] and long['net_premium']==0
     assert short['max_profit']==5000 and short['loss_unlimited']
-    assert long['breakevens']==[100] and long['estimated_margin']==1000
+    assert long['breakevens']==[100] and long['estimated_margin'] is None
 
 def test_future_with_short_call_has_bounded_upside_and_actual_multiplier():
     call={**future('SELL'),'option_type':'CE','strike':110,'entry_price':5}

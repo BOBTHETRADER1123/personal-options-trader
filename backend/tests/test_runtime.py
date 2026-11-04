@@ -45,7 +45,7 @@ def test_socket_dashboard_work_does_not_block_event_loop(monkeypatch):
         def slow_dashboard(*args):
             started.set()
             assert release.wait(3)
-            return None
+            return {'data':{},'sessions':{}}
         class Socket:
             headers = {}
             query_params = {}
@@ -56,6 +56,7 @@ def test_socket_dashboard_work_does_not_block_event_loop(monkeypatch):
         monkeypatch.setattr(main, "socket_identity", lambda *args: (main.time.time() + 30, "session"))
         monkeypatch.setattr(main, "feed_manager", None)
         monkeypatch.setattr(main, "socket_dashboard", slow_dashboard)
+        monkeypatch.setattr(main, "_dashboard_publisher", main.SharedDashboardPublisher())
         socket = Socket()
         task = asyncio.create_task(main.websocket(socket))
         for _ in range(100):
@@ -69,19 +70,13 @@ def test_socket_dashboard_work_does_not_block_event_loop(monkeypatch):
     asyncio.run(run())
 
 
-def test_socket_ticket_commit_does_not_block_other_http_work(monkeypatch):
+def test_socket_ticket_does_not_wait_for_the_global_writer(monkeypatch):
     from types import SimpleNamespace
     async def run():
-        release=threading.Event();started=threading.Event()
-        def commit():started.set();assert release.wait(3)
-        fake=SimpleNamespace(execute=lambda *a:None,add=lambda *a:None,commit=commit)
         monkeypatch.setattr(main,'write_lock',asyncio.Lock())
-        task=asyncio.create_task(main.issue_ws_ticket(SimpleNamespace(token_hash='test-session'),fake))
-        try:
-            for _ in range(100):
-                if started.is_set():break
-                await asyncio.sleep(.005)
-            assert started.is_set() and not task.done()
-            assert main.process_health()['ok']
-        finally:release.set();await asyncio.wait_for(task,3)
+        monkeypatch.setattr(main,'_ws_tickets',main.TicketRegistry())
+        monkeypatch.setattr(main,'stream_session',lambda *args:('test-session',main.time.time()+30))
+        async with main.write_lock:
+            value=await asyncio.wait_for(main.issue_ws_ticket(SimpleNamespace(),None),.25)
+        assert main._ws_tickets.consume(value['ticket'])[1]=='test-session'
     asyncio.run(run())

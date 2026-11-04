@@ -20,13 +20,17 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from .database import (Base, engine as db_engine, SessionLocal, get_db, iso_now,
                        is_database_unavailable, is_sqlite_contention,
-                       run_transaction, sqlite_error_code)
+                       run_transaction, sqlite_error_code, bounded_read)
 from .models import Owner, UserSession, SocketTicket, Trade, Event, Timeline, QuoteEvent, Setting, SchemaVersion, ActionRecord, PnlSnapshot, RecordingGap
-from .security import require_session, create_session, password_hash, verify_password, verify_totp, digest, rate_limit, validate_origin, session_from_cookie, COOKIE, ALLOWED_ORIGINS
+from .security import require_session, create_session, password_hash, verify_password, verify_totp, digest, rate_limit, validate_origin, session_from_cookie, COOKIE, ALLOWED_ORIGINS, validate_session_request
 from .schemas import AuthInput, PasswordInput, TradeInput, ActionInput, SettingsInput, RiskInput
 from . import engine
 from .payoff import strategy_risk
+from .margin import unavailable_for_basket, safe_margin_audit
+from .exchange_margin import exchange_margin_status
+from .kotak_margin import MarginCheckError, safe_single_order_audit
 from .scheduler import CollectorLease, ExchangeCalendar, guard_lease
+from .realtime import TicketRegistry, SharedDashboardPublisher
 from . import cloud_backup, resource_health, maintenance, reporting, daily_reports, sheets_sync, archival
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from fastapi.exceptions import RequestValidationError
@@ -62,6 +66,8 @@ _started_at=time.monotonic()
 _last_database_write=None
 _recording_status={}
 _runtime_settings={}
+_ws_tickets=TicketRegistry()
+_dashboard_publisher=SharedDashboardPublisher()
 
 def touch_activity():
     global _activity_until
@@ -137,7 +143,8 @@ async def refresh_selected_feeds(db,force=False):
             return selected_feed_contracts(reader)
     async with _feed_refresh_lock:
         if collector_lease and collector_lease.token is None:return
-        contracts=await asyncio.to_thread(selected)
+        candidates=await asyncio.to_thread(selected)
+        contracts=candidates
         if exchange_calendar:
             now=datetime.now(timezone.utc)
             contracts=[c for c in contracts if exchange_calendar.state(c,now)['open']]
@@ -150,6 +157,8 @@ async def refresh_selected_feeds(db,force=False):
             else:
                 await feed_manager.reconfigure(contracts)
             _feed_contract_ids=identities
+        if candidates and not contracts:
+            await feed_manager.mark_market_closed()
 
 def demo_quote(contract,broker,now=None):
     now=now or time.time();base=float(contract.get('base_price') or 100)
@@ -269,50 +278,71 @@ def capture_once(lease=None):
     if result and result.get('recorded') and sheets_service:sheets_service.notify_work()
     return result
 
-async def background_loop():
+async def stop_selected_feeds():
     global _feed_contract_ids
+    # Serialize socket reconfiguration without owning the database writer lock.
+    async with _feed_refresh_lock:
+        if feed_manager:await feed_manager.stop()
+        _feed_contract_ids=None
+
+
+async def background_loop():
     next_tick=time.monotonic();renewed=0.0;refreshed=0.0
-    while not stop_event.is_set() and database_ready:
-        try:
-            async with write_lock:
-                active=recording_needed()
-                demand=active or _viewers>0 or time.monotonic()<_activity_until
-                if collector_lease and not demand:
-                    if collector_lease.token:
-                        await feed_manager.stop();_feed_contract_ids=None
-                        await asyncio.to_thread(collector_lease.release)
-                elif collector_lease:
-                    now=time.monotonic()
-                    if now-renewed>=5 or collector_lease.token is None:
-                        previous=collector_lease.token
-                        owned=await asyncio.to_thread(collector_lease.renew);renewed=now
-                        if not owned:
-                            await feed_manager.stop();_feed_contract_ids=None
-                        elif previous!=collector_lease.token:
-                            await asyncio.to_thread(restore_active_state)
-                            refreshed=0
-                    if collector_lease.token:
-                        if now-refreshed>=5:
+    subscription_task=None
+    try:
+        while not stop_event.is_set() and database_ready:
+            stop_feed=False;refresh_feed=False
+            try:
+                async with write_lock:
+                    active=recording_needed()
+                    demand=active or _viewers>0 or time.monotonic()<_activity_until
+                    if collector_lease and not demand:
+                        if collector_lease.token:
+                            await asyncio.to_thread(collector_lease.release)
+                            stop_feed=True
+                    elif collector_lease:
+                        now=time.monotonic()
+                        if now-renewed>=5 or collector_lease.token is None:
+                            previous=collector_lease.token
+                            owned=await asyncio.to_thread(collector_lease.renew);renewed=now
+                            if not owned:stop_feed=True
+                            elif previous!=collector_lease.token:
+                                await asyncio.to_thread(restore_active_state)
+                                refreshed=0
+                        if collector_lease.token:
+                            if now-refreshed>=5:
+                                refresh_feed=True;refreshed=now
+                            if active or _viewers or engine.buffered_quote_status().get('pending',0):
+                                result=await asyncio.to_thread(capture_once,collector_lease.token)
+                                if result.get('lease_lost'):
+                                    collector_lease.token=None;stop_feed=True;refresh_feed=False
+                    else:
+                        await asyncio.to_thread(capture_once)
+                # Broker stop/subscribe may wait on the network. No reader snapshot
+                # or global writer lock survives into this wait.
+                if stop_feed:await stop_selected_feeds()
+                if refresh_feed and (subscription_task is None or subscription_task.done()):
+                    async def refresh():
+                        try:
                             with SessionLocal() as db:await refresh_selected_feeds(db)
-                            refreshed=now
-                        if active or _viewers or engine.buffered_quote_status().get('pending',0):
-                            result=await asyncio.to_thread(capture_once,collector_lease.token)
-                            if result.get('lease_lost'):
-                                await feed_manager.stop();collector_lease.token=None
-                else:
-                    await asyncio.to_thread(capture_once)
-        except SQLAlchemyError as error:
-            log_database_error('Database capture',error)
-            if is_database_unavailable(error):
-                database_unavailable()
-                return
-            # A short local write conflict or one invalid statement must not
-            # turn a healthy workspace into a minute-long connection outage.
-        except Exception as error:
-            log.warning('Background capture interrupted (error_type=%s); records retained.',type(error).__name__)
-        next_tick+=1
-        if next_tick<time.monotonic():next_tick=math.ceil(time.monotonic())
-        await wait_for_shutdown(max(.01,next_tick-time.monotonic()))
+                        except Exception as error:
+                            log.warning('Subscription refresh interrupted (error_type=%s); recording continues.',type(error).__name__)
+                    subscription_task=asyncio.create_task(refresh())
+            except SQLAlchemyError as error:
+                log_database_error('Database capture',error)
+                if is_database_unavailable(error):
+                    database_unavailable()
+                    return
+            except Exception as error:
+                log.warning('Background capture interrupted (error_type=%s); records retained.',type(error).__name__)
+            next_tick+=1
+            if next_tick<time.monotonic():next_tick=math.ceil(time.monotonic())
+            await wait_for_shutdown(max(.01,next_tick-time.monotonic()))
+    finally:
+        if subscription_task:
+            subscription_task.cancel()
+            await asyncio.gather(subscription_task,return_exceptions=True)
+
 
 def restore_active_state():
     with SessionLocal() as db:
@@ -370,11 +400,12 @@ async def database_services(reporting_loop):
 
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,kotak_setup,_feed_refresh_lock
+    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,kotak_setup,_feed_refresh_lock,_ws_tickets,_dashboard_publisher
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
     from .brokers import FeedManager
+    _ws_tickets=TicketRegistry();_dashboard_publisher=SharedDashboardPublisher()
     stop_event=asyncio.Event();_feed_refresh_lock=asyncio.Lock();database_ready=False;_viewers=0;_activity_until=0;_started_at=time.monotonic()
     with _quote_selection_lock:_quote_selection_requests.clear()
     kotak_setup=broker_setup.KotakSetupService(factory=SessionLocal)
@@ -585,8 +616,8 @@ async def create_trade(payload:TradeInput,db=Depends(get_db)):
             result=engine.create_trades(db,payload);db.commit();update_demand(db)
             return result
         result=await asyncio.to_thread(persist);touch_activity()
-        await refresh_selected_feeds(db)
-        return result
+    await refresh_selected_feeds(db)
+    return result
 
 @app.get('/api/trades/{trade_id}',dependencies=[Depends(require_session)])
 def get_trade(trade_id:str,include_history:bool=True,history_limit:int=Query(default=200,ge=1,le=500),before_second:int|None=None,db=Depends(get_db)):
@@ -629,8 +660,8 @@ async def trade_action(trade_id:str,payload:ActionInput,db=Depends(get_db)):
             return result
         result=await asyncio.to_thread(persist);touch_activity();reporting.notify_work()
         if cloud_service:cloud_service.notify_work()
-        await refresh_selected_feeds(db)
-        return result
+    await refresh_selected_feeds(db)
+    return result
 
 @app.get('/api/events',dependencies=[Depends(require_session)])
 def recent_events(limit:int=20,db=Depends(get_db)):
@@ -806,35 +837,96 @@ async def patch_settings(payload:SettingsInput,db=Depends(get_db)):
 def risk(payload:RiskInput):
     legs=[leg.model_dump(exclude_none=True) for leg in payload.legs]
     if any(leg.get('exchange')=='MCX' and not leg.get('demo') and not leg.get('price_multiplier') for leg in legs):return {'supported':False,'reason':'MCX risk requires the verified monetary multiplier from the broker master.','points':[]}
-    try:return strategy_risk(legs,payload.spot,payload.charges)
+    try:
+        result=strategy_risk(legs,payload.spot,payload.charges,payload.realized_pnl)
+        result['validation_warnings']=result.get('premium_warnings',[])
+        result['broker_margin']=unavailable_for_basket(legs,net_premium=result.get('net_premium'))
+        result['exchange_margin']=exchange_margin_status(legs)
+        return result
     except (KeyError,TypeError,ValueError):raise HTTPException(422,'Supply option type, side, strike, lot size, lots and entry price for every leg.')
 
-@app.post('/api/ws-ticket')
-async def issue_ws_ticket(current=Depends(require_session),db=Depends(get_db)):
+class KotakMarginInput(BaseModel):
+    model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
+    instrument_id:str=Field(min_length=1,max_length=150)
+    side:Literal['BUY','SELL']
+    lots:int=Field(ge=1,le=1000,strict=True)
+    price:float=Field(gt=0,le=1e9,strict=True)
+    product:Literal['NRML','MIS']='NRML'
+
+
+@app.post('/api/brokers/kotak/margin-required',dependencies=[Depends(require_session)])
+async def kotak_margin_required(payload:KotakMarginInput,request:Request,db=Depends(get_db)):
+    """Explicit scalar check; never loop/sum legs or submit a broker order."""
+    rate_limit(request,'kotak-margin',limit=6,seconds=60)
+    contract=catalog.find(payload.instrument_id,'kotak') if catalog else None
+    if not contract or contract.get('demo') is not False or contract.get('broker')!='kotak':
+        raise HTTPException(422,'Select a genuine Kotak contract from the current instrument master.')
+    if feed_manager is None:raise HTTPException(409,'No Kotak market-data session is available.')
+    # Network I/O never holds a database transaction or writer lock.
+    option_chain.finish_read_transaction(db)
+    try:
+        async with asyncio.timeout(25):
+            result=await feed_manager.margin_required(contract,lots=payload.lots,side=payload.side,
+                                                      price=payload.price,product=payload.product,order_type='L')
+    except MarginCheckError as error:raise HTTPException(409,str(error)) from None
+    except TimeoutError:raise HTTPException(504,'The read-only Kotak margin check timed out. Basket margin remains unavailable.') from None
+    audit=safe_single_order_audit(result)
+    log.info('Read-only Kotak margin diagnostic %s',audit)
     async with write_lock:
-        def save_ticket():
-            raw=secrets.token_urlsafe(32)
-            db.execute(delete(SocketTicket).where(SocketTicket.expires_at<time.time()))
-            db.add(SocketTicket(token_hash=digest(raw),session_hash=current.token_hash,expires_at=time.time()+30))
-            db.commit()
-            return {'ticket':raw,'expires_in':30}
-        return await asyncio.to_thread(save_ticket)
+        def persist():
+            db.add(Event(trade_id='MARGIN',kind='single_order_margin_diagnostic',timestamp=iso_now(),data=audit));db.commit()
+        await asyncio.to_thread(persist)
+    return result
+
+
+@app.post('/api/margin/preview',dependencies=[Depends(require_session)])
+async def margin_preview(payload:RiskInput,request:Request,db=Depends(get_db)):
+    rate_limit(request,'margin-preview',limit=30,seconds=60)
+    legs=[leg.model_dump(exclude_none=True) for leg in payload.legs]
+    try:
+        result=unavailable_for_basket(legs)
+        result['exchange_margin']=exchange_margin_status(legs)
+    except ValueError as error:raise HTTPException(422,str(error)) from None
+    async with write_lock:
+        def persist():
+            db.add(Event(trade_id='MARGIN',kind='paper_basket_margin_assessment',timestamp=iso_now(),data=safe_margin_audit(result)));db.commit()
+        await asyncio.to_thread(persist)
+    return result
+
+
+def stream_session(request,db):
+    with bounded_read(db):
+        current=validate_session_request(request,session_from_cookie(request,db))
+        return current.token_hash,current.expires_at
+
+
+@app.post('/api/ws-ticket')
+async def issue_ws_ticket(request:Request,db=Depends(get_db)):
+    # Same owner, origin and CSRF checks, but no DELETE/INSERT/commit writer.
+    session_hash,expiry=await asyncio.to_thread(stream_session,request,db)
+    return _ws_tickets.issue(session_hash,expiry)
+
 
 def socket_identity(ticket,request):
+    # Consume atomically before validating; a used/invalid ticket cannot fall
+    # back to cookies. No trading/session mutation runs during the handshake.
+    item=_ws_tickets.consume(ticket) if ticket else None
+    if ticket and item is None:return None
     with SessionLocal() as db:
-        if ticket:
-            row=db.get(SocketTicket,digest(ticket))
-            session=db.get(UserSession,row.session_hash) if row and row.expires_at>time.time() else None
-            if row:db.delete(row);db.commit()
-        else:session=session_from_cookie(request,db)
-        if not session or session.expires_at<=time.time():return None
-        return session.expires_at,session.token_hash
+        with bounded_read(db):
+            session=db.get(UserSession,item[1]) if item else session_from_cookie(request,db)
+            if not session or session.expires_at<=time.time():return None
+            return session.expires_at,session.token_hash
 
-def socket_dashboard(session_hash,statuses):
+
+def socket_dashboard(session_hashes):
+    # One short read batch validates every viewer and builds the dashboard once.
     with SessionLocal() as db:
-        current=db.get(UserSession,session_hash)
-        if not current or current.expires_at<=time.time():return None
-        return engine.dashboard(db,statuses)
+        with bounded_read(db):
+            sessions={row.token_hash:row.expires_at for row in db.scalars(
+                select(UserSession).where(UserSession.token_hash.in_(session_hashes),UserSession.expires_at>time.time()))}
+            return {'data':engine.dashboard(db,feed_manager.statuses() if feed_manager else {}),'sessions':sessions}
+
 
 @app.websocket('/ws')
 @app.websocket('/api/ws')
@@ -842,25 +934,37 @@ async def websocket(ws:WebSocket):
     global _viewers
     origin=ws.headers.get('origin')
     if origin and origin.rstrip('/') not in ALLOWED_ORIGINS:await ws.close(code=4403);return
-    async with write_lock:
+    registration=None;accepted=False
+    try:
         identity=await asyncio.to_thread(socket_identity,ws.query_params.get('ticket'),ws)
         if not identity:await ws.close(code=4401);return
         expiry,session_hash=identity
-    await ws.accept()
-    _viewers+=1;touch_activity()
-    try:
+        registration=_dashboard_publisher.register(session_hash,expiry)
+        await ws.accept();accepted=True
+        _viewers+=1;touch_activity()
+        previous=None;last_send=0.0
         while time.time()<expiry:
-            data=await asyncio.to_thread(socket_dashboard,session_hash,feed_manager.statuses() if feed_manager else {})
-            if data is None:break
-            await ws.send_json({'type':'dashboard','data':data})
+            snapshot=await _dashboard_publisher.snapshot(socket_dashboard)
+            if snapshot is None or snapshot.sessions.get(session_hash,0)<=time.time():break
+            if snapshot.fingerprint!=previous:
+                await asyncio.wait_for(ws.send_text(snapshot.encoded),timeout=5)
+                previous=snapshot.fingerprint;last_send=time.monotonic()
+            elif time.monotonic()-last_send>=3:
+                await asyncio.wait_for(ws.send_json({'type':'heartbeat','server_time':iso_now()}),timeout=5)
+                last_send=time.monotonic()
             await asyncio.sleep(1)
         await ws.close(code=4401)
     except (WebSocketDisconnect,RuntimeError):pass
+    except (TimeoutError,ValueError):
+        with suppress(RuntimeError):await ws.close(code=1013)
     except SQLAlchemyError as error:
         log_database_error('Workspace stream',error)
         if is_database_unavailable(error):database_unavailable()
         with suppress(RuntimeError):await ws.close(code=1013)
-    finally:_viewers=max(0,_viewers-1)
+    finally:
+        if registration is not None:_dashboard_publisher.unregister(registration)
+        if accepted:_viewers=max(0,_viewers-1)
+
 
 class DailyPrepareInput(BaseModel):
     model_config=ConfigDict(extra='forbid')
