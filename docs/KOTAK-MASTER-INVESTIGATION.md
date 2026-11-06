@@ -1,6 +1,6 @@
-# Kotak Scrip Master investigation — 4 November 2026
+# Kotak Scrip Master investigation — 4–5 November 2026
 
-This report records the original implementation at commit 1805992, the pinned official `kotakneoapi==3.0.9` wheel, and the current official 3.0.13 source/changelog read on 4 November 2026. It does not claim that a live authenticated master request, downloaded current CSV, or broker-feed connection has been tested. No credentials or real orders were used in this investigation.
+This report records the original implementation at commit 1805992, the pinned official `kotakneoapi==3.0.9` wheel, and the current official 3.0.13 source/changelog read on 4 November 2026. The investigation combines captured production master diagnostics with in-memory replays of official contract files. Broker WebSocket delivery requires separate owner verification.
 
 ## Confirmed origin of the displayed message
 
@@ -23,23 +23,19 @@ Therefore the diagnostic implementation should use the verified official SDK RES
 
 The application requests the officially supported segments `nse_fo`, `bse_fo`, and `mcx_fo`. Their current CSV URLs must come from the actual response's `filesPaths`, with exact segment/filename matching and HTTPS/official-host checks. Dated example URLs in documentation are examples, not current file locations.
 
-## Expiry parsing: current source differs from the pinned SDK
+## Expiry parsing confirmed from the 5 November 2026 files
 
-The pinned 3.0.9 `services/scrip_search.py` adds 315,511,200 seconds to NSE `pExpiryDate`, while parsing BSE/MCX directly. **This is no longer the current official rule.** The official 3.0.13 changelog, dated 28 October 2026, explicitly states that its approximately ten-year adjustment is specific to `nse_com`, not `nse_fo`. The current official `scrip_search.py` converts `pExpiryDate` as direct epoch seconds for all supported `*_fo` segments. Its UTC date must not be shifted into the next day by an IST conversion.
+The SDK pinned by this deployment is `kotakneoapi==3.0.9`. The newer 3.0.13 changelog describes direct epoch decoding for `nse_fo`, but the three official files returned on 5 November establish the schema that the app had to parse. The NSE file contained equal `pExpiryDate` and `lExpiryDate` fields encoded in the legacy NSE epoch. Commit `a0353ba` selected `pExpiryDate` and applied direct Unix decoding, which moved all 86,055 rows back ten years and failed validation with `no_current_derivatives`.
 
-The fresh public source fetch identified `__version__ = "3.0.13"`; SHA-256 of its `services/scrip_search.py` was `b3f033dc5c5024d7caa3ff3857231c1f58e1bcd09900edd9b518ef9cc81d1028`. The original app instead prefers `lExpiryDate` over `pExpiryDate` and gives NSE's former legacy `lExpiryDate` a segment-specific offset. Current official `pExpiryDate` therefore needs explicit precedence and direct UTC conversion. Historical imports that use `lExpiryDate` need their own documented compatibility rule; the old SDK's `pExpiryDate` conversion must not be blindly applied to today's data. The `transformed` versus `transformed-v1` directory name does not, by itself, establish an epoch conversion rule.
+The corrected parser requires both fields to agree when both are present, uses the legacy NSE conversion for the paired schema, and verifies the decoded date against the explicit NSE `pScripRefKey` when provided. BSE and MCX use direct UTC dates. The parser preserves explicit normalized dates and fails closed on schema disagreement. It does not adjust dates based on their age.
 
-A read-only synthetic reproduction executed the original parser helpers without importing app settings or making a broker request:
+| Captured segment | Verified derivative contracts | Result |
+| --- | ---: | --- |
+| NSE | 86,055 | Accepted with legacy decoding and reference cross-check |
+| BSE | 39,575 | Accepted using direct UTC decoding |
+| MCX | 16,402 | Accepted using direct UTC decoding, with 40 non-derivative rows ignored |
 
-| Synthetic native input | Original parser result | What this proves |
-|---|---|---|
-| NSE `pExpiryDate = 1478188800` | 2016-11-03 | Direct epoch result; only the legacy pinned 3.0.9 source adds ten years. This does not establish a current parser bug. |
-| NSE `lExpiryDate = 1478188800` | 2026-11-03 | Original app's legacy-field conversion. |
-| NSE `lExpiryDate = 1478188800.0` | ValueError: unrecognized expiry format | The original numeric test rejects an integral decimal representation. |
-
-The decimal-epoch example is a deterministic parser failure on synthetic input. It has not been observed in the production CSV, so it must not be reported as the exact production root cause. No actual current CSV URL, column values, HTTP status or root exception has been captured in this source-only investigation. The owner must reproduce a contract refresh using the new safe stage/row diagnostics before any specific branch is described as the observed server cause.
-
-Normalized ISO expiry strings must retain their supplied dates. Native epoch aliases require finite integral values and explicit schema-specific conversion, not a guessed ten-year correction chosen to make an expired date look current. Unexpected historical dates must fail current-contract eligibility while the previous validated catalog remains available for existing positions.
+The exact files were replayed locally. A separate production attempt on 4 November returned HTTP 424 at `response_status`, before CSV download. It is handled as a temporary dependency failure with bounded retry. The replay verifies parsing, not a broker WebSocket connection.
 
 ## Verified SDK transport and CSV schema details
 
@@ -67,4 +63,4 @@ Traceback diagnostics must preserve every exception-chain frame (file, line, fun
 - [Official 3.0.13 changelog](https://github.com/Kotak-Neo/kotak-neo-python/blob/main/CHANGELOG.md)
 - [Official native-field examples](https://github.com/Kotak-Neo/kotak-neo-python/blob/main/docs/functions/market_data/search_scrip.md)
 
-The pinned wheel documents the installed SDK; the fresh official source and changelog document the newer published conversion rules. Their difference is material and must remain explicit. Production HTTP/CSV/root-cause and authenticated feed verification remain separate from these source and synthetic-parser findings.
+The pinned wheel documents the installed SDK; the fresh official source and changelog document the newer published conversion rules. Their difference is material and must remain explicit. Production catalog publication and authenticated feed verification are separate checks.

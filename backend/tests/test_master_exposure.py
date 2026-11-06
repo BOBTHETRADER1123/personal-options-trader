@@ -58,10 +58,11 @@ def test_native_expiry_rejects_invalid_or_out_of_bounds_seconds(value):
 
 
 
-def test_current_p_expiry_column_takes_precedence_over_legacy_alias():
+@pytest.mark.parametrize("legacy", ["invalid", "0", "1478188800"])
+def test_conflicting_native_expiry_aliases_fail_closed(legacy):
     seconds = str(int(datetime(2026, 11, 3, 10, tzinfo=timezone.utc).timestamp()))
-    row = normalize_row("kotak", native_row(pExpiryDate=seconds, lExpiryDate="invalid"))
-    assert row["expiry"] == "2026-11-03"
+    with pytest.raises(ValueError, match="expiry aliases conflict"):
+        normalize_row("kotak", native_row(pExpiryDate=seconds, lExpiryDate=legacy))
 
 
 def test_explicit_normalized_expiry_preserves_date_over_native_epoch():
@@ -261,3 +262,51 @@ def test_reload_publishes_master_metadata_only_after_all_rows_validate(tmp_path)
     assert current.error is not None
     assert current.master_metadata == initial
     assert current.find("kotak:nse_fo:123") == before
+
+
+# Representative public native rows from the API-returned 2026-11-05 files.
+# NSE SHA256 b2727a2eabca8c05e4358e85fe5c1db3d24f40a33e49d3212eed8b80a31ca697.
+@pytest.mark.parametrize("suffix", ["", ".0"])
+def test_actual_dual_alias_nse_schema_preserves_published_reference_expiry(suffix):
+    result = normalize_row("kotak", native_row(
+        pSymbol="101004", pSymbolName="INDHOTEL", pTrdSymbol="INDHOTEL26DEC970PE",
+        pOptionType="PE", pScripRefKey="INDHOTEL29DEC26970.00PE", lLotSize="1000",
+        pExpiryDate="1483021800" + suffix, lExpiryDate="1483021800", **{"dStrikePrice;": "97000"}))
+    assert result["expiry"] == "2026-12-29"
+    assert result["expiry_schema"] == "kotak_native_dual_legacy_nse_epoch"
+    assert result["strike"] == 970
+
+
+@pytest.mark.parametrize("segment,seconds,expected", [
+    ("bse_fo", "1793903399", "2026-11-05"),
+    ("mcx_fo", "1794959999", "2026-11-17"),
+])
+def test_actual_dual_alias_bse_mcx_fields_use_utc_business_date(segment, seconds, expected):
+    result = normalize_row("kotak", native_row(segment, pExpiryDate=seconds, lExpiryDate=seconds))
+    assert result["expiry"] == expected
+    assert result["expiry_schema"] == "kotak_native_dual_utc_epoch"
+
+
+@pytest.mark.parametrize("reference", [
+    "NIFTY09NOV2626350.00PE", "NIFTY28DEC26970.00PE",
+    "OTHER29DEC26970.00PE", "NIFTY99XYZ26970.00PE", "NIFTY29DEC26970.00PE-private",
+])
+def test_native_nse_reference_cannot_silently_change_decoded_expiry(reference):
+    with pytest.raises(ValueError, match="Kotak NSE"):
+        normalize_row("kotak", native_row(pExpiryDate="1483021800", lExpiryDate="1483021800", pScripRefKey=reference))
+
+
+def test_native_nse_future_reference_has_exact_expiry_without_inventing_a_session():
+    result = normalize_row("kotak", native_row(pSymbolName="TATASTEEL", pTrdSymbol="TATASTEEL26NOVFUT",
+        pOptionType="XX", pScripRefKey="TATASTEEL23NOV26FUT", pExpiryDate="1479911400", lExpiryDate="1479911400"))
+    assert result["expiry"] == "2026-11-23" and result["option_type"] == "FUT"
+
+
+def test_direct_p_only_epoch_is_checked_against_optional_nse_reference():
+    seconds=str(int(datetime(2026,11,9,14,30,tzinfo=timezone.utc).timestamp()))
+    result=normalize_row("kotak",native_row(pExpiryDate=seconds,pScripRefKey="NIFTY09NOV2626350.00PE"))
+    assert result["expiry"]=="2026-11-09" and result["expiry_schema"]=="kotak_native_p_utc_epoch"
+    # Dual native Unix aliases would imply a changed schema, not permission to
+    # quietly add ten years. The published reference rejects that mismatch.
+    with pytest.raises(ValueError,match="conflicts with the published"):
+        normalize_row("kotak",native_row(pExpiryDate=seconds,lExpiryDate=seconds,pScripRefKey="NIFTY09NOV2626350.00PE"))

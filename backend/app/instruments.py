@@ -52,11 +52,13 @@ def _date(value: object) -> str:
 def _kotak_native_expiry(value: object, segment: str, column: str) -> str:
     """Decode current and legacy native expiry schemas without guessing epochs.
 
-    Official v3.0.13 (2026-10-28) uses direct UTC seconds for pExpiryDate in
-    all supported *_fo segments. Preserve the separately documented legacy
-    lExpiryDate NSE offset for old imports. Never apply that legacy offset to
-    the current field. Normalized date values retain their published date.
-    Integral decimal CSV values (for example 1793743200.0) are valid.
+    The column argument identifies the schema, not the age of the contract.
+    Current official source documents p-only UTC seconds, while the actual
+    2026-11-05 NSE CSV exposes equal p/l fields in the pinned SDK's legacy
+    NSE epoch. _kotak_row_expiry validates their agreement and explicit NSE
+    reference date before selecting this decoder. Normalized dates retain
+    their published date; no current-date heuristic changes an expiry.
+    Integral decimal CSV seconds are valid.
     """
     text = str(value).strip()
     if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
@@ -73,6 +75,62 @@ def _kotak_native_expiry(value: object, segment: str, column: str) -> str:
         return moment.date().isoformat()
     except (InvalidOperation, OverflowError, OSError):
         raise ValueError("Invalid Kotak native expiry seconds") from None
+
+
+_MONTH_NUMBERS = {name: number for number, name in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1)}
+
+
+def _verify_kotak_nse_reference(row: dict, expiry: str, underlying: str) -> None:
+    """Cross-check a decoded date; never derive or repair an expiry from a name.
+
+    Every NSE row in the verified 2026-11-05 native file carries an exact
+    underlying + DDMMMYY reference key. The explicit month map is independent
+    of the Windows/server locale. A future schema mismatch fails closed.
+    """
+    reference = _pick(row, "pScripRefKey").upper()
+    if not reference:
+        return  # Normalized/older imports may not carry this optional field.
+    prefix = underlying.upper()
+    match = re.fullmatch(re.escape(prefix) + r"(\d{2})([A-Z]{3})(\d{2})(?:FUT|\d+(?:\.\d+)?(?:CE|PE))", reference)
+    if not match:
+        raise ValueError("Kotak NSE contract reference format is invalid")
+    try:
+        reference_date = date(2000 + int(match[3]), _MONTH_NUMBERS[match[2]], int(match[1])).isoformat()
+    except (ValueError, KeyError):
+        raise ValueError("Kotak NSE contract reference date is invalid") from None
+    if expiry != reference_date:
+        raise ValueError("Kotak NSE expiry conflicts with the published contract reference")
+
+
+def _kotak_row_expiry(row: dict, segment: str, underlying: str) -> tuple[str, str]:
+    explicit = _pick(row, "expiry")
+    if explicit:
+        return explicit, "normalized_expiry"
+    current, legacy = _pick(row, "pExpiryDate"), _pick(row, "lExpiryDate")
+    if current and legacy:
+        # Both aliases in the actual native file encode the SAME value. Never
+        # silently choose one when the broker fields contradict each other.
+        try:
+            equal = Decimal(current) == Decimal(legacy)
+        except InvalidOperation:
+            try:
+                equal = _date(current) == _date(legacy)
+            except ValueError:
+                equal = False
+        if not equal:
+            raise ValueError("Kotak native expiry aliases conflict")
+        column, value = "lExpiryDate", legacy
+        schema = "kotak_native_dual_legacy_nse_epoch" if segment == "nse_fo" else "kotak_native_dual_utc_epoch"
+    elif legacy:
+        column, value = "lExpiryDate", legacy
+        schema = "kotak_legacy_nse_epoch" if segment == "nse_fo" else "kotak_native_l_utc_epoch"
+    else:
+        column, value, schema = "pExpiryDate", current, "kotak_native_p_utc_epoch"
+    decoded = _kotak_native_expiry(value, segment, column)
+    if segment == "nse_fo":
+        _verify_kotak_nse_reference(row, decoded, underlying)
+    return decoded, schema
 
 
 def contract_master_status(contract: dict, now: datetime | None = None) -> dict:
@@ -234,10 +292,7 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
         exchange = {"nse_fo": "NSE", "bse_fo": "BSE", "mcx_fo": "MCX"}.get(segment.lower(), _pick(row, "exchange"))
         symbol = _pick(row, "pTrdSymbol", "trading_symbol", "symbol")
         underlying = _pick(row, "pSymbolName", "pUnderlying", "underlying")
-        expiry = _pick(row, "expiry")
-        if not expiry:
-            native_column = "pExpiryDate" if _pick(row, "pExpiryDate") else "lExpiryDate"
-            expiry = _kotak_native_expiry(_pick(row, native_column), segment, native_column)
+        expiry, expiry_schema = _kotak_row_expiry(row, segment, underlying)
         strike = _kotak_native_price(row, "dStrikePrice", "strike")
         option_type = _pick(row, "pOptionType", "option_type")
         lot = _pick(row, "lLotSize", "lot_size")
@@ -272,7 +327,8 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
             "strike": parsed_strike, "option_type": option_type, "instrument_type": "future" if option_type == "FUT" else "option", "lot_size": parsed_lot,
             "tick_size": _positive(tick), **conversion,
             "demo": False, "source": "broker_master",
-            "imported_at": datetime.now(timezone.utc).isoformat()}
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+            **({"expiry_schema": expiry_schema} if broker == "kotak" else {})}
 
 
 def demo_contracts(today: date | None = None) -> list[dict]:

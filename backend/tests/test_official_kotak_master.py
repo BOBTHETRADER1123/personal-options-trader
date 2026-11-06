@@ -117,8 +117,9 @@ def test_bounded_retry_only_for_temporary_errors(caplog):
     assert error.value.details['http_status']==403 and delays==[1,2]
 
 
-def test_complete_three_segment_download_uses_official_get_headers_and_no_csv_credentials(monkeypatch,caplog):
-    public=paths();client,calls=fake_client([httpx.Response(503),httpx.Response(200,json={'data':{'filesPaths':list(public.values())}})])
+@pytest.mark.parametrize('temporary_status', [503,424])
+def test_complete_three_segment_download_uses_official_get_headers_and_no_csv_credentials(monkeypatch,caplog,temporary_status):
+    public=paths();client,calls=fake_client([httpx.Response(temporary_status),httpx.Response(200,json={'data':{'filesPaths':list(public.values())}})])
     downloads=[]
     def handler(request):
         downloads.append(request)
@@ -233,3 +234,67 @@ def test_slow_cache_validation_never_holds_recording_writer_lock(tmp_path,monkey
     try:
         with Session(sql) as db:asyncio.run(scenario(db))
     finally:engine.set_catalog(original);sql.dispose()
+
+
+@pytest.mark.parametrize('temporary_status', [503,424])
+def test_master_temporary_dependency_failures_stop_after_three_attempts(temporary_status,caplog):
+    body={'error':{'private':'SYNTHETIC_PRIVATE_KEY'},'message':'Do not log private broker error text'}
+    client,calls=fake_client([httpx.Response(temporary_status,json=body) for _ in range(3)])
+    delays=[]
+    with pytest.raises(MasterRefreshError) as error:
+        download(client=client,now=NOW,sleep=delays.append)
+    assert len(calls)==3 and delays==[1,2]
+    details=error.value.details
+    assert details['http_status']==temporary_status
+    assert details['endpoint']=='https://mis.kotaksecurities.com/script-details/1.0/masterscrip/file-paths'
+    assert details['method']=='GET' and details['authorization_present'] is True
+    assert details['content_type']=='application/json'
+    assert details['response_shape']=={'json_object':True,'data_object':False,'filesPaths_list':False,
+                                      'error_field':True,'fault_field':False,'message_field':True}
+    rendered=json.dumps(details)+caplog.text
+    assert 'SYNTHETIC_PRIVATE_KEY' not in rendered and 'Do not log private' not in rendered
+
+
+def test_permanent_403_reports_safe_request_shape_without_retry(caplog):
+    client,calls=fake_client([httpx.Response(403,content=b'SYNTHETIC_PRIVATE_KEY',
+                                        headers={'content-type':'SYNTHETIC_PRIVATE_KEY'})])
+    waits=[]
+    with pytest.raises(MasterRefreshError) as error:download(client=client,now=NOW,sleep=waits.append)
+    assert len(calls)==1 and waits==[] and error.value.retryable is False
+    assert error.value.details['content_type']=='other'
+    assert not any(error.value.details['response_shape'].values())
+    assert 'SYNTHETIC_PRIVATE_KEY' not in json.dumps(error.value.details)+caplog.text
+
+
+@pytest.mark.parametrize('location,code', [
+    (None,'redirect_location_missing'),
+    (HOST+'2026-11-03/transformed/nse_fo.csv','redirect_source_changed'),
+    (HOST+TODAY+'/transformed/bse_fo.csv','redirect_source_changed'),
+])
+def test_csv_redirect_requires_same_current_date_and_segment(monkeypatch,location,code):
+    client,_=fake_client([httpx.Response(200,json={'data':{'filesPaths':list(paths().values())}})])
+    requests=[]
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(302,headers={} if location is None else {'location':location})
+    original=httpx.Client
+    monkeypatch.setattr('app.kotak_master.httpx.Client',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
+    with pytest.raises(MasterRefreshError) as error:download(client=client,now=NOW)
+    assert error.value.details['code']==code and len(requests)==1
+    assert error.value.details['stage']=='csv_download' and error.value.details['segment']=='nse_fo'
+
+
+def test_current_official_csv_redirect_with_unchanged_filename_is_allowed(monkeypatch):
+    client,_=fake_client([httpx.Response(200,json={'data':{'filesPaths':list(paths().values())}})])
+    requests=[]
+    def handler(request):
+        requests.append(request)
+        segment=request.url.path.split('/')[-1].removesuffix('.csv')
+        if request.url.host=='lapi.kotaksecurities.com':
+            return httpx.Response(302,headers={'location':str(request.url).replace('lapi.','mis.')})
+        return httpx.Response(200,content=csv_bytes([row(segment)]),headers={'content-type':'text/csv'})
+    original=httpx.Client
+    monkeypatch.setattr('app.kotak_master.httpx.Client',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
+    batch=download(client=client,now=NOW)
+    assert len(batch)==3 and len(requests)==6
+    assert all('authorization' not in request.headers for request in requests)

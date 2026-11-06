@@ -23,7 +23,9 @@ log = logging.getLogger('personal_options_trader.master')
 log.setLevel(logging.INFO)  # Only app-authored, credential-free diagnostics below.
 SEGMENTS = ('nse_fo', 'bse_fo', 'mcx_fo')
 MAX_BYTES = 100 * 1024 * 1024
-RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+# Official troubleshooting describes 424 as a temporary dependency failure.
+# Bounded retries are safe here because this endpoint only reads the master.
+RETRY_STATUSES = {408, 424, 429, 500, 502, 503, 504}
 REQUIRED = {
     'token': {'pSymbol', 'instrument_token', 'token'},
     'symbol': {'pTrdSymbol', 'trading_symbol', 'symbol'},
@@ -39,14 +41,41 @@ REQUIRED = {
 
 class MasterRefreshError(ValueError):
     def __init__(self, code, stage, *, segment=None, row_number=None,
-                 http_status=None, retryable=False, missing_columns=None):
+                 http_status=None, retryable=False, missing_columns=None,
+                 endpoint=None, method=None, authorization_present=None,
+                 content_type=None, response_shape=None):
         super().__init__(code)  # Codes are app constants, never broker text.
         self.details = {k: v for k, v in {
             'code': code, 'stage': stage, 'segment': segment,
             'row_number': row_number, 'http_status': http_status,
-            'missing_columns': missing_columns,
+            'missing_columns': missing_columns, 'endpoint': endpoint, 'method': method,
+            'authorization_present': authorization_present, 'content_type': content_type,
+            'response_shape': response_shape,
         }.items() if v is not None}
         self.retryable = retryable
+
+
+def response_diagnostics(response):
+    """Only fixed MIME names and JSON-shape booleans; never body/error text."""
+    mime = response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+    safe_mimes = {'application/json', 'application/problem+json', 'text/plain',
+                  'text/html', 'text/csv', 'application/octet-stream'}
+    content_type = mime if mime in safe_mimes else 'missing' if not mime else 'other'
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        payload = None
+    is_object = isinstance(payload, dict)
+    data = payload.get('data') if is_object else None
+    data_object = isinstance(data, dict)
+    return {'content_type': content_type, 'response_shape': {
+        'json_object': is_object,
+        'data_object': data_object,
+        'filesPaths_list': data_object and isinstance(data.get('filesPaths'), list),
+        'error_field': is_object and 'error' in payload,
+        'fault_field': is_object and 'fault' in payload,
+        'message_field': is_object and 'message' in payload,
+    }}
 
 
 class MasterBatch(list):
@@ -226,11 +255,13 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
             response = api.rest_client.request(url=endpoint, method='GET', headers=headers,
                                                timeout=min(12, max(.1, deadline - clock())))
             status = response.status_code
-            log.info('Kotak master endpoint=scrip_master method=GET authorization_present=%s http_status=%s',
-                     bool(headers['Authorization']), status)
+            public_request = {'endpoint': endpoint, 'method': 'GET',
+                              'authorization_present': bool(headers['Authorization'])}
+            diagnostics = response_diagnostics(response)
+            log.info('Kotak master request=%s http_status=%s response=%s', public_request, status, diagnostics)
             if status != 200:
                 raise MasterRefreshError('scrip_master_http_error', 'response_status', http_status=status,
-                                         retryable=status in RETRY_STATUSES)
+                                         retryable=status in RETRY_STATUSES, **public_request, **diagnostics)
             try:
                 payload = response.json()
             except (ValueError, TypeError) as exc:
@@ -251,7 +282,16 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
                         with transport.stream('GET', current, timeout=min(12, max(.1, deadline-clock()))) as response:
                             if response.status_code in {301,302,303,307,308}:
                                 from urllib.parse import urljoin
-                                current = urljoin(current, response.headers.get('location',''))
+                                location = response.headers.get('location')
+                                if not location:
+                                    raise MasterRefreshError('redirect_location_missing', 'csv_download', segment=segment)
+                                redirected = urljoin(current, location)
+                                target = public_url(redirected)
+                                expected = public_url(url)
+                                if (source_date(redirected) != source_date(url)
+                                        or target.path.rsplit('/', 1)[-1] != expected.path.rsplit('/', 1)[-1]):
+                                    raise MasterRefreshError('redirect_source_changed', 'csv_download', segment=segment)
+                                current = redirected
                                 continue
                             if response.status_code != 200:
                                 raise MasterRefreshError('csv_http_error', 'csv_download', segment=segment,

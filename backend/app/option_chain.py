@@ -41,7 +41,8 @@ _attempts: dict[str, float] = {}
 _universes = WeakKeyDictionary()
 _refresh_states = WeakKeyDictionary()
 MIN_INTERVAL = 3.0
-MASTER_REFRESH_SECONDS = 300
+MASTER_REFRESH_SECONDS = 300  # Reuse a validated current catalog; not a failure cooldown.
+MASTER_RETRY_SECONDS = 15
 CHAIN_SUBSCRIPTION_SECONDS = 600
 SOURCES = {'kotak': 'https://github.com/Kotak-Neo/kotak-neo-python/blob/main/docs/guides/websocket.md'}
 
@@ -206,7 +207,7 @@ def master_status(db=None, broker='kotak'):
     return {'status': 'ready' if rows else 'not_loaded', 'broker': broker,
             'updated_at': stamp or legacy_stamp, 'last_successful_refresh_at': stamp,
             'last_attempt_at': state.get('last_attempt_at'), 'last_error': state.get('last_error'),
-            'refresh_in_progress': _master_lock.locked(), 'segment_status': segments,
+            'refresh_in_progress': _master_lock.locked(), 'retry_after_seconds': max(0, math.ceil(MASTER_RETRY_SECONDS - (time.monotonic() - _attempts.get(broker, -MASTER_RETRY_SECONDS)))), 'segment_status': segments,
             'sources': [{'segment': segment, **details} for segment, details in segments.items()],
             'source': 'selected_broker_instrument_master', 'underlying_count': len(rows),
             'stale': not verified, 'new_trades_allowed': verified, 'read_only': True}
@@ -310,8 +311,10 @@ async def refresh_master(db, force=False, broker='kotak'):
         current = master_status(db, broker)
         if current['new_trades_allowed'] and current['updated_at'] and age(current['updated_at']) < (MASTER_REFRESH_SECONDS if force else 86400):
             return {**current, 'refresh_in_progress': False}
-        if time.monotonic() - _attempts.get(broker, -MASTER_REFRESH_SECONDS) < MASTER_REFRESH_SECONDS:
-            return {**current, 'refresh_in_progress': False, 'message': 'Refresh is rate limited to one attempt per five minutes.'}
+        remaining = math.ceil(MASTER_RETRY_SECONDS - (time.monotonic() - _attempts.get(broker, -MASTER_RETRY_SECONDS)))
+        if remaining > 0:
+            return {**current, 'refresh_in_progress': False, 'retry_after_seconds': remaining,
+                    'message': f'Please wait {remaining} seconds before another contract refresh. Use Reconnect market feed for a dropped connection.'}
         _attempts[broker] = time.monotonic()
         state = _refresh_state(broker)
         state.update(last_attempt_at=iso_now(), last_error=None)
@@ -345,6 +348,9 @@ async def refresh_master(db, force=False, broker='kotak'):
             state['last_error'] = {**details, 'at': iso_now()}
             log.error('Official Kotak master refresh failed; existing contracts retained. diagnostic=%s\n%s',
                       json.dumps(state['last_error'], sort_keys=True), safe_master_traceback(exc))
+        # A failed refresh can be retried after a short cooldown from completion,
+        # with one in-flight import; the validated catalog cache remains separate.
+        _attempts[broker] = time.monotonic()
         try:
             await asyncio.to_thread(_persist_refresh_state, broker, dict(state))
         except OSError as exc:
@@ -503,7 +509,7 @@ def underlyings(q: str = Query('', max_length=100), mode: Literal['sample','live
     rows.sort(key=lambda r: (r['kind'] != 'index', r['exchange'] != 'NSE', r['symbol']))
     return {'underlyings': rows, 'total': len(groups), 'filtered_total': len(rows), 'mode': selected_mode,
             'demo': selected_mode == 'sample', 'master': master_status(db, broker), 'configured': configured(broker),
-            'message': 'Import or refresh this brokerÃ¢â‚¬â„¢s official master to list every entitled NSE/BSE/MCX option. Missing live fields remain unavailable.'}
+            'message': 'Import or refresh this brokerÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s official master to list every entitled NSE/BSE/MCX option. Missing live fields remain unavailable.'}
 
 
 @router.get('/master/status')
@@ -605,11 +611,11 @@ async def option_chain(underlying: str = Query(..., min_length=1, max_length=180
         metadata = {k:v for k,v in group.items() if k not in {'contracts', 'reference_futures'}} if group else None
         contracts = group['contracts'] if group else []
     if not metadata:
-        raise HTTPException(404, 'Choose an underlying from this brokerÃ¢â‚¬â„¢s instrument catalog. Refresh its master if missing.')
+        raise HTTPException(404, 'Choose an underlying from this brokerÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s instrument catalog. Refresh its master if missing.')
     metadata = {**metadata, 'broker': broker}
     expiry = expiry or metadata['expiries'][0]
     if expiry not in metadata['expiries']:
-        raise HTTPException(422, 'Choose an active expiry from this underlyingÃ¢â‚¬â„¢s master.')
+        raise HTTPException(422, 'Choose an active expiry from this underlyingÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s master.')
     selected = [c for c in contracts if c['expiry'] == expiry]
     if demo:
         result = build_chain(metadata, selected, expiry, demo=True, stamp=iso_now())
