@@ -5,7 +5,13 @@ export async function api<T=any>(path:string,options:RequestInit={}):Promise<T>{
  const headers:Record<string,string>={'Content-Type':'application/json',...(options.headers as Record<string,string>||{})};
  if(csrf)headers['X-CSRF-Token']=csrf;
  const response=await fetch(API_BASE+path,{...options,headers,credentials:'include'});
- if(!response.ok){const err=await response.json().catch(()=>({detail:response.statusText})); throw new Error(typeof err.detail==='string'?err.detail:JSON.stringify(err.detail||err));}
+ if(!response.ok){
+  const err=await response.json().catch(()=>({detail:response.statusText}));
+  const retryAfter=response.headers.get('Retry-After');
+  throw Object.assign(new Error(typeof err.detail==='string'?err.detail:JSON.stringify(err.detail||err)),{
+   status:response.status,retryAfterSeconds:retryAfter===null?undefined:Number(retryAfter),
+  });
+ }
  if(response.status===204)return undefined as T;
  return response.json();
 }

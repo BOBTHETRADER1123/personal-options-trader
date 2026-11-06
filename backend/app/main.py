@@ -47,6 +47,11 @@ feed_status={}
 catalog=None
 _feed_contract_ids=None
 _feed_refresh_lock=asyncio.Lock()
+_feed_auto_requested=False
+_last_manual_reconnect=None
+FEED_RECONNECT_COOLDOWN_SECONDS=10
+FEED_FIRST_QUOTE_GRACE_SECONDS=30
+FEED_REFERENCE_GROUPS=('NSE:NIFTY','BSE:SENSEX','MCX:NATURALGAS','MCX:CRUDEOIL')
 _quote_selection_lock=Lock()
 _quote_selection_requests={}
 database_ready=True
@@ -130,35 +135,129 @@ def selected_feed_contracts(db):
             wanted.update(l['instrument_id'] for l in row.data.get('legs',[]) if l.get('status') in {'open','pending'})
     return catalog.select_live(wanted,engine.BROKERS)
 
-async def refresh_selected_feeds(db,force=False):
-    global _feed_contract_ids
-    if feed_manager is None:return
-    # Every caller commits its paper mutation before reconfiguring sockets.
-    # Release any subsequent read snapshot before waiting for another refresh:
-    # rollback-journal commits must never wait for a socket-owning reader.
+def reference_feed_contracts(calendar, now):
+    """Choose at most one verified official future per reference underlying."""
+    universe=option_chain.live_universe('kotak')
+    references=[]
+    for group in FEED_REFERENCE_GROUPS:
+        nearest=None
+        for contract in universe.get(group,{}).get('reference_futures',[]):
+            if contract.get('source')!='broker_master' or contract.get('master_active') is not True:
+                continue
+            state=calendar.state(contract,now)
+            if state.get('reason')=='contract_expired_settlement_required':
+                continue
+            if state['open']:
+                nearest=(contract,state)
+                break
+            if nearest is None:
+                nearest=(contract,state)
+        if nearest is not None:
+            references.append(nearest)
+    return references
+
+
+def feed_request_result(status, message, retry_after_seconds=None):
+    result={'ok':status in {'connected','connecting','reconnecting','awaiting_quotes'},'status':status,'message':message}
+    if retry_after_seconds is not None:
+        result['retry_after_seconds']=retry_after_seconds
+    return result
+
+
+async def refresh_selected_feeds(db,force=False,*,owner_request=None):
+    global _feed_contract_ids,_feed_auto_requested,_last_manual_reconnect
+    if feed_manager is None:
+        return feed_request_result('rate_limited','Market data is starting up.',2) if owner_request else None
+    if owner_request:
+        if _runtime_settings.get('demo_mode'):
+            return feed_request_result('demo_mode','Switch off sample mode to receive Kotak market data.')
+        if exchange_calendar is None:
+            return feed_request_result('calendar_unavailable','The verified exchange calendar is unavailable.')
+        if not option_chain.configured('kotak'):
+            return feed_request_result('not_configured','Complete Kotak setup in Broker Connections.')
+        # Preserve demand through pre-open while an authenticated viewer or
+        # recent owner activity keeps the collector running.
+        _feed_auto_requested=True
+        touch_activity()
+    # End reads before waiting for the socket or another subscription refresh.
     await asyncio.to_thread(option_chain.finish_read_transaction,db)
     binding=db.get_bind()
+
     def selected():
         with Session(binding,expire_on_commit=False) as reader:
             return selected_feed_contracts(reader)
+
     async with _feed_refresh_lock:
-        if collector_lease and collector_lease.token is None:return
+        if collector_lease and collector_lease.token is None:
+            return feed_request_result('rate_limited','Market-data collector is starting up.',2) if owner_request else None
         candidates=await asyncio.to_thread(selected)
         contracts=candidates
+        states=[]
+        now=datetime.now(timezone.utc)
+        # Accepted owner WebSockets re-arm demand after a backend restart.
+        watching=not _runtime_settings.get('demo_mode') and (
+            _viewers>0 or (_feed_auto_requested and time.monotonic()<_activity_until)
+        )
+        reference_only=False
         if exchange_calendar:
-            now=datetime.now(timezone.utc)
-            contracts=[c for c in contracts if exchange_calendar.state(c,now)['open']]
+            selected_states=[(c,exchange_calendar.state(c,now)) for c in candidates]
+            contracts=[c for c,state in selected_states if state['open']]
+            states=[state for _,state in selected_states
+                    if state.get('reason')!='contract_expired_settlement_required']
+            if not contracts and watching:
+                references=await asyncio.to_thread(reference_feed_contracts,exchange_calendar,now)
+                contracts=[c for c,state in references if state['open']]
+                states.extend(state for _,state in references)
+                reference_only=bool(contracts)
         identities=frozenset((c['id'],c['broker']) for c in contracts)
-        if force or identities!=_feed_contract_ids:
-            if force:
-                # A saved credential change needs a new authenticated socket.
+        same_selection=identities==_feed_contract_ids
+        restart=force
+        recover=False
+        if contracts and (owner_request or watching) and not force:
+            current=feed_manager.statuses().get('kotak',{})
+            status=current.get('status')
+            waiting_age=engine.age_seconds(current.get('awaiting_since'),now)
+            waiting_for_quote=status=='awaiting_quotes' and (
+                owner_request!='manual' or waiting_age is None or waiting_age<FEED_FIRST_QUOTE_GRACE_SECONDS
+            )
+            in_progress=status in {'connecting','reconnecting'} or waiting_for_quote
+            if owner_request and in_progress and same_selection:
+                return feed_request_result(status,'Kotak is already connecting or waiting for its first quote.')
+            age=engine.age_seconds(current.get('last_quote_at'),now)
+            fresh=age is not None and age<=_runtime_settings.get('stale_after_seconds',10)
+            if owner_request and status=='connected' and same_selection and (owner_request=='automatic' or fresh):
+                return feed_request_result('connected','Kotak socket is already connected. Check the latest quote timestamp for freshness.')
+            if status in {'authentication_required','error'} and (owner_request=='automatic' or reference_only) and owner_request!='manual':
+                if owner_request:
+                    message=('Kotak requires sign-in. Check your broker setup.' if status=='authentication_required'
+                             else 'Kotak rejected the feed connection. Check broker setup and try Reconnect.')
+                    return feed_request_result(status,message)
+                return
+            restart=owner_request=='manual' and not in_progress and not (status=='connected' and fresh)
+            if restart:
+                clock=time.monotonic()
+                remaining=0 if _last_manual_reconnect is None else math.ceil(FEED_RECONNECT_COOLDOWN_SECONDS-(clock-_last_manual_reconnect))
+                if remaining>0:
+                    return feed_request_result('rate_limited',f'Please wait {remaining} seconds before reconnecting.',remaining)
+                _last_manual_reconnect=clock
+            recover=same_selection and status in {'disconnected','awaiting_instruments','market_closed'}
+        if restart or not same_selection or recover:
+            if restart:
                 await feed_manager.stop()
                 await feed_manager.start(contracts)
             else:
                 await feed_manager.reconfigure(contracts)
             _feed_contract_ids=identities
-        if candidates and not contracts:
+        if not contracts and states and all(state.get('known',True) for state in states):
             await feed_manager.mark_market_closed()
+        if owner_request:
+            if not contracts:
+                if any(not state.get('known',True) for state in states):
+                    return feed_request_result('calendar_unavailable','No selected contract is in a verified trading session.')
+                if states:
+                    return feed_request_result('market_closed','Selected markets are closed. Quotes can start when a verified session opens.')
+                return feed_request_result('awaiting_instruments','Refresh the official contract list or select a current contract.')
+            return feed_request_result('connecting','Market-feed request accepted. Wait for a fresh quote to confirm data is flowing.')
 
 def demo_quote(contract,broker,now=None):
     now=now or time.time();base=float(contract.get('base_price') or 100)
@@ -400,13 +499,14 @@ async def database_services(reporting_loop):
 
 @asynccontextmanager
 async def lifespan(app):
-    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,kotak_setup,_feed_refresh_lock,_ws_tickets,_dashboard_publisher
+    global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,kotak_setup,_feed_refresh_lock,_feed_contract_ids,_feed_auto_requested,_last_manual_reconnect,_ws_tickets,_dashboard_publisher
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
     from .brokers import FeedManager
     _ws_tickets=TicketRegistry();_dashboard_publisher=SharedDashboardPublisher()
     stop_event=asyncio.Event();_feed_refresh_lock=asyncio.Lock();database_ready=False;_viewers=0;_activity_until=0;_started_at=time.monotonic()
+    _feed_contract_ids=None;_feed_auto_requested=False;_last_manual_reconnect=None
     with _quote_selection_lock:_quote_selection_requests.clear()
     kotak_setup=broker_setup.KotakSetupService(factory=SessionLocal)
     catalog=ContractCatalog();engine.set_catalog(catalog)
@@ -793,6 +893,18 @@ async def select_quotes(payload:QuoteSelectionInput,request:Request,current=Depe
 
 @app.get('/api/brokers',dependencies=[Depends(require_session)])
 def brokers(db=Depends(get_db)):return engine.dashboard(db,feed_manager.statuses() if feed_manager else {})['brokers']
+
+@app.post('/api/brokers/kotak/connect',dependencies=[Depends(require_session)])
+async def connect_kotak_feed(request:Request,db=Depends(get_db)):
+    rate_limit(request,'broker-connect',limit=30)
+    return await refresh_selected_feeds(db,owner_request='automatic')
+
+
+@app.post('/api/brokers/kotak/reconnect',dependencies=[Depends(require_session)])
+async def reconnect_kotak_feed(request:Request,db=Depends(get_db)):
+    rate_limit(request,'broker-reconnect',limit=12)
+    return await refresh_selected_feeds(db,owner_request='manual')
+
 
 class KotakCredentialInput(BaseModel):
     model_config=ConfigDict(extra='forbid')

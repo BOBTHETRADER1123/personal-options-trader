@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 
-from .base import FeedAuthenticationError, FeedProtocolError, utc_now
+from .base import FeedAuthenticationError, FeedProtocolError
 from .kotak import KotakFeed
 
 
@@ -15,6 +16,7 @@ class FeedManager:
         self._tasks: list[asyncio.Task] = []
         self._contracts: dict[str, list] = {}
         self._states: dict[str, dict] = {}
+        self._first_quote_at: dict[str, float] = {}
         self._stopping = False
         self._adapters = [KotakFeed(self._quote, self._status)]
         for adapter in self._adapters:
@@ -37,8 +39,14 @@ class FeedManager:
         # The selected recording policy owns persistence/buffering; never send
         # this broker's receipt through another broker's price cache.
         await self.on_quote(quote)
-        state = self._states[quote["broker"]]
-        state.update({"last_quote_at": quote["received_at"], "status": "connected", "received_events": state["received_events"] + 1})
+        broker = quote["broker"]
+        state = self._states[broker]
+        if broker not in self._first_quote_at:
+            self._first_quote_at[broker] = time.monotonic()
+        state.update(last_quote_at=quote["received_at"], received_events=state["received_events"] + 1)
+        if state["status"] != "connected":
+            await self._status(broker, {"status": "connected", "detail": "Receiving Kotak market quotes",
+                                        "awaiting_since": None, "retry_in_seconds": None})
 
     async def start(self, instruments):
         if self._tasks:
@@ -81,6 +89,10 @@ class FeedManager:
             await adapter.reconfigure(desired)
         except asyncio.CancelledError:
             raise
+        except FeedProtocolError as exc:
+            await self.stop()
+            await self._status(adapter.broker, {"status": "error", "detail": str(exc),
+                                                "subscriptions": 0, "awaiting_since": None})
         except Exception as exc:
             # A failed subscription change needs a fresh transport. Cancel and
             # join the old task first: two sockets must never run concurrently.
@@ -98,8 +110,10 @@ class FeedManager:
         state = self._states[adapter.broker]
         while not self._stopping:
             received_before = state["received_events"]
+            self._first_quote_at.pop(adapter.broker, None)
             try:
-                await self._status(adapter.broker, {"status": "connecting", "detail": "Connecting read-only market feed"})
+                await self._status(adapter.broker, {"status": "connecting", "detail": "Connecting read-only market feed",
+                                                   "awaiting_since": None, "retry_in_seconds": None})
                 await adapter.stream(contracts)
                 if not self._stopping:
                     raise ConnectionError("Feed ended")
@@ -113,14 +127,16 @@ class FeedManager:
                 # Protocol/configuration errors need operator correction.
                 return
             except Exception as exc:
-                if state["received_events"] > received_before:
-                    # A connection delivered actual quotes: the next drop is a
-                    # fresh outage, not another attempt in the previous outage.
+                first_quote_at = self._first_quote_at.get(adapter.broker)
+                if (first_quote_at is not None and state["received_events"] - received_before >= 2
+                        and time.monotonic() - first_quote_at >= 30):
+                    # A short burst followed by another drop belongs to the
+                    # same outage. Reset after a sustained quote connection.
                     attempt = 0
                 attempt += 1
                 self._states[adapter.broker]["reconnect_count"] += 1
                 delay = min(60, 2 ** min(attempt, 6)) + random.uniform(0, 1)
-                await self._status(adapter.broker, {"status": "reconnecting", "detail": f"Connection interrupted ({type(exc).__name__}); retrying", "retry_in_seconds": round(delay, 1)})
+                await self._status(adapter.broker, {"status": "reconnecting", "detail": f"Connection interrupted ({type(exc).__name__}); retrying", "retry_in_seconds": round(delay, 1), "awaiting_since": None})
                 await asyncio.sleep(delay)
 
     async def mark_market_closed(self):

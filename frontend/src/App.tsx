@@ -1,3 +1,4 @@
+import { startMarketAutoConnect } from './marketConnection';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, ArrowDownToLine, ArrowRight, ArrowUpRight, Bell, BookOpen, CalendarDays, ChartNoAxesCombined, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, Command, FileSpreadsheet, FlaskConical, FolderCheck, LayoutDashboard, Layers, Loader2, LogOut, Menu, Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, TrendingDown, TrendingUp, Wallet, Wifi, WifiOff, X } from 'lucide-react';
 import { api, API_BASE, brokers, brokerLabel, money, num, setCsrf, signed, time } from './api';
@@ -92,6 +93,18 @@ export default function App(){
   document.addEventListener('visibilitychange',visibility);
   return()=>{stopped=true;suspend();clearInterval(poll);clearInterval(reportPoll);document.removeEventListener('visibilitychange',visibility);};
  },[session?.authenticated,refresh]);
+ const marketDataMode=(settings.demo_mode??dashboard.demo)===false;
+ useEffect(()=>{
+  if(!session?.authenticated||!marketDataMode)return;
+  return startMarketAutoConnect({
+   request:signal=>api('/api/brokers/kotak/connect',{method:'POST',signal}),
+   visible:pageVisible,
+   subscribe:listener=>{document.addEventListener('visibilitychange',listener);return()=>document.removeEventListener('visibilitychange',listener);},
+   onResult:()=>{void refresh();},
+   onAuthRequired:()=>{void checkSession();},
+   onFailure:()=>notify('Automatic market connection could not start. Open Broker connections to check the status or reconnect.',true),
+  });
+ },[session?.authenticated,session?.csrf_token,marketDataMode,refresh,notify,checkSession]);
  const trades:Row[]=(dashboard.trades||[]).map(normalized),active=trades.filter(t=>['OPEN','PENDING'].includes(t.status)),closed=[...new Map([...trades.filter(t=>['CLOSED','CANCELLED'].includes(t.status)),...olderTrades].map(t=>[t.id,t])).values()],summary=dashboard.summary||{},accounts:Row[]=(dashboard.brokers||[]).filter((account:Row)=>Boolean(brokers[account.id])),quotes:Row[]=(dashboard.quotes||[]).filter((quote:Row)=>Boolean(brokers[quote.broker]));
  const net=Number(summary.net_pnl||summary.total_pnl||0),margin=brokerMarginValue(summary),capital=Number(summary.paper_capital||0),demo=Boolean(dashboard.demo);
  const graph=useMemo(()=>{const rows:Row[]=dashboard.portfolio_timeline||[];const day=new Date(Date.now()+19800000).toISOString().slice(0,10);const start=chartRange==='Today'?Date.parse(day+'T00:00:00+05:30'):chartRange==='1W'?Date.now()-7*86400000:0;return rows.filter(p=>new Date(p.timestamp).getTime()>=start).map(p=>({x:p.timestamp,y:Number(p.net_pnl||0)}));},[dashboard.portfolio_timeline,chartRange]);
@@ -151,8 +164,12 @@ export default function App(){
  if(!session?.authenticated)return <Auth session={session} onLogin={checkSession} error={authError} onRetry={checkSession}/>;
  const visible=(page==='history'?(showRemoved?removedTrades:closed):active).filter(t=>brokerFilter==='all'||t.broker===brokerFilter);
  const activity=[...trades.map(t=>({id:`${t.id}-open`,title:t.name,description:`Paper trade opened · ${brokerLabel(t.broker)}`,at:t.created_at,closed:false,trade:t})),...closed.filter(t=>t.closed_at).map(t=>({id:`${t.id}-close`,title:t.name,description:`Paper trade closed · ${brokerLabel(t.broker)}`,at:t.closed_at,closed:true,trade:t}))].sort((a,b)=>new Date(b.at).getTime()-new Date(a.at).getTime()).slice(0,5);
- const marketConnected=accounts.some(account=>account.status==='connected'||account.feed?.status==='connected');
  const freshQuotes=quotes.filter(quote=>!quote.demo&&!quote.stale),staleQuotes=quotes.filter(quote=>!quote.demo&&quote.stale);
+ const kotakAccount=accounts.find(account=>account.id==='kotak');
+ const kotakStatus=kotakAccount?.feed?.status||kotakAccount?.status;
+ const marketConnected=kotakStatus==='connected'&&freshQuotes.some(quote=>quote.broker==='kotak');
+ const marketLabels:Record<string,string>={connected:'Quotes stale',awaiting_quotes:'Waiting for quotes',connecting:'Connecting',reconnecting:'Reconnecting',market_closed:'Market closed',authentication_required:'Sign-in required'};
+ const marketLabel=marketConnected?'Connected':marketLabels[kotakStatus]||'Not connected';
  const savedJobs=jobs.filter(job=>job.status==='saved').length,pendingJobs=jobs.filter(job=>job.status!=='saved').length;
  const dateLabel=new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',weekday:'long',day:'numeric',month:'long',year:'numeric'}).format(new Date());
  const navPage=page==='history'?'positions':page;
@@ -171,7 +188,7 @@ export default function App(){
    <div className="sidebar-brokers"><div className="sidebar-section-title"><span>BROKER CONNECTIONS</span><button onClick={()=>navigate('connections')}>Manage</button></div>{Object.entries(brokers).map(([id,name])=>{const account=accounts.find(account=>account.id===id),connected=account?.status==='connected'||account?.feed?.status==='connected';return <button className="sidebar-broker" key={id} onClick={()=>navigate('connections')}><span className={`broker-logo ${id}`}>K</span><span><strong>{name}</strong><small>{connected?'Market data connected':account?.status==='demo'?'Sample prices':'Needs connection'}</small></span><i className={connected?'connected':''}/></button>;})}</div>
    <div className="sidebar-bottom"><button className={`sidebar-utility ${page==='settings'?'active':''}`} onClick={()=>navigate('settings')}><Settings2 size={18}/>Data & settings</button><button className="sidebar-utility" onClick={logout}><LogOut size={18}/>Sign out</button><div className="workspace-account"><span className="avatar">PT</span><div><strong>{workspaceLabel}</strong><small>Private account</small></div><button className="icon-btn" aria-label="Help & getting started" onClick={()=>setHelp(true)}><CircleHelp size={18}/></button></div></div>
   </aside>
-  <div className="main-shell"><header className="topbar"><button className="icon-btn mobile-menu" aria-label="Open navigation" onClick={()=>setMobileNav(true)}><Menu size={21}/></button><div className="breadcrumbs">{workspaceLabel}<span>/</span><strong>{title[page]||'Trading overview'}</strong></div><div className="topbar-right"><button className="icon-btn theme-toggle" aria-label={`Switch to ${theme==='dark'?'light':'dark'} mode`} onClick={()=>setTheme(theme==='dark'?'light':'dark')}>{theme==='dark'?'☀':'☾'}</button><span className="market-connection"><span className={`tiny-green-dot ${marketConnected?'':'neutral'}`}/><span>Market data</span><strong>{marketConnected?'Connected':'Not connected'}</strong></span><button className={`icon-btn notification-btn ${notifications?'selected':''}`} aria-label="Recent activity" onClick={()=>setNotifications(!notifications)}><Bell size={19}/>{pendingJobs>0&&<i/>}</button><button className="avatar top-avatar" onClick={()=>navigate('settings')} aria-label="Account settings">PT</button></div></header>
+  <div className="main-shell"><header className="topbar"><button className="icon-btn mobile-menu" aria-label="Open navigation" onClick={()=>setMobileNav(true)}><Menu size={21}/></button><div className="breadcrumbs">{workspaceLabel}<span>/</span><strong>{title[page]||'Trading overview'}</strong></div><div className="topbar-right"><button className="icon-btn theme-toggle" aria-label={`Switch to ${theme==='dark'?'light':'dark'} mode`} onClick={()=>setTheme(theme==='dark'?'light':'dark')}>{theme==='dark'?'☀':'☾'}</button><span className="market-connection"><span className={`tiny-green-dot ${marketConnected?'':'neutral'}`}/><span>Market data</span><strong>{marketLabel}</strong></span><button className={`icon-btn notification-btn ${notifications?'selected':''}`} aria-label="Recent activity" onClick={()=>setNotifications(!notifications)}><Bell size={19}/>{pendingJobs>0&&<i/>}</button><button className="avatar top-avatar" onClick={()=>navigate('settings')} aria-label="Account settings">PT</button></div></header>
    <main className={`content page-${page}`}><div className="page-heading"><div><div className="heading-meta"><span className="eyebrow">{page==='overview'?dateLabel:'PERSONAL OPTIONS TRADING DESK'}</span><Badge tone="green"><span className="tiny-green-dot"/>PAPER MODE</Badge></div><h1>{title[page]}</h1><p>{subtitle[page]}</p></div><div className="page-actions">{page!=='builder'&&page!=='chain'&&<button className="btn primary" onClick={newTrade}><Plus size={18}/>New paper trade</button>}</div></div>
     {authError&&<div className="banner error"><WifiOff size={17}/>{authError}<button className="text-btn" onClick={()=>refresh(true)}>Retry</button></div>}
     {demo&&page!=='settings'&&<div className="demo-ribbon"><FlaskConical size={15}/><span><strong>Sample prices</strong> · Fictional contracts and simulated quotes are separate from genuine market data.</span><button className="text-btn" onClick={()=>navigate('connections')}>Connect market data<ArrowUpRight size={13}/></button></div>}

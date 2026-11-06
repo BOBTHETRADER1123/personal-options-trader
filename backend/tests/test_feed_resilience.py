@@ -10,7 +10,7 @@ import pytest
 
 import app.brokers as manager_module
 from app.brokers import FeedManager
-from app.brokers.base import FeedAuthenticationError
+from app.brokers.base import FeedAuthenticationError, FeedProtocolError
 from app.brokers.kotak import KotakFeed, is_transient_network_error
 
 
@@ -33,25 +33,33 @@ def quiet_clock(monkeypatch):
     return delays
 
 
-def test_backoff_restarts_after_a_connection_that_delivered_quotes(monkeypatch):
+def test_backoff_grows_on_short_lived_quotes_and_resets_after_a_stable_connection(monkeypatch):
     delays = quiet_clock(monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(manager_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+
     async def run():
-        async def on_quote(quote):
-            pass
-        manager = FeedManager(on_quote)
+        manager = FeedManager(_noop)
+
         class Adapter:
             broker = "kotak"
             calls = 0
+
             async def stream(self, contracts):
                 self.calls += 1
                 if self.calls == 5:
                     manager._stopping = True
                     return
-                await manager._quote({"broker": "kotak", "received_at": "2030-01-01T00:00:00+00:00"})
-                raise ConnectionError("dropped after working")
+                quote = {"broker": "kotak", "received_at": "2030-01-01T00:00:00+00:00"}
+                await manager._quote(quote)
+                clock[0] += 30 if self.calls == 3 else 1
+                await manager._quote(quote)
+                raise ConnectionError("dropped after receiving quotes")
+
         await manager._run(Adapter(), [])
+
     asyncio.run(run())
-    assert delays == [2, 2, 2, 2]
+    assert delays == [2, 4, 2, 4]
 
 
 def test_backoff_still_grows_when_nothing_was_ever_received(monkeypatch):
@@ -93,7 +101,7 @@ class Rejected(Exception):
 
 @pytest.mark.parametrize("error,expected", [
     (TimeoutError(), True), (ConnectionResetError(), True), (OSError("network is unreachable"), True),
-    (Rejected(503), True), (Rejected(429), True),
+    (Rejected(503), True), (Rejected(429), True), (Rejected(408), True), (Rejected(424), True),
     (Rejected(401), False), (Rejected(400), False), (ValueError("Authentication did not establish a valid session"), False),
 ])
 def test_only_network_trouble_counts_as_transient(error, expected):
@@ -135,6 +143,7 @@ async def _noop(*args):
 @pytest.mark.parametrize("login_error,expected", [
     (TimeoutError("login timed out"), ConnectionError),
     (Rejected(502), ConnectionError),
+    (Rejected(424), ConnectionError),
     (Rejected(401), FeedAuthenticationError),
     (RuntimeError("anything else"), FeedAuthenticationError),
 ])
@@ -178,9 +187,17 @@ def test_one_malformed_message_no_longer_stops_every_contract(monkeypatch):
     quotes, statuses = [], []
     async def on_quote(value): quotes.append(value)
     async def on_status(broker, state): statuses.append(state)
-    asyncio.run(KotakFeed(on_quote, on_status).stream([contract("123"), contract("456")]))
+
+    async def run():
+        manager = FeedManager(on_quote, on_status)
+        await manager._adapters[0].stream([contract("123"), contract("456")])
+
+    asyncio.run(run())
     assert [(q["instrument_id"], q["ltp"]) for q in quotes] == [("kotak:mcx_fo:456", 46)]
-    assert any("malformed" in s.get("detail", "") for s in statuses)
+    assert [state["status"] for state in statuses] == ["awaiting_quotes", "awaiting_quotes", "connected"]
+    assert statuses[0]["awaiting_since"]
+    assert "malformed" in statuses[1]["detail"]
+    assert statuses[2]["awaiting_since"] is None
 
 
 def test_totp_code_is_not_sent_twice_in_the_same_30_second_step(monkeypatch):
@@ -282,3 +299,105 @@ def test_boolean_depth_prices_cannot_become_genuine_bid_ask():
     from app.brokers.base import FeedProtocolError
     with pytest.raises(FeedProtocolError):
         parse_sfeed(row(last_traded_price=10,buy=[{"price":True}]),{("mcx_fo","123"):contract()})
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("transport", ConnectionError),
+    ("timeout", ConnectionError),
+    ("rejected", FeedAuthenticationError),
+    ("handshake_rejected", FeedAuthenticationError),
+    ("cancelled", asyncio.CancelledError),
+])
+def test_failed_sdk_context_entry_closes_socket_before_retry(monkeypatch, failure, expected):
+    from websockets.exceptions import ConnectionClosed
+
+    fake_login_sdk(monkeypatch, None)
+    monkeypatch.setenv("KOTAK_SID", "offline-session")
+    auth_error = sys.modules["neo_api_client.websocket.feed.exceptions"].AuthenticationError
+    transitions = []
+
+    class Socket:
+        def __init__(self, **settings):
+            assert settings["max_reconnect_attempts"] == 0
+            assert settings["max_connect_retries"] == 0
+
+        async def __aenter__(self):
+            transitions.append("opened")
+            if failure == "transport":
+                raise auth_error("private transport response") from ConnectionClosed(None, None)
+            if failure == "timeout":
+                raise auth_error("Authentication timeout")
+            if failure == "handshake_rejected":
+                raise RuntimeError("private handshake response") from Rejected(403)
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            raise auth_error("private credential rejection")
+
+        async def __aexit__(self, *args):
+            pytest.fail("Python must not exit an unentered context")
+
+        async def close(self):
+            transitions.append("closed")
+
+    monkeypatch.setattr(sys.modules["neo_api_client.websocket.feed"], "SFeedWebSocket", Socket)
+    with pytest.raises(expected) as error:
+        asyncio.run(KotakFeed(_noop, _noop).stream([contract()]))
+    assert transitions == ["opened", "closed"]
+    assert "private" not in str(error.value)
+
+
+def test_nested_explicit_rejection_is_terminal_even_with_generic_connection_error():
+    failure = ConnectionError("private wrapper")
+    failure.__cause__ = Rejected(403)
+    assert not is_transient_network_error(failure)
+
+
+@pytest.mark.parametrize("transport", [True, False])
+def test_reconfigure_only_retries_transient_sdk_subscription_failure(monkeypatch, transport):
+    fake_login_sdk(monkeypatch, None)
+    subscription_error = sys.modules["neo_api_client.websocket.feed.exceptions"].SubscriptionError
+
+    class Socket:
+        async def subscribe_scrips(self, tokens):
+            if transport:
+                raise subscription_error("private response") from ConnectionResetError()
+            raise subscription_error("private response")
+
+    async def run():
+        feed = KotakFeed(_noop, _noop)
+        feed._socket = Socket()
+        with pytest.raises(ConnectionError if transport else FeedProtocolError) as error:
+            await feed.reconfigure([contract()])
+        assert "private response" not in str(error.value)
+
+    asyncio.run(run())
+
+
+def test_manager_does_not_retry_a_terminal_subscription_update():
+    async def run():
+        manager = FeedManager(_noop)
+        started = asyncio.Event()
+
+        class Adapter:
+            broker = "kotak"
+
+            def configured(self):
+                return True
+
+            async def stream(self, contracts):
+                assert not started.is_set(), "Terminal subscription errors must not create another socket"
+                started.set()
+                await asyncio.Event().wait()
+
+            async def reconfigure(self, contracts):
+                raise FeedProtocolError("Invalid subscription configuration")
+
+        manager._adapters = [Adapter()]
+        await manager.start([contract()])
+        await started.wait()
+        await manager.reconfigure([contract("456")])
+        assert manager.statuses()["kotak"]["status"] == "error"
+        assert manager.statuses()["kotak"]["reconnect_count"] == 0
+        assert not manager._tasks
+
+    asyncio.run(run())
