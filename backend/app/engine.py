@@ -27,6 +27,7 @@ from .payoff import strategy_risk
 from .margin import unavailable_for_basket
 from .exchange_margin import exchange_margin_status
 from .instruments import contract_master_status
+from .scheduler import ExchangeCalendar
 
 BROKERS={'kotak':'Kotak Neo'}
 DEFAULT_SETTINGS={'brokerage_per_order':20.0,'charges_percent':0.05,'slippage_bps':0.0,'fill_basis':'bid_ask','logging_mode':'full_history','recording_policy_version':3,'preferred_feed':'broker','stale_after_seconds':10,'demo_mode':True,'paper_capital':1000000.0,'unlimited_paper_buying_power':False,'trade_count_definition':'strategies','delete_after_local_save':False,'auto_delete_online':False}
@@ -154,6 +155,8 @@ def age_seconds(timestamp,at=None):
     except (ValueError,TypeError):return None
 
 def contract_identity(value):
+    if value.get('option_type')=='EQ':
+        return ('stock',value.get('instrument_id') or value.get('id'))
     try:strike=float(value.get('strike'))
     except (TypeError,ValueError):strike=None
     return (str(value.get('exchange')),str(value.get('underlying')),str(value.get('expiry')),strike,str(value.get('option_type')))
@@ -220,10 +223,19 @@ def validate_new_exposure(contract,settings):
     if settings.get('demo_mode'):return
     from datetime import date
     from zoneinfo import ZoneInfo
-    try:expiry=date.fromisoformat(str(contract.get('expiry','')))
-    except ValueError:raise HTTPException(422,'The contract needs a valid exchange expiry date.') from None
-    if expiry<datetime.now(timezone.utc).astimezone(ZoneInfo('Asia/Kolkata')).date():
-        raise HTTPException(409,'This contract expired. Record an explicit paper settlement before opening a separately linked contract.')
+    now=datetime.now(timezone.utc)
+    stock=contract.get('option_type')=='EQ'
+    if stock:
+        if (contract.get('exchange')!='NSE' or contract.get('segment')!='nse_cm'
+                or contract.get('instrument_type')!='stock' or contract.get('expiry') is not None
+                or contract.get('strike')!=0 or contract.get('lot_size')!=1 or contract.get('price_multiplier')!=1
+                or not contract.get('isin')):
+            raise HTTPException(422,'Select verified NSE cash-market shares.')
+    else:
+        try:expiry=date.fromisoformat(str(contract.get('expiry','')))
+        except ValueError:raise HTTPException(422,'The contract needs a valid exchange expiry date.') from None
+        if expiry<now.astimezone(ZoneInfo('Asia/Kolkata')).date():
+            raise HTTPException(409,'This contract expired. Record an explicit paper settlement before opening a separately linked contract.')
     # Check the current catalog rather than provenance frozen on an old leg.
     # Broker tokens can be recycled; never increase an unrelated historical
     # contract merely because its token occurs in today's master.
@@ -234,12 +246,21 @@ def validate_new_exposure(contract,settings):
     if (int(current.get('lot_size',0))!=int(contract.get('lot_size',0))
             or current.get('price_multiplier')!=contract.get('price_multiplier')):
         raise HTTPException(409,'The contract units changed in the current master. Open a separately identified paper leg instead of increasing the historical leg.')
-    status=contract_master_status(current)
-    if not status['ready']:raise HTTPException(409,status['reason'])
+    status=contract_master_status(current,now)
+    if not status['ready']:
+        if stock:raise HTTPException(409,'Refresh the NSE stock catalog before placing a paper stock order.')
+        raise HTTPException(409,status['reason'])
 
 
 def execution_price(db,contract,side,broker,settings,manual=None,quote_override=None,limit_price=None):
     if broker not in BROKERS and manual is None:raise HTTPException(409,'This broker is retired. No new market-price fills are available.')
+    stock=contract.get('option_type')=='EQ'
+    if stock:
+        if settings.get('demo_mode') or manual is not None or limit_price is not None:
+            raise HTTPException(422,'Stock trades require current Kotak quotes and a simulated market price.')
+        validate_new_exposure(contract,settings)
+        if not ExchangeCalendar().state(contract,datetime.now(timezone.utc))['open']:
+            raise HTTPException(409,'Paper stock orders are available during verified NSE cash-market sessions.')
     if manual is not None:
         if not math.isfinite(float(manual)) or manual<0:raise HTTPException(422,'Paper fill price must be nonnegative and finite.')
         return float(manual),{'source':'manual_paper_assumption','ltp':float(manual),'received_at':iso_now()},0.0
@@ -248,11 +269,18 @@ def execution_price(db,contract,side,broker,settings,manual=None,quote_override=
     # later quotes already exist in the journal. Interactive actions use latest.
     quote=quote_override if quote_override is not None else resolve_quote(db,contract,broker,settings)
     if not quote:raise HTTPException(409,'No quote is available. Connect the market-data feed first.')
+    if stock and (quote.get('instrument_id')!=(contract.get('instrument_id') or contract.get('id'))
+                  or quote.get('demo') is not False or quote.get('broker')!=broker):
+        raise HTTPException(409,'Wait for a current Kotak quote for this exact stock.')
     age=age_seconds(quote.get('received_at'))
     if age is None or age>settings['stale_after_seconds']:
         raise HTTPException(409,'The selected market-data quote is stale. Reconnect before recording a paper fill.')
     exchange_age=age_seconds(quote.get('exchange_timestamp'))
-    if quote.get('exchange_timestamp_basis')=='last_update_time' and (exchange_age is None or exchange_age>settings['stale_after_seconds']):
+    timestamp_basis=quote.get('exchange_timestamp_basis')
+    side_price=quote.get('ask' if side=='BUY' else 'bid')
+    stock_uses_ltp=stock and (settings['fill_basis']!='bid_ask' or not side_price)
+    if (timestamp_basis=='last_update_time' or (stock_uses_ltp and timestamp_basis=='last_trade_time')) and (
+            exchange_age is None or exchange_age>settings['stale_after_seconds']):
         raise HTTPException(409,'The exchange update is stale despite a recent server receipt. Wait for a current broker update.')
     if quote.get('broker') not in (None,broker):raise HTTPException(409,"A paper fill cannot use another broker's quote.")
     if quote.get('bid') and quote.get('ask') and quote['bid']>quote['ask']:raise HTTPException(409,'The quote has a crossed bid/ask. Wait for a consistent market quote.')
@@ -279,12 +307,17 @@ def premium_cash_flow(leg,lots=None,price=None):
 RISK_VERSION=4
 
 
+def stock_cost_basis(legs):
+    return sum((Decimal(str(leg['entry_price']))*leg['open_lots']
+                for leg in legs if leg.get('option_type')=='EQ' and leg['open_lots']>0),Decimal(0))
+
+
 def paper_cash_reserve(trade):
-    """Known net option premium and paid charges only; never broker margin."""
+    """Known share purchases, net option premium and paid charges; excludes broker margin."""
     active=[leg for leg in trade.get('legs',[]) if leg.get('open_lots',0)>0]
     if not active:return 0.0
     debit=-sum((Decimal(str(premium_cash_flow(leg,leg['open_lots']))) for leg in active),Decimal(0))
-    return float(max(Decimal(0),debit)+Decimal(str(trade.get('charges',0))))
+    return float(stock_cost_basis(active)+max(Decimal(0),debit)+Decimal(str(trade.get('charges',0))))
 
 
 def refresh_trade_risk(trade):
@@ -301,6 +334,18 @@ def refresh_trade_risk(trade):
             'realized_pnl':trade.get('realized_pnl',0)}
     signature=hashlib.sha256(json.dumps(inputs,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     if trade.get('_risk_signature')==signature and trade.get('broker_margin'):return trade
+    if any(leg.get('option_type')=='EQ' for leg in trade['legs']):
+        trade.update(instrument_type='stock',stock_cost_basis=round(float(stock_cost_basis(active)),2),
+                     risk={'supported':False,'closed':not bool(active),'reason':'Cash shares have no expiry payoff.',
+                           'max_profit':None,'max_loss':None,'profit_unlimited':False,'loss_unlimited':False,
+                           'breakevens':[],'points':[],'net_premium':0},
+                     margin_estimate=None,hedge_benefit=None,open_net_premium=0,
+                     broker_margin={'status':'not_applicable','verified':False,'label':'Cash share purchase','total_margin':None},
+                     exchange_margin={'status':'not_applicable','verified':False,'label':'Cash share purchase'},
+                     paper_cash_reserve=round(paper_cash_reserve(trade),2),paper_capital_check='stock_cost_and_charges',
+                     paper_capital_notice='Open shares at their purchase cost and paid charges are checked against simulated cash.',
+                     _risk_signature=signature,calculation_version=RISK_VERSION)
+        return trade
     try:
         risk=strategy_risk(active,trade.get('spot'),trade.get('charges',0),trade.get('realized_pnl',0))
     except (ValueError,TypeError,KeyError) as error:
@@ -333,7 +378,9 @@ def enforce_paper_buying_power(db,trade,settings):
                  if other['id']!=trade['id'] and other['broker']==trade['broker'] and
                  other['status']=='open' and bool(other.get('demo'))==bool(trade.get('demo')))
     if reserved+paper_cash_reserve(trade)>float(settings['paper_capital'])+.005:
-        raise HTTPException(409,'Known premium and charges exceed the configured simulated capital for this broker. Reduce lots or enable unlimited paper buying power. Broker margin is unavailable; this is not broker-provided money.')
+        if trade.get('instrument_type')=='stock':
+            raise HTTPException(409,'Share purchase cost and charges exceed configured simulated cash. Reduce shares or enable unlimited paper buying power.')
+        raise HTTPException(409,'Known cash costs and charges exceed the configured simulated capital for this broker. Reduce lots or enable unlimited paper buying power. Broker margin is unavailable; this is not broker-provided money.')
 
 
 def recalculate(trade,at=None):
@@ -465,22 +512,31 @@ def new_leg(db,request,broker,settings,at):
     if contract.get('exchange')=='MCX' and not settings['demo_mode'] and (not contract.get('price_multiplier') or not contract.get('monetary_conversion_source')):
         raise HTTPException(422,'This MCX contract needs verified quantity and price units. Refresh the broker contracts before paper execution.')
     contract_id=contract.get('instrument_id',contract['id'])
-    validate_new_exposure(contract,settings)
+    stock=contract.get('option_type')=='EQ'
+    if stock:
+        if item['side']!='BUY':
+            raise HTTPException(422,'Sell shares from an existing paper stock position.')
+        if item.get('order_type','MARKET')!='MARKET' or any(item.get(key) is not None for key in ('price','stop_loss','target')):
+            raise HTTPException(422,'Paper stock orders currently support market orders only.')
+    else:
+        validate_new_exposure(contract,settings)
     quote=resolve_quote(db,contract,broker,settings)
     if not quote:raise HTTPException(409,f'No quote for {contract["symbol"]}; wait for the feed.')
     # Pending limits require the same valid/fresh quote as immediate fills.
-    execution_price(db,contract,item['side'],broker,settings,quote_override=quote)
+    market_price,quote,market_slip=execution_price(db,contract,item['side'],broker,settings,quote_override=quote)
     pending=False
     if item.get('order_type','MARKET')=='LIMIT':
         if not item.get('price'):raise HTTPException(422,'Set a limit price.')
         compare=fill_reference(quote,item['side'],settings)
         pending=compare>item['price'] if item['side']=='BUY' else compare<item['price']
     if pending:price=float(item['price']); slip=0.0
+    elif stock:price,slip=market_price,market_slip
     else:
         price,quote,slip=execution_price(db,contract,item['side'],broker,settings,
             limit_price=item['price'] if item.get('order_type')=='LIMIT' else None)
     lots=int(item['lots']);quantity=lots*int(contract['lot_size'])*float(contract.get('price_multiplier') or 1)
     leg={k:contract.get(k) for k in ('symbol','underlying','exchange','segment','expiry','strike','option_type','lot_size','price_multiplier','multiplier_verified','monetary_conversion_source','broker_quantity_multiplier','token','source','broker','master_active','master_refresh_at','master_source_date')}
+    if stock:leg.update(instrument_type='stock',isin=contract['isin'])
     leg.update({'id':ident('leg'),'instrument_id':contract_id,'side':item['side'],'lots':lots,'filled_lots':0 if pending else lots,'open_lots':0 if pending else lots,'order_type':item.get('order_type','MARKET'),'limit_price':item.get('price'),'entry_price':price,'current_price':float(quote['ltp']),'exit_price':None,'entry_at':None if pending else at,'exit_at':None,'realized_pnl':0.0,'unrealized_pnl':0.0,'charges':0.0 if pending else charges(price,quantity,settings),'slippage_cost':0 if pending else slip*quantity,'status':'pending' if pending else 'open','stop_loss':item.get('stop_loss'),'target':item.get('target'),'quote_at':quote.get('received_at'),'exchange_quote_at':quote.get('exchange_timestamp'),'exchange_timestamp_basis':quote.get('exchange_timestamp_basis'),'quote_event_id':quote.get('event_id'),'quote_source':quote.get('broker',broker),'bid':quote.get('bid'),'ask':quote.get('ask'),'demo':settings['demo_mode']})
     return leg
 
@@ -499,13 +555,15 @@ def create_trades(db,payload):
     if existing:return existing
     settings=get_settings(db);action_id=ident('action');results=[]
     legs=[l for l in payload['legs'] if l.get('enabled',True)]
-    if not legs:raise HTTPException(422,'Enable at least one option leg.')
+    if not legs:raise HTTPException(422,'Enable at least one paper order leg.')
     for broker in dict.fromkeys(payload['brokers']):
         started=time.perf_counter_ns();at=iso_now()
         try:
             with db.begin_nested():
                 if broker not in BROKERS:raise HTTPException(422,'New paper trades support Kotak Neo only. Legacy records remain available.')
                 newlegs=[new_leg(db,l,broker,settings,at) for l in legs]
+                if len(newlegs)>1 and any(l.get('option_type')=='EQ' for l in newlegs):
+                    raise HTTPException(422,'Open each paper stock position as a single order.')
                 if any(l['underlying']!=payload['underlying'] for l in newlegs):raise HTTPException(422,'The selected contract belongs to a different underlying.')
                 trade={'id':ident('trade'),'strategy_id':action_id,'action_id':action_id,'name':payload['name'],'broker':broker,'underlying':payload['underlying'],'status':'open','mode':'PAPER','demo':settings['demo_mode'],'created_at':at,'closed_at':None,'legs':newlegs,'net_premium':sum(premium_cash_flow(l) for l in newlegs),'spot':catalog.find(legs[0]['instrument_id']).get('spot'),'mfe':None,'mae':None,'mfe_at':None,'mae_at':None,'dispatch_at':at,'processing_ms':(time.perf_counter_ns()-started)/1e6,'accounting_method':'weighted_average','export_queued':False}
                 recalculate(trade,at);enforce_paper_buying_power(db,trade,settings);store_trade(db,trade);event(db,trade,'entry',{'legs':copy.deepcopy(newlegs),'action_id':action_id,'dispatch_at':at,'processing_ms':trade['processing_ms']});snapshot(db,trade,'entry');store_trade(db,trade)
@@ -540,6 +598,10 @@ def apply_action(db,trade_id,payload):
     row=db.get(Trade,trade_id)
     if not row:raise HTTPException(404,'Trade not found.')
     trade=copy.deepcopy(row.data);settings=get_settings(db);action=payload['action'];at=iso_now()
+    stock=any(leg.get('option_type')=='EQ' for leg in trade['legs'])
+    if stock and (action not in ('add_lots','partial_exit','exit_leg','exit_strategy','duplicate','edit')
+                  or any(payload.get(key) is not None for key in ('price','stop_loss','target','leg'))):
+        raise HTTPException(422,'Paper stock positions support share purchases, sales and renaming at current market prices.')
     if trade['broker'] not in BROKERS and action not in {'edit','cancel_pending','settle_expiry'}:
         raise HTTPException(409,'This broker is retired. Historical records are preserved; new trades and market-price actions use Kotak Neo only.')
     if action=='duplicate':
@@ -572,6 +634,8 @@ def apply_action(db,trade_id,payload):
             # Validate both quotes and the new contract before recording either
             # simulated transaction; the outer API transaction is atomic.
             replacement=new_leg(db,payload['leg'],trade['broker'],settings,at)
+            if replacement.get('option_type')=='EQ':
+                raise HTTPException(422,'Open paper stocks separately from derivative strategies.')
             if replacement['underlying']!=trade['underlying']:raise HTTPException(422,'Replacement must use the strategy underlying.')
             execution_price(db,leg,'SELL' if leg['side']=='BUY' else 'BUY',trade['broker'],settings)
             old_id=leg['id'];old_lots=leg['open_lots']
@@ -581,13 +645,15 @@ def apply_action(db,trade_id,payload):
         elif action=='add_leg':
             if not payload.get('leg'):raise HTTPException(422,'Select a leg to add.')
             new=new_leg(db,payload['leg'],trade['broker'],settings,at)
+            if new.get('option_type')=='EQ':
+                raise HTTPException(422,'Open paper stocks separately from derivative strategies.')
             if new['underlying']!=trade['underlying']:raise HTTPException(422,'A leg must use the strategy underlying.')
             trade['legs'].append(new);trade['net_premium']+=premium_cash_flow(new);event(db,trade,'added_leg',{'leg':new})
         elif action=='add_lots':
             if not leg or leg['status']!='open':raise HTTPException(422,'Select an open leg.')
             lots=payload.get('lots')
             if not lots:raise HTTPException(422,'Choose lots to add.')
-            validate_new_exposure(leg,settings)
+            if not stock:validate_new_exposure(leg,settings)
             price,quote,slip=execution_price(db,leg,leg['side'],trade['broker'],settings,payload.get('price'))
             leg['entry_price']=(leg['entry_price']*leg['open_lots']+price*lots)/(leg['open_lots']+lots)
             leg['lots']+=lots;leg['filled_lots']+=lots;leg['open_lots']+=lots;leg['charges']+=charges(price,lots*monetary_units(leg),settings);leg['slippage_cost']+=slip*lots*monetary_units(leg);leg['current_price']=quote['ltp'];leg['quote_at']=quote.get('received_at');leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['exchange_timestamp_basis']=quote.get('exchange_timestamp_basis');leg['quote_event_id']=quote.get('event_id');trade['net_premium']+=premium_cash_flow(leg,lots,price);event(db,trade,'added_lots',{'leg_id':leg['id'],'lots':lots,'price':price,'average_entry_price':leg['entry_price'],'quote_event_id':quote.get('event_id')})
@@ -669,13 +735,19 @@ def record_quote(db,quote,process=True):
     if process:revalue_quote(db,entry)
     return entry.id
 
+def _quote_matches_leg(leg,quote):
+    same_id=leg['instrument_id']==quote['instrument_id']
+    if leg.get('option_type')=='EQ' or quote.get('option_type')=='EQ':
+        return same_id
+    return same_id or contract_identity(leg)==contract_identity(quote)
+
+
 def _trade_uses_quote(trade,quote,settings):
     if trade.get('broker') not in BROKERS or quote.get('broker') not in BROKERS:return False
     if trade['status'] not in ('open','pending') or bool(trade.get('demo'))!=bool(quote['demo']):return False
     source=settings['preferred_feed'];source=trade['broker'] if source=='broker' else source
     return source==quote['broker'] and any(leg['status'] in ('open','pending') and
-        (leg['instrument_id']==quote['instrument_id'] or contract_identity(leg)==contract_identity(quote))
-        for leg in trade['legs'])
+        _quote_matches_leg(leg,quote) for leg in trade['legs'])
 
 
 
@@ -723,8 +795,7 @@ def revalue_quote(db,entry):
                 fresh=(age_seconds(quote['received_at']) or 0)<=settings['stale_after_seconds']
                 for leg in trade['legs']:
                     if leg['status'] not in ('open','pending'):continue
-                    matches=leg['instrument_id']==quote['instrument_id'] or contract_identity(leg)==contract_identity(quote)
-                    if not matches:continue
+                    if not _quote_matches_leg(leg,quote):continue
                     changed=True;leg['current_price']=float(quote['ltp']);leg['quote_at']=quote['received_at'];leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['exchange_timestamp_basis']=quote.get('exchange_timestamp_basis');leg['quote_event_id']=entry.id;leg['quote_source']=quote['broker'];leg['bid']=quote.get('bid');leg['ask']=quote.get('ask')
                     if leg['status']=='pending' and fresh:
                         price=fill_reference(quote,leg['side'],settings)
@@ -1062,6 +1133,8 @@ def dashboard(db,statuses=None):
                 if prior_value is None:daily_complete=False
         today_pnl+=trade['net_pnl']-baseline
     summary={'net_pnl':round(sum(t['net_pnl'] for t in trades),2),'total_pnl':round(sum(t['net_pnl'] for t in trades),2),'realized_pnl':round(sum(t['realized_pnl'] for t in trades),2),'unrealized_pnl':round(sum(t['unrealized_pnl'] for t in trades),2),'today_pnl':round(today_pnl,2),'today_pnl_complete':daily_complete,'charges':round(sum(t['charges'] for t in trades),2),'active_trades':len(open_trades),'active_positions':sum(sum(l['open_lots']>0 for l in t['legs']) for t in trades),'margin_estimate':None if open_trades else 0,'broker_margin_status':'unavailable' if open_trades else 'not_required','paper_capital':settings['paper_capital'],'available_paper_capital':None if open_trades else settings['paper_capital'],'paper_cash_reserved':round(sum(t.get('paper_cash_reserve',0) for t in open_trades),2),'available_paper_cash_capital':round(settings['paper_capital']-sum(t.get('paper_cash_reserve',0) for t in open_trades),2),'paper_capital_check':'premium_cash_only'}
+    if any(t.get('instrument_type')=='stock' for t in open_trades):
+        summary['paper_capital_check']='known_cash_costs'
     trade_counts={'strategies':len({t.get('strategy_id') or t.get('action_id') or t['id'] for t in trades}),'executions':len(trades),'active_strategies':len({t.get('strategy_id') or t.get('action_id') or t['id'] for t in open_trades}),'closed_executions':sum(t['status']=='closed' for t in trades),'definition':settings.get('trade_count_definition','strategies')}
     summary['all_time_trade_count']=trade_counts[trade_counts['definition']]
     brokers=[]

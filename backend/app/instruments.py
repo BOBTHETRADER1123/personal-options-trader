@@ -12,6 +12,8 @@ import json
 import math
 import os
 import re
+import tempfile
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -331,6 +333,38 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
             **({"expiry_schema": expiry_schema} if broker == "kotak" else {})}
 
 
+def normalize_kotak_stock(row: dict) -> dict | None:
+    """Normalize one-share NSE EQ-series securities from the native cash master."""
+    isin = _pick(row, "pISIN")
+    if _pick(row, "pGroup") != "EQ" or not isin.startswith("INE"):
+        return None  # Indices, ETFs, debt and special series are outside this catalog.
+    if (_pick(row, "pExchSeg") != "nse_cm" or _pick(row, "pExchange") != "NSE"
+            or _pick(row, "pSegment") != "CASH"):
+        raise ValueError("Invalid NSE cash segment")
+    token = _pick(row, "pSymbol")
+    symbol = _pick(row, "pTrdSymbol")
+    underlying = _pick(row, "pSymbolName")
+    name = _pick(row, "pDesc")
+    if (not re.fullmatch(r"[0-9]+", token) or not re.fullmatch(r"INE[A-Z0-9]{8}[0-9]", isin)
+            or not underlying or symbol != f"{underlying}-EQ" or not name):
+        raise ValueError("Missing or inconsistent NSE stock identity")
+    if (_positive(_pick(row, "lLotSize"), True) != 1
+            or _pick(row, "lPrecision") != "2"
+            or _pick(row, "pOptionType")
+            or any(_pick(row, field) not in {"", "-1"} for field in ("pExpiryDate", "lExpiryDate", "dStrikePrice"))):
+        raise ValueError("Unsupported NSE stock units or derivative fields")
+    tick = _positive(_kotak_native_price(row, "dTickSize", "tick_size"))
+    # A token can be recycled. Including the published security identifier in
+    # the app ID keeps earlier holdings and marks separate from a new stock.
+    identifier = f"kotak:nse_cm:{token}:{isin}"
+    return {"id": identifier, "instrument_id": identifier, "broker": "kotak", "token": token,
+            "isin": isin, "symbol": symbol, "underlying": underlying, "name": name,
+            "exchange": "NSE", "segment": "nse_cm", "expiry": None, "strike": 0.0,
+            "option_type": "EQ", "instrument_type": "stock", "lot_size": 1, "tick_size": tick,
+            "price_multiplier": 1.0, "multiplier_verified": True, "demo": False,
+            "source": "broker_master"}
+
+
 def demo_contracts(today: date | None = None) -> list[dict]:
     """Synthetic sample contracts: the values below are NOT current market data."""
     today = today or datetime.now(IST).date()
@@ -373,6 +407,46 @@ def demo_contracts(today: date | None = None) -> list[dict]:
     return results
 
 
+@dataclass(frozen=True)
+class StockMasterCandidate:
+    path: Path
+    rows: tuple[dict, ...]
+    metadata: dict
+
+
+def _validated_stock_cache(payload):
+    rows, metadata = payload["stocks"], payload["stock_refresh"]
+    if not isinstance(rows, list) or not rows or not isinstance(metadata, dict):
+        raise ValueError("Invalid stock catalog")
+    segment = metadata["segments"]["nse_cm"]
+    source = segment["source_date"]
+    stamp = metadata["last_successful_refresh_at"]
+    refresh_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    if (refresh_at.tzinfo is None or refresh_at.astimezone(IST).date().isoformat() != source
+            or set(metadata["segments"]) != {"nse_cm"} or segment["active_count"] != len(rows)):
+        raise ValueError("Invalid stock master provenance")
+    tokens, isins = set(), set()
+    for row in rows:
+        token, isin = row["token"], row["isin"]
+        identifier = f"kotak:nse_cm:{token}:{isin}"
+        if (not re.fullmatch(r"[0-9]+", token) or not re.fullmatch(r"INE[A-Z0-9]{8}[0-9]", isin)
+                or token in tokens or isin in isins
+                or row["id"] != identifier or row["instrument_id"] != identifier
+                or row["broker"] != "kotak" or row["exchange"] != "NSE" or row["segment"] != "nse_cm"
+                or row["option_type"] != "EQ" or row["instrument_type"] != "stock"
+                or row["expiry"] is not None or row["strike"] != 0
+                or row["lot_size"] != 1 or row["price_multiplier"] != 1
+                or row["multiplier_verified"] is not True or row["demo"] is not False
+                or row["source"] != "broker_master" or row["master_active"] is not True
+                or row["master_source_date"] != source or row["master_refresh_at"] != stamp
+                or not row["name"] or not row["underlying"] or row["symbol"] != f"{row['underlying']}-EQ"):
+            raise ValueError("Invalid normalized stock record")
+        _positive(row["tick_size"])
+        tokens.add(token)
+        isins.add(isin)
+    return tuple(rows), metadata
+
+
 class ContractCatalog:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path or os.environ.get("INSTRUMENT_MASTER_PATH", DEFAULT_PATH))
@@ -380,10 +454,15 @@ class ContractCatalog:
         self._live: list[dict] = []
         self.master_metadata: dict = {}
         self.error: str | None = None
+        self.stock_path = self.path.with_suffix(".stocks.json")
+        self.stock_rows: tuple[dict, ...] = ()
+        self.stock_metadata: dict = {}
+        self.stock_error: str | None = None
         self._demo = demo_contracts()
         self.reload()
 
     def reload(self):
+        self._reload_stock_master()
         pending = []
         self.error = None
         if not self.path.exists():
@@ -432,6 +511,52 @@ class ContractCatalog:
             self.master_metadata = metadata
         finally:
             self.revision += 1
+
+    def _reload_stock_master(self):
+        self.stock_error = None
+        if not self.stock_path.exists():
+            self.stock_rows, self.stock_metadata = (), {}
+            return
+        try:
+            if self.stock_path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("Stock catalog exceeds size limit")
+            payload = json.loads(self.stock_path.read_text(encoding="utf-8"))
+            self.stock_rows, self.stock_metadata = _validated_stock_cache(payload)
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            self.stock_error = f"Stock master not loaded: {type(exc).__name__}"
+
+    def prepare_stock_master(self, batch):
+        """Validate and stage the cash catalog without holding the writer lock."""
+        rows, metadata = _validated_stock_cache({"stocks": list(batch), "stock_refresh": batch.metadata})
+        encoded = json.dumps({"stocks": rows, "stock_refresh": metadata}, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 16 * 1024 * 1024:
+            raise ValueError("Stock catalog exceeds size limit")
+        self.stock_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.stock_path.parent, prefix=".stocks-", suffix=".tmp",
+                                             delete=False) as output:
+                temporary = Path(output.name)
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            return StockMasterCandidate(temporary, rows, metadata)
+        except Exception:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
+
+    def publish_stock_master(self, candidate, active_legs=()):
+        """Publish validated records atomically, preserving existing stock identities."""
+        current = {row["id"]: row for row in candidate.rows}
+        fields = ("isin", "exchange", "segment", "option_type", "expiry", "strike", "lot_size", "price_multiplier")
+        for leg in active_legs:
+            row = current.get(leg.get("instrument_id"))
+            if row and any(leg.get(field) != row[field] for field in fields):
+                raise ValueError("Active stock identity or units changed")
+        candidate.path.replace(self.stock_path)
+        self.stock_rows, self.stock_metadata, self.stock_error = candidate.rows, candidate.metadata, None
+        self.revision += 1
 
     def restore_demo_contracts(self, trades: list[dict]) -> int:
         """Retain unexpired sample contracts after the startup date changes.
@@ -535,6 +660,8 @@ class ContractCatalog:
             for leg in trade.get('legs', []):
                 if leg.get('status') not in {'open','pending'} or leg.get('demo') is not False:
                     continue
+                if leg.get('segment') == 'nse_cm':
+                    continue  # Cash tokens are usable only from the current stock master.
                 contract = dict(leg)
                 contract['id'] = leg.get('instrument_id')
                 contract['broker'] = trade['broker']
@@ -554,12 +681,12 @@ class ContractCatalog:
         # with unrelated contracts. Index references, then copy only matches.
         # Length/identity also cover supported demo appends and list replacement
         # before their caller publishes a catalog revision.
-        identity = (self.revision, id(self._demo), len(self._demo), id(self._live), len(self._live))
+        identity = (self.revision, id(self._demo), len(self._demo), id(self._live), len(self._live), id(self.stock_rows))
         cached = getattr(self, "_lookup_cache", None)
         if cached is not None and cached[0] == identity:
             return cached[1], cached[2]
         all_rows, live_rows = {}, {}
-        for rows, index in ((self._demo, all_rows), (self._live, live_rows)):
+        for rows, index in ((self._demo, all_rows), (self._live, live_rows), (self.stock_rows, live_rows)):
             for row in rows:
                 identifier = row["id"]
                 previous = index.get(identifier)
@@ -579,7 +706,7 @@ class ContractCatalog:
                 all_rows[identifier] = (*first, *following)
         # Retain list references so an abandoned list's id cannot be reused
         # for a same-length replacement while this cache remains valid.
-        self._lookup_cache = (identity, all_rows, live_rows, self._demo, self._live)
+        self._lookup_cache = (identity, all_rows, live_rows, self._demo, self._live, self.stock_rows)
         return all_rows, live_rows
 
     def find(self, instrument_id: str, broker: str | None = None) -> dict | None:
@@ -601,7 +728,8 @@ class ContractCatalog:
         use the same expiry filter as all(demo=False), without copying all rows.
         """
         allowed = set(BROKERS) & set(BROKERS if brokers is None else brokers)
-        today = datetime.now(IST).date().isoformat()
+        now = datetime.now(IST)
+        today = now.date().isoformat()
         index = self._lookup_indexes()[1]
         selected = []
         for identifier in sorted(set(instrument_ids)):
@@ -609,7 +737,9 @@ class ContractCatalog:
             if rows is None:
                 continue
             for row in rows if isinstance(rows, tuple) else (rows,):
-                if row["broker"] in allowed and row["expiry"] >= today:
+                current = (contract_master_status(row, now)["ready"] if row["option_type"] == "EQ"
+                           else row["expiry"] >= today)
+                if row["broker"] in allowed and current:
                     selected.append(dict(row))
         return selected
 

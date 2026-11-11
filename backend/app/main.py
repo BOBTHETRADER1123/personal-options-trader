@@ -32,6 +32,8 @@ from .kotak_margin import MarginCheckError, safe_single_order_audit
 from .scheduler import CollectorLease, ExchangeCalendar, guard_lease
 from .realtime import TicketRegistry, SharedDashboardPublisher
 from . import cloud_backup, resource_health, maintenance, reporting, daily_reports, sheets_sync, archival
+from .instruments import contract_master_status
+from .stocks import NSE_CASH, StockMaster
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -64,6 +66,7 @@ daily_service=None
 sheets_service=None
 storage_archiver=None
 kotak_setup=None
+stock_master=None
 _active_positions=[]
 _activity_until=0.0
 _viewers=0
@@ -388,6 +391,7 @@ async def stop_selected_feeds():
 async def background_loop():
     next_tick=time.monotonic();renewed=0.0;refreshed=0.0
     subscription_task=None
+    stock_task=None
     try:
         while not stop_event.is_set() and database_ready:
             stop_feed=False;refresh_feed=False
@@ -420,6 +424,16 @@ async def background_loop():
                 # Broker stop/subscribe may wait on the network. No reader snapshot
                 # or global writer lock survives into this wait.
                 if stop_feed:await stop_selected_feeds()
+                if (refresh_feed and stock_master and stock_master.due()
+                        and (stock_task is None or stock_task.done())
+                        and any(leg.get('option_type')=='EQ' and leg.get('open_lots',0)>0
+                                for trade in _active_positions for leg in trade.get('legs',[]))
+                        and exchange_calendar and exchange_calendar.state(NSE_CASH,datetime.now(timezone.utc))['open']
+                        and option_chain.configured('kotak')):
+                    async def refresh_stocks():
+                        with SessionLocal() as db:
+                            await stock_master.refresh(db,background=True)
+                    stock_task=asyncio.create_task(refresh_stocks())
                 if refresh_feed and (subscription_task is None or subscription_task.done()):
                     async def refresh():
                         try:
@@ -441,6 +455,9 @@ async def background_loop():
         if subscription_task:
             subscription_task.cancel()
             await asyncio.gather(subscription_task,return_exceptions=True)
+        if stock_task:
+            stock_task.cancel()
+            await asyncio.gather(stock_task,return_exceptions=True)
 
 
 def restore_active_state():
@@ -500,6 +517,7 @@ async def database_services(reporting_loop):
 @asynccontextmanager
 async def lifespan(app):
     global catalog,feed_manager,stop_event,database_ready,collector_lease,exchange_calendar,cloud_service,resource_monitor,daily_service,sheets_service,storage_archiver,_started_at,_viewers,_activity_until,kotak_setup,_feed_refresh_lock,_feed_contract_ids,_feed_auto_requested,_last_manual_reconnect,_ws_tickets,_dashboard_publisher
+    global stock_master
     from .instruments import ContractCatalog
     from .reporting import reporting_loop
     from . import reporting
@@ -510,6 +528,7 @@ async def lifespan(app):
     with _quote_selection_lock:_quote_selection_requests.clear()
     kotak_setup=broker_setup.KotakSetupService(factory=SessionLocal)
     catalog=ContractCatalog();engine.set_catalog(catalog)
+    stock_master=StockMaster(catalog,write_lock)
     exchange_calendar=ExchangeCalendar();collector_lease=CollectorLease(SessionLocal)
     cloud_service=cloud_backup.CloudBackupService(session_factory=SessionLocal)
     resource_monitor=resource_health.ResourceMonitor()
@@ -828,6 +847,31 @@ async def reload_instruments():
         await refresh_selected_feeds(db,force=True)
     return {'ok':True,'live_contracts':len(catalog.all(demo=False))}
 
+@app.get('/api/stocks',dependencies=[Depends(require_session)])
+def list_stocks(q:str=Query('',max_length=100),limit:int=Query(25,ge=1,le=100),db=Depends(get_db)):
+    if stock_master is None:
+        raise HTTPException(503,'The stock catalog is starting up.')
+    settings=engine.get_settings(db)
+    option_chain.finish_read_transaction(db)
+    now=datetime.now(timezone.utc)
+    state=exchange_calendar.state(NSE_CASH,now) if exchange_calendar else {}
+    session={'known':bool(state.get('known')), 'open':bool(state.get('open')),
+             'reason':state.get('reason','calendar_unavailable')}
+    return stock_master.search(q,limit,demo=settings['demo_mode'],session=session)
+
+
+@app.post('/api/stocks/master/refresh',dependencies=[Depends(require_session)])
+async def refresh_stock_list(request:Request,db=Depends(get_db)):
+    rate_limit(request,'stock-master-refresh',limit=6,seconds=60)
+    if stock_master is None:
+        raise HTTPException(503,'The stock catalog is starting up.')
+    demo=await asyncio.to_thread(lambda: engine.get_settings(db)['demo_mode'])
+    await asyncio.to_thread(option_chain.finish_read_transaction,db)
+    if demo:
+        raise HTTPException(409,'Switch to market-data paper mode to load NSE shares.')
+    return await stock_master.refresh(db)
+
+
 class QuoteSelectionItem(BaseModel):
     model_config=ConfigDict(extra='forbid')
     broker:Literal['kotak']
@@ -848,7 +892,12 @@ def resolve_quote_selection(db,items):
     selected={}
     for item in items:
         row=catalog.find(item.instrument_id,item.broker) if catalog else None
-        if not row or row.get('demo') is not False or row['broker']!=item.broker or row['expiry']<today:
+        if not row or row.get('demo') is not False or row['broker']!=item.broker:
+            raise HTTPException(422,'Select current contracts from each selected broker instrument master.')
+        if row.get('option_type')=='EQ':
+            if not contract_master_status(row)['ready']:
+                raise HTTPException(409,'Refresh the NSE stock list before requesting stock quotes.')
+        elif row['expiry']<today:
             raise HTTPException(422,'Select current contracts from each selected broker instrument master.')
         selected[(item.broker,item.instrument_id)]=row
     return list(selected.values()),settings['stale_after_seconds']

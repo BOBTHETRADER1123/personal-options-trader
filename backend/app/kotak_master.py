@@ -17,12 +17,14 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .instruments import IST, normalize_row
+from .instruments import IST, normalize_kotak_stock, normalize_row
 
 log = logging.getLogger('personal_options_trader.master')
 log.setLevel(logging.INFO)  # Only app-authored, credential-free diagnostics below.
 SEGMENTS = ('nse_fo', 'bse_fo', 'mcx_fo')
+STOCK_SEGMENT = 'nse_cm'
 MAX_BYTES = 100 * 1024 * 1024
+MAX_STOCK_BYTES = 12 * 1024 * 1024
 # Official troubleshooting describes 424 as a temporary dependency failure.
 # Bounded retries are safe here because this endpoint only reads the master.
 RETRY_STATUSES = {408, 424, 429, 500, 502, 503, 504}
@@ -37,6 +39,10 @@ REQUIRED = {
     'segment': {'pExchSeg', 'exchange_segment', 'segment'},
     'tick_size': {'dTickSize', 'tick_size'},
 }
+STOCK_REQUIRED = {name: {name} for name in (
+    'pSymbol', 'pGroup', 'pExchSeg', 'pExchange', 'pSegment', 'pSymbolName',
+    'pTrdSymbol', 'pISIN', 'pDesc', 'lLotSize', 'lPrecision', 'dTickSize',
+)}
 
 
 class MasterRefreshError(ValueError):
@@ -109,17 +115,17 @@ def source_date(url):
         raise MasterRefreshError('invalid_file_date', 'file_paths') from None
 
 
-def resolve_paths(payload, today):
+def resolve_paths(payload, today, segments=SEGMENTS):
     if not isinstance(payload, dict) or not isinstance(payload.get('data'), dict):
         raise MasterRefreshError('invalid_data_object', 'response_json')
     paths = payload['data'].get('filesPaths')
     if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
         raise MasterRefreshError('invalid_filesPaths', 'file_paths')
     result = {}
-    for segment in SEGMENTS:
+    for segment in segments:
         matches = []
         for url in paths:
-            # Validate only requested segment URLs, never download cash files.
+            # Derivative and cash refreshes request only their own segment files.
             basename = urlsplit(url).path.rsplit('/', 1)[-1].lower()
             if basename not in {segment + '.csv', segment + '-v1.csv'}:
                 continue
@@ -129,6 +135,10 @@ def resolve_paths(payload, today):
             raise MasterRefreshError('segment_file_missing', 'file_paths', segment=segment)
         newest = max(d for d, _ in matches)
         chosen = sorted({url for d, url in matches if d == newest})
+        if segment == STOCK_SEGMENT:
+            versioned = [url for url in chosen if urlsplit(url).path.lower().endswith('/nse_cm-v1.csv')]
+            if versioned:
+                chosen = versioned
         if len(chosen) != 1:
             raise MasterRefreshError('ambiguous_segment_files', 'file_paths', segment=segment)
         if newest != today:
@@ -169,7 +179,9 @@ def retry(operation, *, stage, segment=None, deadline, clock=time.monotonic, sle
 
 
 def parse_csv(raw, segment, *, today, stamp):
-    if not raw or len(raw) > MAX_BYTES:
+    is_stock = segment == STOCK_SEGMENT
+    required = STOCK_REQUIRED if is_stock else REQUIRED
+    if not raw or len(raw) > (MAX_STOCK_BYTES if is_stock else MAX_BYTES):
         raise MasterRefreshError('empty_or_oversized_csv', 'csv_download', segment=segment)
     try:
         text = raw.decode('utf-8-sig')
@@ -185,7 +197,7 @@ def parse_csv(raw, segment, *, today, stamp):
     normalized = [name.strip().rstrip(';') for name in headers]
     if not normalized or len(normalized) != len(set(normalized)):
         raise MasterRefreshError('empty_or_duplicate_headers', 'csv_columns', segment=segment)
-    missing = sorted(name for name, aliases in REQUIRED.items() if not set(normalized) & aliases)
+    missing = sorted(name for name, aliases in required.items() if not set(normalized) & aliases)
     if missing:
         raise MasterRefreshError('required_columns_missing', 'csv_columns', segment=segment, missing_columns=missing)
     rows, seen, signatures, row_count, expired = [], set(), set(), 0, 0
@@ -199,6 +211,20 @@ def parse_csv(raw, segment, *, today, stamp):
             supplied = next((row[k].strip().lower() for k in ('pExchSeg','exchange_segment','segment') if row.get(k)), segment)
             if supplied != segment:
                 raise MasterRefreshError('segment_mismatch', 'csv_row', segment=segment, row_number=row_number)
+            if is_stock:
+                try:
+                    stock = normalize_kotak_stock(row)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise MasterRefreshError('invalid_stock_fields', 'csv_row', segment=segment, row_number=row_number) from exc
+                if stock is None:
+                    continue
+                if stock['token'] in seen or stock['isin'] in signatures:
+                    raise MasterRefreshError('duplicate_stock_identity', 'csv_row', segment=segment, row_number=row_number)
+                seen.add(stock['token'])
+                signatures.add(stock['isin'])
+                stock.update(master_active=True, master_refresh_at=stamp, master_source_date=today)
+                rows.append(stock)
+                continue
             if any(row.get(k) for k in ('dStrikePrice', 'dTickSize')) and not row.get('lPrecision'):
                 raise MasterRefreshError('native_price_precision_missing', 'csv_row', segment=segment, row_number=row_number)
             kind = next((row[k].strip().upper() for k in ('pOptionType','option_type') if row.get(k)), '')
@@ -223,17 +249,18 @@ def parse_csv(raw, segment, *, today, stamp):
     except csv.Error as exc:
         raise MasterRefreshError('malformed_csv', 'csv_row', segment=segment, row_number=reader.line_num) from exc
     if not rows:
-        raise MasterRefreshError('no_current_derivatives', 'csv_validation', segment=segment)
+        raise MasterRefreshError('no_current_stocks' if is_stock else 'no_current_derivatives', 'csv_validation', segment=segment)
     return rows, {'row_count': row_count, 'active_count': len(rows), 'expired_count': expired,
-                  'required_columns_verified': sorted(REQUIRED), 'segment_verified': True,
+                  'required_columns_verified': sorted(required), 'segment_verified': True,
                   'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
 
 
-def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
+def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep, segments=SEGMENTS):
     owned_client = client is None
     moment = now or datetime.now(timezone.utc)
     today, stamp = moment.astimezone(IST).date().isoformat(), moment.isoformat()
     deadline = clock() + 80
+    max_bytes = MAX_STOCK_BYTES if segments == (STOCK_SEGMENT,) else MAX_BYTES
     if client is None:
         os.environ['NEO_LOG_LEVEL'] = 'NOLOG'
         os.environ['NEO_LOG_FILE_ENABLED'] = 'false'
@@ -266,7 +293,7 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
                 payload = response.json()
             except (ValueError, TypeError) as exc:
                 raise MasterRefreshError('invalid_json', 'response_json', http_status=status) from exc
-            return resolve_paths(payload, today)
+            return resolve_paths(payload, today, segments)
 
         paths = retry(paths_request, stage='scrip_master_request', deadline=deadline, clock=clock, sleep=sleep)
         for segment, url in paths.items():
@@ -302,7 +329,7 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
                             chunks, size = [], 0
                             for chunk in response.iter_bytes():
                                 size += len(chunk)
-                                if size + total > MAX_BYTES:
+                                if size + total > max_bytes:
                                     raise MasterRefreshError('csv_size_limit', 'csv_download', segment=segment)
                                 if clock() >= deadline:
                                     raise MasterRefreshError('refresh_deadline_exceeded', 'csv_download', segment=segment)
@@ -324,3 +351,8 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
                 client.api_client.rest_client.close()
             except Exception:
                 log.warning('Kotak master transport close failed; credential details omitted')
+
+
+def download_stock_master(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep):
+    """Download only the official NSE cash master via the read-only endpoint."""
+    return download(client=client, now=now, clock=clock, sleep=sleep, segments=(STOCK_SEGMENT,))

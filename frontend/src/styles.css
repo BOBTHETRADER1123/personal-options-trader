@@ -631,3 +631,164 @@ body{background:var(--bg)}.sidebar{background:#131416}.topbar{background:#141517
 .execution-caution label{display:flex;flex-direction:row;align-items:flex-start;gap:10px;margin-top:14px;cursor:pointer}
 .execution-caution input{width:16px;height:16px;margin-top:3px;flex-shrink:0;accent-color:#0a82f9}
 @media(max-width:700px){.execution-preview-heading{padding-left:18px;padding-right:18px}.execution-caution{margin:16px 18px}.execution-preview-heading .text-btn{margin-left:0}}
+
+
+/* ==========================================================================
+   ENHANCED MODERN TRADING TERMINAL — GLASSMORPHISM & MICRO-INTERACTIONS
+   ========================================================================== */
+
+/* Modern visual tokens */
+:root {
+  --glass-bg: rgba(22, 24, 29, 0.72);
+  --glass-raised: rgba(30, 33, 40, 0.82);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-focus: rgba(255, 132, 29, 0.45);
+  --glass-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+  --bull-green: #34d399;
+  --bear-rose: #f43f5e;
+  --accent-glow: 0 0 15px rgba(255, 132, 29, 0.25);
+}
+
+[data-theme="light"] {
+  --glass-bg: rgba(255, 255, 255, 0.85);
+  --glass-raised: rgba(246, 248, 252, 0.92);
+  --glass-border: rgba(200, 210, 225, 0.55);
+  --glass-shadow: 0 10px 25px -8px rgba(20, 45, 80, 0.08);
+}
+
+/* Glassmorphism on Panels & Cards */
+.panel, .stat-card, .overview-terminal > section, .performance-details, .modal {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border) !important;
+  box-shadow: var(--glass-shadow);
+  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.22s ease, border-color 0.22s ease;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.6);
+  border-color: rgba(255, 255, 255, 0.15) !important;
+}
+
+/* Sleek Topbar & Sidebar */
+.topbar {
+  background: rgba(19, 20, 23, 0.82) !important;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--glass-border) !important;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.sidebar {
+  background: linear-gradient(180deg, rgba(19, 20, 22, 0.95) 0%, rgba(13, 14, 16, 0.98) 100%) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid var(--glass-border) !important;
+}
+
+.sidebar nav button {
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  border-radius: 8px;
+}
+
+.sidebar nav button:hover {
+  transform: translateX(3px);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar nav button.active {
+  background: rgba(255, 132, 29, 0.12) !important;
+  border-left: 3px solid var(--accent) !important;
+  box-shadow: inset 1px 0 10px rgba(255, 132, 29, 0.15);
+}
+
+/* Pulsing Live Connection Indicator */
+.tiny-green-dot:not(.neutral) {
+  position: relative;
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.7);
+  animation: pulse-glow 2.4s infinite;
+}
+
+@keyframes pulse-glow {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6); }
+  70% { transform: scale(1.05); box-shadow: 0 0 0 6px rgba(52, 211, 153, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+}
+
+/* Smooth Interactive Buttons */
+.btn {
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.btn:active {
+  transform: scale(0.98);
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, #ff9436, #ff7017) !important;
+  border-color: #ff841d !important;
+  box-shadow: 0 4px 16px rgba(255, 132, 29, 0.3);
+}
+
+.btn.primary:hover {
+  background: linear-gradient(135deg, #ffa858, #ff841d) !important;
+  box-shadow: 0 6px 22px rgba(255, 132, 29, 0.45);
+  transform: translateY(-1px);
+}
+
+/* High Precision Numerical Formatting */
+.pnl, .stat-value, .numeric, .oc-basket-ltp, .lifetime-count, td strong {
+  font-variant-numeric: tabular-nums lining-nums;
+  letter-spacing: -0.02em;
+}
+
+.positive, .pnl.positive {
+  color: var(--bull-green) !important;
+  text-shadow: 0 0 12px rgba(52, 211, 153, 0.2);
+}
+
+.negative, .pnl.negative {
+  color: var(--bear-rose) !important;
+  text-shadow: 0 0 12px rgba(244, 63, 94, 0.2);
+}
+
+/* Refined Modal Experience */
+.modal-backdrop {
+  backdrop-filter: blur(8px) !important;
+  background: rgba(4, 7, 12, 0.72) !important;
+}
+
+.modal {
+  animation: modal-pop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+@keyframes modal-pop {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Modern Minimalist Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
