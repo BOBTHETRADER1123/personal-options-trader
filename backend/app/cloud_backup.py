@@ -123,7 +123,7 @@ class DriveConfig:
             client_secret=os.getenv("GOOGLE_DRIVE_CLIENT_SECRET", ""),
             redirect_uri=os.getenv("GOOGLE_DRIVE_REDIRECT_URI", ""),
             encryption_key=os.getenv("GOOGLE_DRIVE_TOKEN_KEY", ""),
-            data_dir=os.getenv("DATA_DIR", "/app/data"),
+            data_dir=os.getenv("DATA_DIR", str(Path(__file__).resolve().parents[2] / "OptionsTraderData")),
             max_spool_bytes=max(1, int(os.getenv("DRIVE_SPOOL_MAX_MB", "256"))) * 1024 * 1024,
             max_file_bytes=max(1, int(os.getenv("DRIVE_MAX_FILE_MB", "64"))) * 1024 * 1024,
             min_free_bytes=max(0, int(os.getenv("DRIVE_MIN_FREE_MB", "512"))) * 1024 * 1024,

@@ -1,6 +1,12 @@
 export const API_BASE = (import.meta as unknown as {env:Record<string,string>}).env.VITE_API_BASE_URL || '';
-let csrf='';
-export function setCsrf(token:string){csrf=token;}
+let csrf=typeof sessionStorage!=='undefined'?sessionStorage.getItem('pot-csrf')||'':'';
+export function setCsrf(token:string){
+ csrf=token;
+ if(typeof sessionStorage!=='undefined'){
+  if(token)sessionStorage.setItem('pot-csrf',token);
+  else sessionStorage.removeItem('pot-csrf');
+ }
+}
 export async function api<T=any>(path:string,options:RequestInit={}):Promise<T>{
  const headers:Record<string,string>={'Content-Type':'application/json',...(options.headers as Record<string,string>||{})};
  if(csrf)headers['X-CSRF-Token']=csrf;

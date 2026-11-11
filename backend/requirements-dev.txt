@@ -1,0 +1,12 @@
+# Developer and test suite dependencies
+-r requirements.txt
+-r requirements-brokers.txt
+
+pytest>=8,<10
+pytest-asyncio>=0.24,<1.0
+pytest-cov>=5.0,<6.0
+flake8>=7.0,<8.0
+black>=24.0,<25.0
+isort>=5.13,<6.0
+mypy>=1.10,<2.0
+types-python-dateutil

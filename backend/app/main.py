@@ -594,6 +594,7 @@ async def security_headers(request,call_next):
     if os.getenv('COOKIE_SECURE','false').lower()=='true':response.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
     return response
 
+@app.get('/health')
 @app.get('/api/health')
 def health():return {'ok':True,'mode':'PAPER','live_orders_supported':False,'database_ready':database_ready,'time':iso_now()}
 
@@ -725,7 +726,7 @@ def trades(demo:bool|None=None,status:str|None=None,hidden:bool=False,offset:int
     rows=sorted([r.data for r in db.scalars(query) if bool(r.data.get('demo'))==bool(mode) and bool(r.data.get('history_hidden'))==hidden],key=lambda t:t.get('created_at',''),reverse=True)
     return [engine.public_trade(t,engine.get_settings(db)) for t in rows[offset:offset+limit]]
 
-@app.post('/api/trades',dependencies=[Depends(require_session)])
+@app.post('/api/trades',status_code=201,dependencies=[Depends(require_session)])
 async def create_trade(payload:TradeInput,db=Depends(get_db)):
     async with write_lock:
         await ensure_writer(db)
