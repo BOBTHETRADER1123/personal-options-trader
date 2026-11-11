@@ -14,3 +14,41 @@
   .oc-table .oc-action-cell { padding:6px 10px!important }
 }
 @media(prefers-reduced-motion:reduce){.oc-spin{animation:none}.oc-table-scroll{scroll-behavior:auto}}
+
+
+/* Option Chain Glassmorphic & Modern Trading Highlights */
+.oc-chain-panel {
+  background: var(--glass-bg, rgba(12, 27, 42, 0.75)) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08)) !important;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+}
+
+.oc-basket {
+  background: rgba(16, 35, 51, 0.88) !important;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.oc-basket.has-legs {
+  border-color: rgba(255, 132, 29, 0.4) !important;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.7), 0 0 20px rgba(255, 132, 29, 0.15);
+}
+
+.oc-table th.oc-strike-cell.atm {
+  background: linear-gradient(135deg, #134636, #1b5f49) !important;
+  color: #6ee7b7 !important;
+  box-shadow: inset 0 0 14px rgba(52, 211, 153, 0.3) !important;
+}
+
+.oc-table tbody tr:hover td {
+  background: rgba(25, 50, 72, 0.65) !important;
+}
+
+.oc-table tbody tr:hover .oc-strike-cell {
+  background: rgba(33, 70, 92, 0.85) !important;
+}
