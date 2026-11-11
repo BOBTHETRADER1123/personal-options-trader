@@ -14,10 +14,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-      - name: Install dependencies
+      - name: Install frontend dependencies
         run: npm install --prefix frontend
+      - name: Type check frontend
+        run: npm run check --prefix frontend
       - name: Build frontend
         run: npm run build --prefix frontend
 
@@ -33,5 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
-      - name: Run pytest
-        run: pytest backend/tests
+          if [ -f backend/requirements-brokers.txt ]; then pip install -r backend/requirements-brokers.txt; fi
+          pip install pytest pytest-asyncio
+      - name: Run backend tests
+        run: python -m pytest backend/tests
