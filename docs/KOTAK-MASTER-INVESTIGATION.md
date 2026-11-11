@@ -64,3 +64,14 @@ Traceback diagnostics must preserve every exception-chain frame (file, line, fun
 - [Official native-field examples](https://github.com/Kotak-Neo/kotak-neo-python/blob/main/docs/functions/market_data/search_scrip.md)
 
 The pinned wheel documents the installed SDK; the fresh official source and changelog document the newer published conversion rules. Their difference is material and must remain explicit. Production catalog publication and authenticated feed verification are separate checks.
+
+
+## Contract status timeout reported on 11 November 2026
+
+The browser's status request times out after 10 seconds. The previous refresh POST waited for the entire download, parsing, cache validation and publication before returning. The browser separately waited up to 90 seconds for that POST. Status also called live_universe, potentially constructing every option-chain group solely to answer a metadata question.
+
+The repair admits one server-owned refresh job and returns HTTP 202 immediately. Its own database session is independent of the browser request. Later requests join the running job. The browser polls status and retries temporary status failures with bounded backoff, without repeating an uncertain POST. Status uses cached catalog counts instead of constructing the full option-chain universe. Safe job stages and the completion timestamp are exposed. The CSV date label explicitly refers to the last verified catalog. Existing source-date validation, atomic publication and paper-trade identity checks remain in force.
+
+Public health checks returned HTTP 200 for liveness and database readiness, and an unauthenticated status request returned HTTP 401. Private production logs and the current authenticated Scrip Master response could not be read because the computer-control connection was unavailable. Therefore neither the exact production download failure nor the cause of the provider's 137.66% CPU sample is established. The 9 November dates shown by the owner identify the saved catalog and cannot establish which files a new request returned. The supplied provider screenshot reports a range average of 4.25% and a peak of 137.66%.
+
+Regression checks cover immediate admission while a mocked download is blocked, duplicate requests joining one job, metadata-only status, owner and CSRF checks, browser polling, temporary status failures and an uncertain POST. Full-suite validation also corrects a pre-existing test expectation from HTTP 200 to HTTP 201, matching the trade-creation response deliberately introduced in commit 29439b3. No broker login or live WebSocket acceptance test is part of these checks.

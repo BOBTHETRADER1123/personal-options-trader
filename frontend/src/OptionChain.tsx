@@ -76,6 +76,76 @@ export async function contractRequest<T = Row>(path: string, options: RequestIni
     throw error;
   } finally { clearTimeout(timeout); parent?.removeEventListener('abort', abort); }
 }
+function waitForMasterStatus(signal: AbortSignal, delay: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => {
+      clearTimeout(timer);
+      reject(new DOMException('The status check was cancelled.', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', aborted);
+      resolve();
+    }, delay);
+    if (signal.aborted) aborted();
+    else signal.addEventListener('abort', aborted, { once: true });
+  });
+}
+
+async function readContractStatus(path: string, signal: AbortSignal): Promise<Row> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await contractRequest(path, { signal }); }
+    catch (error) {
+      const failure = error as Error & { status?: number };
+      if (signal.aborted || failure.name === 'AbortError' || failure.status === 401
+        || failure.status === 403 || attempt >= 2) throw error;
+      await waitForMasterStatus(signal, 2000 * 2 ** attempt);
+    }
+  }
+}
+
+export async function refreshContractMaster(
+  broker: string, signal: AbortSignal, onStatus: (status: Row) => void,
+): Promise<Row> {
+  const statusPath = '/api/option-chain/master/status?broker=' + broker;
+  let status = await readContractStatus(statusPath, signal);
+  onStatus(status);
+  if (!status.refresh_in_progress) {
+    let response: Row;
+    try {
+      response = await contractRequest('/api/option-chain/master/refresh?broker=' + broker,
+        { method: 'POST', signal });
+    } catch (error) {
+      // An uncertain POST may have started a job. Only read status afterwards.
+      status = await readContractStatus(statusPath, signal);
+      onStatus(status);
+      if (!status.refresh_in_progress) throw error;
+      response = { master: status };
+    }
+    status = response.master || status;
+    onStatus(status);
+    if (!status.refresh_in_progress) return response;
+  }
+  for (let poll = 0; poll < 90; poll++) {
+    await waitForMasterStatus(signal, 2000);
+    status = await readContractStatus(statusPath, signal);
+    onStatus(status);
+    if (!status.refresh_in_progress) {
+      return { ok: status.new_trades_allowed === true && !status.last_error, master: status };
+    }
+  }
+  throw new Error('The server is still refreshing contracts. Check refresh status shortly.');
+}
+
+export function contractRefreshProgress(master: Row): string {
+  const labels: Record<string, string> = {
+    queued: 'Contract refresh queued.',
+    downloading: 'Downloading and validating official Kotak contract files.',
+    validating_cache: 'Validating the replacement contract catalog.',
+    publishing: 'Publishing the verified contract catalog.',
+  };
+  return labels[String(master.refresh_stage)] || 'Checking the contract refresh status.';
+}
+
 export function contractMasterBlocked(master: Row): boolean {
   return master.stale === true || master.new_trades_allowed === false || (master.stale !== false && master.fresh !== true);
 }
@@ -209,10 +279,7 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
     const controller = new AbortController(); masterController.current = controller;
     const statusPath = `/api/option-chain/master/status?broker=${broker}`;
     try {
-      const status = await contractRequest(statusPath, { signal: controller.signal });
-      setMaster(status);
-      if (status.refresh_in_progress) { onNotify('A contract refresh is already running. Check status before starting another.'); return; }
-      const result = await contractRequest(`/api/option-chain/master/refresh?broker=${broker}`, { method: 'POST', signal: controller.signal }, 90000);
+      const result = await refreshContractMaster(broker, controller.signal, setMaster);
       if (result.master) setMaster(result.master);
       if (result.ok !== false) setCatalogRevision(v => v + 1);
       onNotify(result.master?.message || (result.ok === false ? contractMasterDiagnostic(result.master || {}) || 'Contract refresh failed. Existing contracts are retained.' : 'Kotak Neo contracts refreshed.'), result.ok === false);
@@ -314,7 +381,7 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
       <div className="oc-expiry-row"><span className="oc-control-label">Expiry</span><div className="oc-expiry-tabs">{(chain?.expiries || selected?.expiries || []).slice(0, 3).map(date => <button key={date} className={expiry === date ? 'active' : ''} aria-pressed={expiry === date} onClick={() => setExpiry(date)}>{expiryLabel(date)}</button>)}</div><label className="oc-next-expiry"><select aria-label="Select option expiry" value={expiry} disabled={!selected} onChange={e => setExpiry(e.target.value)}>{!(chain?.expiries || selected?.expiries || []).length && <option value="">Choose expiry</option>}{(chain?.expiries || selected?.expiries || []).map(date => <option key={date} value={date}>{expiryLabel(date, true)}</option>)}</select><ChevronDown size={13} /></label><div className="oc-freshness"><Clock3 size={12} />{chainLoading ? 'Refreshing…' : updatedAt ? `Updated ${time(updatedAt)}${age !== null ? ` · ${age}s ago` : ''}` : 'Awaiting data'}</div></div>
       <div className="oc-summary-row"><div><span>ATM IV</span><strong>{finite(summary.atm_iv) ? `${valueText(summary.atm_iv)}%` : '—'}</strong></div><div><span>Days to expiry</span><strong>{valueText(summary.days_to_expiry, 0)}</strong></div><div><span>Market lot</span><strong>{valueText(summary.lot_size || selected?.lot_size, 0)}</strong></div><div><span>Put / call ratio</span><strong>{valueText(summary.pcr)}</strong></div><div className="oc-display-controls"><label title={canNormalize ? 'Divide OI and volume by each contract’s lot size' : 'This source does not declare quantity units'}><input type="checkbox" checked={inLots} disabled={!canNormalize} onChange={e => setInLots(e.target.checked)} />OI & volume in lots</label><label><input type="checkbox" checked={showBuildup} onChange={e => setShowBuildup(e.target.checked)} />Buildup</label><label><input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} />Auto refresh</label></div><div className="oc-action-tools"><button aria-label="Refresh option chain" title="Refresh option chain; minimum three seconds between requests" disabled={chainLoading || !selected || clock - lastRefresh.current < 3000} onClick={() => void loadChain(true)}><RefreshCw className={chainLoading ? 'oc-spin' : ''} size={16} /></button><div className="oc-settings" ref={settingsRef}><button aria-label="Choose option chain columns" aria-expanded={settingsOpen} title="Choose columns" onClick={() => setSettingsOpen(!settingsOpen)}><Settings2 size={17} /></button>{settingsOpen && <div className="oc-column-popover"><strong>Chain columns</strong><p>LTP, strikes and buy/sell controls stay visible.</p>{COLUMNS.map(column => <label key={column.key}><input type="checkbox" checked={columns.includes(column.key)} onChange={e => setColumns(current => e.target.checked ? [...current, column.key] : current.filter(c => c !== column.key))} />{column.label}</label>)}<button onClick={() => setColumns(DEFAULT_COLUMNS)}>Reset columns</button></div>}</div></div></div>
 
-      {mode === 'live' && (contractMasterBlocked(master) || master.last_error || masterLoading) && <div className="oc-notice error" role="status"><ShieldCheck size={15} /><span>{masterLoading ? 'Checking and refreshing official Kotak contracts…' : contractMasterBlocked(master) ? 'Contract data is stale or unverified. New paper trades are blocked. Existing positions and history are preserved.' : ''} {contractMasterDiagnostic(master)}{contractMasterSources(master) && <small> Source CSV dates: {contractMasterSources(master)}.</small>}</span><button disabled={masterLoading} onClick={async () => { try { setMaster(await contractRequest(`/api/option-chain/master/status?broker=${broker}`)); } catch (error) { onNotify((error as Error).message, true); } }}>Check refresh status</button></div>}
+      {mode === 'live' && (contractMasterBlocked(master) || master.last_error || masterLoading) && <div className="oc-notice error" role="status"><ShieldCheck size={15} /><span>{(masterLoading || master.refresh_in_progress) ? contractRefreshProgress(master) : contractMasterBlocked(master) ? 'Contract data is stale or unverified. New paper trades are blocked. Existing positions and history are preserved.' : ''} {contractMasterDiagnostic(master)}{contractMasterSources(master) && <small> Last verified CSV dates: {contractMasterSources(master)}.</small>}</span><button disabled={masterLoading} onClick={async () => { try { setMaster(await contractRequest(`/api/option-chain/master/status?broker=${broker}`)); } catch (error) { onNotify((error as Error).message, true); } }}>Check refresh status</button></div>}
       {(mode === 'sample' || chain?.message || chain?.mode_matches_workspace === false || universeError || chainError) && <div className={`oc-notice ${chainError || universeError ? 'error' : ''}`} role={chainError || universeError ? 'alert' : 'status'}><ShieldCheck size={15} /><span>{chainError || universeError || chain?.message || (mode === 'sample' ? 'Fictional practice contracts and prices. Sample metrics are not exchange observations.' : '')}{chain?.mode_matches_workspace === false && <strong> Switch the workspace data mode in Settings before building a strategy from this chain.</strong>}</span>{chainError && <button onClick={() => void loadChain(true)}>Retry</button>}</div>}
       {chainLoading && !chain ? <div className="oc-empty"><Loader2 className="oc-spin" size={26} /><h3>Loading the option chain</h3><p>Matching contracts, strikes and available market fields.</p></div> : !rows.length ? <div className="oc-empty"><Layers size={27} /><h3>{universeLoading ? 'Loading F&O contracts' : selected ? 'No option chain available yet' : 'Choose an F&O stock or index'}</h3><p>{chainError || universeError || chain?.message || 'Search the instrument list, select an expiry, and the calls and puts will appear here.'}</p>{mode === 'live' && <button className="oc-secondary" onClick={updateMaster} disabled={masterLoading}>{masterLoading ? 'Updating…' : 'Refresh contract list'}</button>}</div> : <div className="oc-table-scroll" ref={tableRef} tabIndex={0} aria-label="Scrollable call and put option chain">
         {optionTable}

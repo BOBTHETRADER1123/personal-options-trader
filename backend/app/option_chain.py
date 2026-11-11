@@ -17,12 +17,12 @@ from pathlib import Path
 from typing import Literal
 from weakref import WeakKeyDictionary
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import JSON, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from . import engine
-from .database import Base, get_db, iso_now, bounded_read
+from .database import Base, get_db, iso_now, bounded_read, SessionLocal
 from .instruments import BROKERS, IST, normalize_row, ContractCatalog
 from .security import require_session
 from .models import LatestQuote, Trade
@@ -40,6 +40,8 @@ _requested: dict[str, tuple[float, set[str]]] = {}
 _attempts: dict[str, float] = {}
 _universes = WeakKeyDictionary()
 _refresh_states = WeakKeyDictionary()
+_master_summaries = WeakKeyDictionary()
+_master_jobs: dict[str, asyncio.Task] = {}
 MIN_INTERVAL = 3.0
 MASTER_REFRESH_SECONDS = 300  # Reuse a validated current catalog; not a failure cooldown.
 MASTER_RETRY_SECONDS = 15
@@ -193,23 +195,52 @@ def _refresh_state(broker):
     return states[broker]
 
 
+def _master_summary(broker):
+    """Status needs small metadata, without constructing the option-chain universe."""
+    catalog = engine.catalog
+    if catalog is None:
+        return 0, None
+    today = datetime.now(IST).date().isoformat()
+    key = (catalog.revision, today, broker)
+    cached = _master_summaries.get(catalog)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    groups, legacy_stamp = set(), None
+    for row in catalog._live:
+        if (row.get('broker') != broker or row.get('expiry', '') < today
+                or row.get('option_type') not in {'CE', 'PE'}):
+            continue
+        groups.add((row['exchange'], row['underlying']))
+        stamp = row.get('imported_at')
+        if stamp and (legacy_stamp is None or stamp < legacy_stamp):
+            legacy_stamp = stamp
+    result = (len(groups), legacy_stamp)
+    _master_summaries[catalog] = (key, result)
+    return result
+
+
 def master_status(db=None, broker='kotak'):
     validate_broker(broker)
-    rows = live_universe(broker)
+    count, legacy_stamp = _master_summary(broker)
     metadata = (getattr(engine.catalog, 'master_metadata', {}) or {}).get(broker, {})
     state = _refresh_state(broker)
     stamp = metadata.get('last_successful_refresh_at')
-    legacy_stamp = min((row['updated_at'] for row in rows.values() if row.get('updated_at')), default=None)
     segments = metadata.get('segments', {})
     today = datetime.now(IST).date().isoformat()
     verified = bool(stamp and age(stamp) <= 86400 and set(segments) == set(SEGMENTS)
                     and all(value.get('source_date') == today for value in segments.values()))
-    return {'status': 'ready' if rows else 'not_loaded', 'broker': broker,
+    job = _master_jobs.get(broker)
+    running = _master_lock.locked() or (job is not None and not job.done())
+    return {'status': 'ready' if count else 'not_loaded', 'broker': broker,
             'updated_at': stamp or legacy_stamp, 'last_successful_refresh_at': stamp,
             'last_attempt_at': state.get('last_attempt_at'), 'last_error': state.get('last_error'),
-            'refresh_in_progress': _master_lock.locked(), 'retry_after_seconds': max(0, math.ceil(MASTER_RETRY_SECONDS - (time.monotonic() - _attempts.get(broker, -MASTER_RETRY_SECONDS)))), 'segment_status': segments,
+            'refresh_stage': state.get('refresh_stage') if running else None,
+            'last_completed_at': state.get('last_completed_at'),
+            'refresh_in_progress': running,
+            'retry_after_seconds': max(0, math.ceil(MASTER_RETRY_SECONDS - (time.monotonic() - _attempts.get(broker, -MASTER_RETRY_SECONDS)))),
+            'segment_status': segments,
             'sources': [{'segment': segment, **details} for segment, details in segments.items()],
-            'source': 'selected_broker_instrument_master', 'underlying_count': len(rows),
+            'source': 'selected_broker_instrument_master', 'underlying_count': count,
             'stale': not verified, 'new_trades_allowed': verified, 'read_only': True}
 
 
@@ -317,13 +348,14 @@ async def refresh_master(db, force=False, broker='kotak'):
                     'message': f'Please wait {remaining} seconds before another contract refresh. Use Reconnect market feed for a dropped connection.'}
         _attempts[broker] = time.monotonic()
         state = _refresh_state(broker)
-        state.update(last_attempt_at=iso_now(), last_error=None)
+        state.update(last_attempt_at=iso_now(), last_error=None, refresh_stage='downloading')
         db.rollback()  # Release reader before network work or acquiring writer.
         try:
             contracts = await asyncio.to_thread(download_master, broker)
             for publication_attempt in range(3):
                 saved = _referenced_trades(db, broker)
                 retained = {leg.get('instrument_id') for trade in saved for leg in trade.get('legs', [])}
+                state['refresh_stage'] = 'validating_cache'
                 candidate = await asyncio.to_thread(prepare_master, broker, contracts, retained)
                 try:
                     async with _write_lock:
@@ -336,6 +368,7 @@ async def refresh_master(db, force=False, broker='kotak'):
                         if (required & previous) - available:
                             continue
                         _assert_active_identities(candidate, latest)
+                        state['refresh_stage'] = 'publishing'
                         publish_master(candidate)
                         break
                 finally:
@@ -351,6 +384,7 @@ async def refresh_master(db, force=False, broker='kotak'):
         # A failed refresh can be retried after a short cooldown from completion,
         # with one in-flight import; the validated catalog cache remains separate.
         _attempts[broker] = time.monotonic()
+        state.update(last_completed_at=iso_now(), refresh_stage=None)
         try:
             await asyncio.to_thread(_persist_refresh_state, broker, dict(state))
         except OSError as exc:
@@ -517,12 +551,56 @@ def get_master_status(broker: Literal['kotak'] = 'kotak'):
     return master_status(broker=broker)
 
 
+async def _run_master_job(broker):
+    # This session belongs to the job, never to a disconnected browser request.
+    try:
+        with SessionLocal() as db:
+            await refresh_master(db, force=True, broker=broker)
+    except asyncio.CancelledError:
+        state = _refresh_state(broker)
+        state.update(last_completed_at=iso_now(), refresh_stage=None,
+                     last_error={'code': 'refresh_interrupted', 'stage': 'server_shutdown', 'at': iso_now()})
+        await asyncio.to_thread(_persist_refresh_state, broker, dict(state))
+        raise
+    except Exception as exc:
+        state = _refresh_state(broker)
+        state.update(last_completed_at=iso_now(), refresh_stage=None,
+                     last_error={'code': 'refresh_job_failed', 'stage': 'refresh',
+                                 'exception_type': type(exc).__name__, 'at': iso_now()})
+        log.error('Kotak master job failed.\\n%s', safe_master_traceback(exc))
+
+
+async def shutdown_master_jobs():
+    jobs = [job for job in _master_jobs.values() if not job.done()]
+    for job in jobs:
+        job.cancel()
+    if jobs:
+        await asyncio.gather(*jobs, return_exceptions=True)
+    _master_jobs.clear()
+
+
 @router.post('/master/refresh')
-async def reload_master(broker: Literal['kotak'] = 'kotak', db: Session = Depends(get_db)):
-    result = await refresh_master(db, force=True, broker=broker)
-    # A contract refresh never logs in to Kotak or restarts a healthy feed.
-    # Owner-selected subscriptions are reconciled by the background scheduler.
-    return {'ok': bool(result['new_trades_allowed'] and not result.get('last_error')), 'master': result}
+async def reload_master(response: Response, broker: Literal['kotak'] = 'kotak'):
+    # Enqueue once and return immediately, so proxy/browser timeouts cannot own
+    # the lifetime of a large official CSV download and atomic publication.
+    current = await asyncio.to_thread(master_status, broker=broker)
+    if current['refresh_in_progress']:
+        response.status_code = 202
+        return {'ok': True, 'accepted': True, 'master': current}
+    if current['new_trades_allowed'] and age(current['updated_at']) < MASTER_REFRESH_SECONDS:
+        return {'ok': True, 'accepted': False, 'master': current}
+    if current['retry_after_seconds']:
+        response.status_code = 429
+        response.headers['Retry-After'] = str(current['retry_after_seconds'])
+        return {'detail': 'Please wait briefly before another contract refresh.', 'master': current}
+    # Recheck after the thread await to fence two requests admitted together.
+    running = _master_jobs.get(broker)
+    if running is None or running.done():
+        _master_jobs[broker] = asyncio.create_task(_run_master_job(broker), name='kotak-master-refresh')
+    response.status_code = 202
+    return {'ok': True, 'accepted': True, 'master': {
+        **current, 'refresh_in_progress': True, 'refresh_stage': 'queued',
+    }}
 
 
 def cached_live_data(db, contracts, expiry, stale_after, reference_contract=None):

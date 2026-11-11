@@ -21,13 +21,13 @@ function declaration(text,name){
  function visit(node){if(ts.isFunctionDeclaration(node)&&node.name?.text===name)result=node;else ts.forEachChild(node,visit);}
  visit(file);if(!result)throw Error('Missing actual function '+name);return result.getText(file);
 }
-const functions=['contractRequest','contractMasterBlocked','contractMasterDiagnostic','contractMasterSources'].map(name=>declaration(chain,name)).join('\n');
+const functions=['contractRequest','waitForMasterStatus','readContractStatus','refreshContractMaster','contractMasterBlocked','contractMasterDiagnostic','contractMasterSources'].map(name=>declaration(chain,name)).join('\n');
 const handler=page==='connections'?'reload':'updateMaster';
 const code=functions+'\n'+declaration(page==='connections'?pages:chain,handler);
 const compiled=ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
 let now=0,nextId=0,calls=[],notifications=[],loading=[],masters=[],revisions=0,refreshes=0;
 const timers=new Map(),masterInFlight={current:false},masterController={current:null};
-const context={exports:{},AbortController,Error,Number,Object,Array,Promise,
+const context={exports:{},AbortController,DOMException,Error,Number,Object,Array,Promise,
  setTimeout:(fn,delay)=>{const id=++nextId;timers.set(id,{fn,due:now+delay});return id;},clearTimeout:id=>timers.delete(id),
  masterInFlight,masterController,broker:'kotak',
  setMasterLoading:value=>loading.push(value),setBusy:value=>loading.push(value),
@@ -38,12 +38,17 @@ const context={exports:{},AbortController,Error,Number,Object,Array,Promise,
   calls.push({path,method:options.method||'GET',signal:options.signal});
   const post=options.method==='POST';
   if(scenario==='status-error'&&!post)return Promise.reject(Error('Status unavailable'));
-  if(!post)return Promise.resolve({stale:true,refresh_in_progress:scenario==='already-running'});
+  if(!post){
+   const gets=calls.filter(c=>c.method==='GET').length;
+   if(gets===1)return Promise.resolve({stale:true,refresh_in_progress:scenario==='already-running'});
+   if(['timeout','duplicate'].includes(scenario)&&gets===2)return Promise.resolve({stale:true,refresh_in_progress:true,refresh_stage:'downloading'});
+   if(scenario==='failure')return Promise.resolve({stale:true,new_trades_allowed:false,refresh_in_progress:false,last_error:{stage:'csv_columns',segment:'mcx_fo',code:'missing_columns',row_number:17}});
+   return Promise.resolve({stale:false,new_trades_allowed:true,refresh_in_progress:false,last_successful_refresh_at:'2026-11-04T03:35:00Z'});
+  }
   if(['timeout','duplicate','request-timeout','external-abort'].includes(scenario))return new Promise((resolve,reject)=>{
    options.signal.addEventListener('abort',()=>{const error=Error('Aborted');error.name='AbortError';reject(error);},{once:true});
   });
-  if(scenario==='failure')return Promise.resolve({ok:false,master:{stale:true,last_error:{stage:'csv_columns',segment:'mcx_fo',code:'missing_columns',row_number:17}}});
-  return Promise.resolve({ok:true,master:{stale:false,last_successful_refresh_at:'2026-11-04T03:35:00Z'}});
+  return Promise.resolve({ok:true,accepted:true,master:{stale:true,refresh_in_progress:true,refresh_stage:'queued'}});
  }};
 vm.createContext(context);vm.runInContext(compiled,context);
 const flush=async()=>{for(let i=0;i<20;i++)await Promise.resolve();};
@@ -65,7 +70,7 @@ const advance=async ms=>{const target=now+ms;while(true){let selected;for(const 
  }else{
   const work=context[handler]();await flush();
   if(scenario==='duplicate'){context[handler]();await flush();}
-  if(scenario==='timeout'||scenario==='duplicate')await advance(90000);
+  await advance(30000);
   await work;result={posts:calls.filter(c=>c.method==='POST').length,gets:calls.filter(c=>c.method==='GET').length,notifications,loading,masters,revisions,refreshes,busy:masterInFlight.current,timers:timers.size,paths:calls.map(c=>c.path)};
  }
  console.log(JSON.stringify(result));
@@ -116,9 +121,9 @@ def test_actual_refresh_handlers_do_not_duplicate_jobs_or_restart_feeds(page, sc
     else:
         assert result["posts"] == 1
     if scenario in ["timeout", "duplicate"]:
-        assert result["gets"] == 2  # Status read after timeout, never another POST.
-        assert any("server may still be working" in row["message"] for row in result["notifications"])
-    if scenario != "success":
+        assert result["gets"] == 3  # Recover the accepted job, then poll, never repeat POST.
+        assert not any(row["error"] for row in result["notifications"])
+    if scenario in ["status-error", "failure"]:
         assert result["revisions"] == 0 and result["refreshes"] == 0
     else:
         assert result["revisions"] == (1 if page == "chain" else 0)

@@ -549,6 +549,7 @@ async def lifespan(app):
     try:yield
     finally:
         stop_event.set()
+        await option_chain.shutdown_master_jobs()
         await feed_manager.stop()
         if collector_lease and collector_lease.token:
             with suppress(SQLAlchemyError):await asyncio.to_thread(collector_lease.release)

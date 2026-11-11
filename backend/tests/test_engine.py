@@ -189,7 +189,7 @@ def test_auth_csrf_origin_and_api_flow(db,monkeypatch):
         assert client.post('/api/risk',json={'legs':[{**valid_risk,'entry_price':'Infinity'}]},headers=headers).status_code==422
         c=contract();payload={'name':'Browser trade','underlying':'NIFTY','brokers':['kotak'],'legs':[{'instrument_id':c['id'],'side':'BUY','lots':1}],'idempotency_key':'browser-flow-001','confirmed':True}
         created=client.post('/api/trades',json=payload,headers=headers)
-        assert created.status_code==200 and len(created.json()['trades'])==1
+        assert created.status_code==201 and len(created.json()['trades'])==1
         trade=created.json()['trades'][0]
         assert client.get(f'/api/trades/{trade["id"]}').json()['events']
         changed=client.post('/api/auth/password',json={'current_password':'test strong password','new_password':'another strong password'},headers=headers)

@@ -3,7 +3,7 @@ import { ArrowDownToLine, Check, CheckCheck, Clock3, FileSpreadsheet, FolderChec
 import { api, API_BASE, brokers, brokerLabel, money, time } from './api';
 import { Badge, Empty, Help, Modal, Panel, Stat } from './components';
 import type { Row } from './components';
-import { contractRequest, contractMasterBlocked, contractMasterDiagnostic, contractMasterSources } from './OptionChain';
+import { contractRequest, contractMasterBlocked, contractMasterDiagnostic, contractMasterSources, refreshContractMaster } from './OptionChain';
 
 export async function downloadReport(job:Row,kind:'xlsx'|'csv_gz'='xlsx'){
  let filename=job.filename||`Trade_${job.trade_id}.xlsx`,checksum=job.checksum;
@@ -96,9 +96,7 @@ export function ConnectionsPage({accounts,quotes,onRefresh,notify}:{accounts:Row
   masterInFlight.current=true;setBusy('kotak');
   const controller=new AbortController();masterController.current=controller;
   try{
-   const status=await contractRequest('/api/option-chain/master/status?broker=kotak',{signal:controller.signal});setMasterStatus(status);setMasterStatusError('');
-   if(status.refresh_in_progress){notify('A contract refresh is already running. Check status before starting another.');return;}
-   const result=await contractRequest('/api/option-chain/master/refresh?broker=kotak',{method:'POST',signal:controller.signal},90000);
+   const result=await refreshContractMaster('kotak',controller.signal,status=>{setMasterStatus(status);setMasterStatusError('');});
    if(result.master)setMasterStatus(result.master);
    if(result.ok!==false)onRefresh();
    notify(result.master?.message||(result.ok===false?contractMasterDiagnostic(result.master||{})||'Contract refresh failed. Existing contracts are retained.':'Kotak Neo contracts refreshed.'),result.ok===false);
@@ -144,7 +142,7 @@ export function ConnectionsPage({accounts,quotes,onRefresh,notify}:{accounts:Row
   {statusError&&<div className="inline-error" role="status">{statusError}<button className="text-btn" disabled={Boolean(busy)} onClick={()=>void refreshConfiguration()}>Refresh connection status<RefreshCw size={14}/></button></div>}
   <div className="connection-grid"><section className="panel connection-card"><div className="connection-title"><span className="broker-logo kotak">K</span><Badge tone={statusTone}>{statusLabel}</Badge></div><h2>Kotak Neo</h2><p>Live broker quotes for simulated trades</p><div className="connection-data"><div><span>Latest quote received</span><strong>{time(account.feed?.last_quote_at||last.received_at)}</strong></div><div><span>Subscribed contracts</span><strong>{account.feed?.subscriptions??(state==='demo'?new Set(own.map(q=>q.instrument_id)).size:'—')}</strong></div><div><span>Reconnect attempts</span><strong>{account.feed?.reconnect_count??'—'}</strong></div><div><span>Broker margin</span><strong>Broker margin unavailable</strong></div><div><span>Trading sessions</span><strong>{connectionHealth?sessionSummary:healthError?'Status unavailable':'Checking verified schedule…'}</strong></div><div><span>Last successful contract refresh</span><strong>{masterStatus?.last_successful_refresh_at?`${time(masterStatus.last_successful_refresh_at,true)} IST`:masterStatus?'Never verified':'Status unavailable'}</strong></div><div><span>Contract master</span><strong>{masterStatus?.refresh_in_progress?'Refresh in progress':masterStatus?contractMasterBlocked(masterStatus)?'Stale / unverified · new trades blocked':'Current verified contracts':'Status unavailable'}</strong></div></div>
    {masterStatusError&&<div className="inline-error" role="status">{masterStatusError}<button className="text-btn" disabled={Boolean(busy)} onClick={()=>void refreshConfiguration()}>Check refresh status<RefreshCw size={14}/></button></div>}
-   {masterStatus&&(contractMasterBlocked(masterStatus)||masterStatus.last_error)&&<Help>{contractMasterBlocked(masterStatus)&&'New paper trades require current verified contracts. Existing positions and one-second history are preserved. '}{contractMasterDiagnostic(masterStatus)}{contractMasterSources(masterStatus)&&` Source CSV dates: ${contractMasterSources(masterStatus)}.`}</Help>}
+   {masterStatus&&(contractMasterBlocked(masterStatus)||masterStatus.last_error)&&<Help>{contractMasterBlocked(masterStatus)&&'New paper trades require current verified contracts. Existing positions and one-second history are preserved. '}{contractMasterDiagnostic(masterStatus)}{contractMasterSources(masterStatus)&&` Last verified CSV dates: ${contractMasterSources(masterStatus)}.`}</Help>}
    <Help>{!setupStatus?'Loading private setup status…':setupStatus.stored?'Your Kotak setup is saved in encrypted server storage. Existing values are never displayed here.':setupStatus?.configured?'Kotak connection details are configured privately on the server.':'Add your Kotak application and registered authenticator details to enable its market feed.'}</Help>
    {feedDetail&&<div className={['error','authentication_required'].includes(state)?'inline-error':'help-note'}>{feedDetail}</div>}
    {healthError&&<Help>The trading schedule is temporarily unavailable. Check the connection status and quote times before placing a paper trade.</Help>}
