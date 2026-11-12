@@ -7,6 +7,7 @@ Legacy chain tables remain defined so historical databases load without loss.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -249,7 +250,23 @@ def download_master(broker):
     return official_master_download()
 
 
-def prepare_master(broker, contracts, retained_ids=None):
+_IDENTITY_FIELDS = ('expiry', 'underlying', 'exchange', 'segment', 'option_type', 'strike', 'lot_size')
+
+
+def _contract_identity(row):
+    return tuple(row.get(key) for key in _IDENTITY_FIELDS)
+
+
+def _qualified_contract_id(row):
+    # Official tokens may be reused after expiry. This ID is local only;
+    # subscriptions continue using the unchanged official segment and token.
+    values = [row[key] for key in _IDENTITY_FIELDS[:-2]]
+    values.extend((format(float(row['strike']), '.15g'), int(row['lot_size'])))
+    digest = hashlib.sha256(json.dumps(values, separators=(',', ':')).encode()).hexdigest()[:32]
+    return f"{row['broker']}:{row['segment']}:{row['token']}:contract:{digest}"
+
+
+def prepare_master(broker, contracts, retained_ids=None, retained_trades=None):
     """Validate a complete replacement before atomic publication; no trade writes."""
     path = engine.catalog.path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,11 +277,66 @@ def prepare_master(broker, contracts, retained_ids=None):
     new_ids = {row['id'] for row in imported}
     if len(new_ids) != len(imported):
         raise MasterRefreshError('duplicate_contract_id', 'cache_validation')
-    # Saved journal legs are immutable history. Missing old identities can still
-    # be marked/exited, but must not certify a new exposure after a refresh.
+    # Never relabel a journal leg when the broker recycles an expired token.
+    # The old cache may already contain the recycled identity, so restore an
+    # expired active leg from its immutable journal fields rather than that cache.
     previous = engine.catalog._live
-    retained = [{**row, 'master_active': False} for row in previous
-                if row.get('broker') == broker and row['id'] in retained_ids and row['id'] not in new_ids]
+    preserved = {row['id']: {**row, 'master_active': False} for row in previous
+                 if row.get('broker') == broker and row['id'] in retained_ids}
+    today = datetime.now(IST).date().isoformat()
+    saved_identities = {}
+    for trade in retained_trades or ():
+        if trade.get('broker') != broker or trade.get('demo') is not False or trade.get('status') not in {'open', 'pending'}:
+            continue
+        for leg in trade.get('legs', []):
+            if leg.get('status') not in {'open', 'pending'} or leg.get('segment') not in SEGMENTS:
+                continue
+            identifier = leg.get('instrument_id')
+            identity = _contract_identity(leg)
+            if identifier in saved_identities and saved_identities[identifier] != identity:
+                raise MasterRefreshError('conflicting_saved_contract_identities', 'cache_validation')
+            saved_identities[identifier] = identity
+            try:
+                expired = datetime.strptime(leg['expiry'], '%Y-%m-%d').date().isoformat() < today
+            except (KeyError, TypeError, ValueError):
+                raise MasterRefreshError('invalid_saved_contract_identity', 'cache_validation') from None
+            if not expired:
+                continue  # An unexpired identity change still fails the publication guard.
+            base = f"{broker}:{leg['segment']}:{leg.get('token')}"
+            if (not isinstance(identifier, str) or not str(leg.get('token', '')).isdigit()
+                    or (identifier != base and not identifier.startswith(base + ':contract:'))):
+                raise MasterRefreshError('invalid_saved_contract_identity', 'cache_validation')
+            preserved[identifier] = {**leg, 'id': identifier, 'instrument_id': identifier,
+                                     'broker': broker, 'demo': False, 'master_active': False,
+                                     'restored_from_trade': True}
+    # Keep an already-qualified current identity stable even if its old base
+    # token is no longer referenced. This avoids duplicate aliases on restart.
+    qualified = {(row['segment'], str(row['token']), _contract_identity(row)): row['id'] for row in previous
+                 if row.get('broker') == broker and ':contract:' in row['id']}
+    qualified.update({(row['segment'], str(row['token']), _contract_identity(row)): identifier for identifier, row in preserved.items()
+                      if ':contract:' in identifier})
+    separated = 0
+    resolved = []
+    for contract in imported:
+        original = preserved.get(contract['id'])
+        if original and _contract_identity(original) != _contract_identity(contract):
+            if original['expiry'] >= today:
+                raise MasterRefreshError('active_contract_identity_changed', 'cache_validation')
+            identifier = _qualified_contract_id(contract)
+            contract = {**contract, 'id': identifier, 'instrument_id': identifier}
+            separated += 1
+        else:
+            identifier = qualified.get((contract['segment'], str(contract['token']), _contract_identity(contract))) if qualified else None
+            if identifier:
+                contract = {**contract, 'id': identifier, 'instrument_id': identifier}
+        resolved.append(contract)
+    imported = resolved
+    new_ids = {row['id'] for row in imported}
+    if len(new_ids) != len(imported):
+        raise MasterRefreshError('duplicate_contract_id', 'cache_validation')
+    retained = [row for identifier, row in preserved.items() if identifier not in new_ids]
+    if separated:
+        log.info('Kotak master separated expired historical token identities count=%s', separated)
     rows = [row for row in previous if row.get('broker') != broker] + imported + retained
     metadata = dict(getattr(engine.catalog, 'master_metadata', {}) or {})
     metadata[broker] = dict(getattr(contracts, 'metadata', {}))
@@ -289,7 +361,7 @@ def prepare_master(broker, contracts, retained_ids=None):
 
 def _assert_active_identities(candidate, trades):
     current = {row['id']: row for row in candidate._live}
-    keys = ('expiry', 'underlying', 'exchange', 'segment', 'option_type', 'strike', 'lot_size')
+    keys = _IDENTITY_FIELDS
     for trade in trades:
         if trade.get('demo') is not False or trade.get('status') not in {'open', 'pending'}:
             continue
@@ -356,7 +428,7 @@ async def refresh_master(db, force=False, broker='kotak'):
                 saved = _referenced_trades(db, broker)
                 retained = {leg.get('instrument_id') for trade in saved for leg in trade.get('legs', [])}
                 state['refresh_stage'] = 'validating_cache'
-                candidate = await asyncio.to_thread(prepare_master, broker, contracts, retained)
+                candidate = await asyncio.to_thread(prepare_master, broker, contracts, retained, saved)
                 try:
                     async with _write_lock:
                         # Recheck trades created while staging, releasing the
