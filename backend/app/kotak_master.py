@@ -25,6 +25,8 @@ SEGMENTS = ('nse_fo', 'bse_fo', 'mcx_fo')
 STOCK_SEGMENT = 'nse_cm'
 MAX_BYTES = 100 * 1024 * 1024
 MAX_STOCK_BYTES = 12 * 1024 * 1024
+DERIVATIVE_REFRESH_SECONDS = 240
+STOCK_REFRESH_SECONDS = 80
 # Official troubleshooting describes 424 as a temporary dependency failure.
 # Bounded retries are safe here because this endpoint only reads the master.
 RETRY_STATUSES = {408, 424, 429, 500, 502, 503, 504}
@@ -259,7 +261,7 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep, s
     owned_client = client is None
     moment = now or datetime.now(timezone.utc)
     today, stamp = moment.astimezone(IST).date().isoformat(), moment.isoformat()
-    deadline = clock() + 80
+    deadline = clock() + (STOCK_REFRESH_SECONDS if segments == (STOCK_SEGMENT,) else DERIVATIVE_REFRESH_SECONDS)
     max_bytes = MAX_STOCK_BYTES if segments == (STOCK_SEGMENT,) else MAX_BYTES
     if client is None:
         os.environ['NEO_LOG_LEVEL'] = 'NOLOG'
@@ -339,6 +341,8 @@ def download(*, client=None, now=None, clock=time.monotonic, sleep=time.sleep, s
                 raw = retry(fetch, stage='csv_download', segment=segment, deadline=deadline, clock=clock, sleep=sleep)
                 total += len(raw)
                 rows, details = parse_csv(raw, segment, today=today, stamp=stamp)
+                if clock() >= deadline:
+                    raise MasterRefreshError('refresh_deadline_exceeded', 'csv_validation', segment=segment)
                 result.extend(rows)
                 details.update(source_url=url, source_date=source_date(url))
                 metadata[segment] = details

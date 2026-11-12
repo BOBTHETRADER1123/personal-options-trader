@@ -298,3 +298,30 @@ def test_current_official_csv_redirect_with_unchanged_filename_is_allowed(monkey
     batch=download(client=client,now=NOW)
     assert len(batch)==3 and len(requests)==6
     assert all('authorization' not in request.headers for request in requests)
+
+
+@pytest.mark.parametrize('validation_seconds, succeeds', [(45, True), (100, False)])
+def test_three_segment_refresh_has_bounded_budget_for_download_and_validation(monkeypatch, validation_seconds, succeeds):
+    from app import kotak_master as master
+    client, _ = fake_client([httpx.Response(200, json={'data': {'filesPaths': list(paths().values())}})])
+    elapsed, downloaded = [0], []
+    def handler(request):
+        segment = request.url.path.rsplit('/', 1)[-1].removesuffix('.csv')
+        downloaded.append(segment)
+        return httpx.Response(200, content=csv_bytes([row(segment)]), headers={'content-type': 'text/csv'})
+    original_client, original_parse = httpx.Client, master.parse_csv
+    monkeypatch.setattr(master.httpx, 'Client', lambda **kw: original_client(transport=httpx.MockTransport(handler), **kw))
+    def slow_validation(*args, **kwargs):
+        result = original_parse(*args, **kwargs)
+        elapsed[0] += validation_seconds
+        return result
+    monkeypatch.setattr(master, 'parse_csv', slow_validation)
+    if succeeds:
+        result = download(client=client, now=NOW, clock=lambda: elapsed[0], sleep=lambda _: None)
+        assert len(result) == 3 and set(result.metadata['segments']) == set(SEGMENTS)
+        assert elapsed[0] == 135
+    else:
+        with pytest.raises(MasterRefreshError) as error:
+            download(client=client, now=NOW, clock=lambda: elapsed[0], sleep=lambda _: None)
+        assert error.value.details == {'code': 'refresh_deadline_exceeded', 'stage': 'csv_validation', 'segment': 'mcx_fo'}
+    assert downloaded == list(SEGMENTS)

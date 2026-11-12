@@ -125,7 +125,7 @@ export async function refreshContractMaster(
     onStatus(status);
     if (!status.refresh_in_progress) return response;
   }
-  for (let poll = 0; poll < 90; poll++) {
+  for (let poll = 0; poll < 180; poll++) {
     await waitForMasterStatus(signal, 2000);
     status = await readContractStatus(statusPath, signal);
     onStatus(status);
