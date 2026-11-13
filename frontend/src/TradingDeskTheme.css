@@ -385,3 +385,4 @@ td {border-color:var(--border);font-size:12px;padding:16px 18px}
 @media(max-width:860px) {.sidebar {visibility:hidden}.sidebar.open {visibility:visible}}
 
 .page-overview .stat-value:not(.positive) {color:var(--red)}
+@media(max-width:860px) {.mobile-dock {grid-template-columns:repeat(6,minmax(0,1fr));padding-left:4px;padding-right:4px}.mobile-dock button {font-size:9px;gap:7px;padding:9px 1px}}

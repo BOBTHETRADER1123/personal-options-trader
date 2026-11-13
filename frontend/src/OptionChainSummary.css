@@ -1,0 +1,82 @@
+/* Reference chain metrics and bounded paper-record summaries. */
+.oc-reference-summary {
+  padding: 0 18px 17px;
+  font-variant-numeric: tabular-nums;
+}
+.ocs-metrics,
+.ocs-accounts {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 10px;
+}
+.ocs-accounts { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.ocs-card {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--oc-border, var(--border));
+  border-radius: 12px;
+  background: var(--oc-panel-raised, var(--panel-raised));
+}
+.ocs-label {
+  display: block;
+  color: var(--oc-muted, var(--muted));
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.6;
+  letter-spacing: .055em;
+  text-transform: uppercase;
+}
+.ocs-value {
+  display: block;
+  margin-top: 4px;
+  color: var(--oc-text, var(--text));
+  font-size: 20px;
+  font-weight: 650;
+  line-height: 1.5;
+  letter-spacing: -.025em;
+  overflow-wrap: anywhere;
+}
+.ocs-value.ocs-positive { color: var(--oc-mint, var(--mint)); }
+.ocs-value.ocs-negative { color: var(--oc-red, var(--red)); }
+.ocs-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--oc-muted, var(--muted));
+  font-size: 10px;
+  line-height: 1.6;
+}
+.ocs-paper-account { margin-top: 13px; }
+.ocs-scope {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  margin: 0 0 9px;
+  color: var(--oc-muted, var(--muted));
+  font-size: 10px;
+  line-height: 1.7;
+}
+.ocs-scope>span { color: var(--oc-text, var(--text)); }
+.ocs-accounts .ocs-value { font-size: 19px; }
+@media (max-width: 1250px) {
+  .ocs-metrics,
+  .ocs-accounts { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 860px) {
+  .oc-reference-summary { padding: 0 13px 14px; }
+  .ocs-metrics,
+  .ocs-accounts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .ocs-card { padding: 10px 11px; }
+  .ocs-value,
+  .ocs-accounts .ocs-value { font-size: 19px; }
+  .ocs-label { font-size: 10px; }
+}
+@media (max-width: 480px) {
+  .ocs-metrics,
+  .ocs-accounts { grid-template-columns: minmax(0, 1fr); }
+  .ocs-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; align-items: center; }
+  .ocs-value,
+  .ocs-accounts .ocs-value { margin-top: 0; font-size: 19px; text-align: right; }
+  .ocs-note { grid-column: 1/-1; }
+}

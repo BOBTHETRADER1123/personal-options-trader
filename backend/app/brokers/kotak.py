@@ -102,7 +102,18 @@ def parse_sfeed(message, contracts: dict, *, received_at=None, received_ns=None)
                             received_ns=received_ns, bid=bid, ask=ask,
                             volume=row.get("volume_traded_today"), open_interest=row.get("open_interest"),
                             exchange_timestamp=updated_at or traded_at, exchange_timestamp_basis=timestamp_basis,
-                            previous_close=row.get("close_price"), sequence=None, event_kind=f"sfeed_{row['type']}", raw_message=row)
+                            previous_close=row.get("close_price"), open=optional_ohlc(row.get("open_price")),
+                            high=optional_ohlc(row.get("high_price")), low=optional_ohlc(row.get("low_price")), sequence=None, event_kind=f"sfeed_{row['type']}", raw_message=row)
+
+
+def optional_ohlc(value):
+    """Optional official SFeed fields must not interrupt otherwise valid quotes.
+
+    Field names: Kotak-Neo/kotak-neo-python docs/guides/websocket.md.
+    """
+    if isinstance(value,bool):return None
+    try:return optional_price(value)
+    except (FeedProtocolError,TypeError,ValueError,OverflowError):return None
 
 
 class KotakFeed(ReadOnlyFeed):

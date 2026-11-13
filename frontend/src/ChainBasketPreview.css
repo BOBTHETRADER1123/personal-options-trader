@@ -1,0 +1,9 @@
+.oc-payoff-preview {display:grid;grid-template-columns:minmax(150px,250px) 1fr;align-items:center;gap:23px;padding:12px 18px;border-top:1px solid var(--oc-border);background:var(--oc-panel-raised)}
+.oc-payoff-graph {min-width:0;text-align:center}
+.oc-payoff-graph svg {display:block;width:100%;height:90px}
+.oc-payoff-graph>span {display:block;font-size:12px;color:var(--oc-muted);padding:14px}
+.oc-payoff-graph small {font-size:9px;color:var(--oc-muted);line-height:1.6;display:block}
+.oc-payoff-values {display:grid;gap:7px;font-size:11px;color:var(--oc-muted);line-height:1.6}
+.oc-payoff-values strong {color:var(--oc-text);font-weight:550;margin-left:6px;font-variant-numeric:tabular-nums}
+.oc-payoff-values p {font-size:10px;color:var(--amber);line-height:1.6;margin:0}
+@media(max-width:600px) {.oc-payoff-preview {grid-template-columns:1fr;padding:11px 13px;gap:11px}.oc-payoff-graph svg {height:65px}.oc-payoff-graph {max-width:220px;margin:auto}.oc-payoff-values {grid-template-columns:1fr 1fr;gap:6px}.oc-payoff-values>span:last-of-type,.oc-payoff-values>p {grid-column:1/-1}.oc-payoff-values span {font-size:10px}.oc-payoff-values strong {display:block;margin-left:0}}

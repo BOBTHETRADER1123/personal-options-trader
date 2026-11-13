@@ -23,6 +23,7 @@ from .database import iso_now
 from .models import (Setting, Trade, Event, Timeline, QuoteEvent, ActionRecord,
                      PendingQuote, LatestQuote, QuoteReceiptCounter, CompactQuoteReceipt,
                      PnlSnapshot, RecordingCursor, RecordingGap)
+from .trade_categories import instrument_category,trade_category,category_summary
 from .payoff import strategy_risk
 from .margin import unavailable_for_basket
 from .exchange_margin import exchange_margin_status
@@ -445,6 +446,7 @@ def store_trade(db,trade):
 
 def public_trade(trade,settings=None):
     result=refresh_trade_risk(copy.deepcopy(trade))
+    result['category']=trade_category(trade)
     result['broker_retired']=trade.get('broker') not in BROKERS
     if result['broker_retired']:result['broker_status']='Retired broker · preserved history'
     for leg in result['legs']:
@@ -564,8 +566,10 @@ def create_trades(db,payload):
                 newlegs=[new_leg(db,l,broker,settings,at) for l in legs]
                 if len(newlegs)>1 and any(l.get('option_type')=='EQ' for l in newlegs):
                     raise HTTPException(422,'Open each paper stock position as a single order.')
+                if len({instrument_category(leg) for leg in newlegs})>1:raise HTTPException(422,'Keep each paper strategy in one trading category: Stocks, F&O or Commodities.')
                 if any(l['underlying']!=payload['underlying'] for l in newlegs):raise HTTPException(422,'The selected contract belongs to a different underlying.')
                 trade={'id':ident('trade'),'strategy_id':action_id,'action_id':action_id,'name':payload['name'],'broker':broker,'underlying':payload['underlying'],'status':'open','mode':'PAPER','demo':settings['demo_mode'],'created_at':at,'closed_at':None,'legs':newlegs,'net_premium':sum(premium_cash_flow(l) for l in newlegs),'spot':catalog.find(legs[0]['instrument_id']).get('spot'),'mfe':None,'mae':None,'mfe_at':None,'mae_at':None,'dispatch_at':at,'processing_ms':(time.perf_counter_ns()-started)/1e6,'accounting_method':'weighted_average','export_queued':False}
+                trade['category']=trade_category(trade)
                 recalculate(trade,at);enforce_paper_buying_power(db,trade,settings);store_trade(db,trade);event(db,trade,'entry',{'legs':copy.deepcopy(newlegs),'action_id':action_id,'dispatch_at':at,'processing_ms':trade['processing_ms']});snapshot(db,trade,'entry');store_trade(db,trade)
                 results.append({'broker':broker,'success':True,'trade_id':trade['id'],'dispatch_at':at,'processing_ms':round(trade['processing_ms'],3),'trade':public_trade(trade,settings)})
         except HTTPException as error:
@@ -610,6 +614,10 @@ def apply_action(db,trade_id,payload):
     else:
         if trade['status'] not in ('open','pending'):raise HTTPException(409,'This trade has finished. Duplicate it to open a new paper trade.')
         if bool(trade['demo'])!=bool(settings['demo_mode']):raise HTTPException(409,"Switch to this trade's demo/market-data mode before modifying it.")
+        if action in ('add_leg','replace_leg') and payload.get('leg'):
+            selected=contract_for(payload['leg']['instrument_id'],trade['broker'],settings['demo_mode'])
+            if instrument_category(selected)!=trade_category(trade):
+                raise HTTPException(422,'A paper position must stay in its original Stocks, F&O or Commodities category. Open a separate strategy for another category.')
         leg=next((l for l in trade['legs'] if l['id']==payload.get('leg_id')),None)
         if action in ('add_lots','partial_exit','exit_leg','replace_leg','edit') and payload.get('leg_id') and not leg:raise HTTPException(404,'Leg not found.')
         if action=='settle_expiry':
@@ -1107,9 +1115,10 @@ def dashboard(db,statuses=None):
     # closed trades cross the WebSocket; old risk graphs are not copied/sent.
     with _cache_lock:
         source=[refresh_trade_risk(t) for t in state['trades'].values() if bool(t.get('demo'))==bool(settings['demo_mode']) and not t.get('history_hidden')]
-        trades=[{**{k:v for k,v in t.items() if k not in {'risk','legs'}},'legs':[{'open_lots':l.get('open_lots',0)} for l in t.get('legs',[])]} for t in source]
+        trades=[{**{k:v for k,v in t.items() if k not in {'risk','legs'}},'category':trade_category(t),'legs':[{'open_lots':l.get('open_lots',0)} for l in t.get('legs',[])]} for t in source]
         visible=[t for t in source if t['status'] in ('open','pending')]+sorted([t for t in source if t['status'] not in ('open','pending')],key=lambda t:t.get('created_at',''),reverse=True)[:50]
         visible_trades=[public_trade(t,settings) for t in visible]
+    categories=category_summary(trades)
     open_trades=[t for t in trades if t['status'] in ('open','pending')]
     local_now=datetime.now(timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo('Asia/Kolkata'))
     midnight=local_now.replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc).isoformat(timespec='microseconds')
@@ -1151,7 +1160,7 @@ def dashboard(db,statuses=None):
         if not portfolio or portfolio[-1]['net_pnl']!=summary['net_pnl']:
             portfolio.append({'timestamp':iso_now(),'net_pnl':summary['net_pnl'],'demo':settings['demo_mode']})
             del portfolio[:-250]
-        return {'summary':summary,'trade_counts':trade_counts,'brokers':brokers,'trades':visible_trades,'history_recent_limit':50,'history_has_more':len(trades)>len(visible_trades),'quotes':quotes,'timeline':[],
+        return {'summary':summary,'category_summary':categories,'trade_counts':trade_counts,'brokers':brokers,'trades':visible_trades,'history_recent_limit':50,'history_has_more':len(trades)>len(visible_trades),'quotes':quotes,'timeline':[],
                 'portfolio_timeline':copy.deepcopy(portfolio),'portfolio_timeline_complete':False,
                 'chart_notice':'Live session chart; Excel retains trade summaries and observed extrema.',
                 'feed_status':statuses or {},'mode':'PAPER','demo':settings['demo_mode'],
@@ -1180,4 +1189,4 @@ def dashboard(db,statuses=None):
             aggregate={'timestamp':point['timestamp'],'net_pnl':round(sum(values.values()),2)}
             if portfolio and portfolio[-1]['timestamp'][:19]==point['timestamp'][:19]:portfolio[-1]=aggregate
             else:portfolio.append(aggregate)
-    return {'summary':summary,'trade_counts':trade_counts,'brokers':brokers,'trades':visible_trades,'history_recent_limit':50,'history_has_more':len(trades)>len(visible_trades),'quotes':quotes,'timeline':points,'portfolio_timeline':portfolio,'portfolio_timeline_complete':portfolio_complete,'feed_status':statuses or {},'mode':'PAPER','demo':settings['demo_mode'],'recording_mode':settings['logging_mode'],'server_time':iso_now()}
+    return {'summary':summary,'category_summary':categories,'trade_counts':trade_counts,'brokers':brokers,'trades':visible_trades,'history_recent_limit':50,'history_has_more':len(trades)>len(visible_trades),'quotes':quotes,'timeline':points,'portfolio_timeline':portfolio,'portfolio_timeline_complete':portfolio_complete,'feed_status':statuses or {},'mode':'PAPER','demo':settings['demo_mode'],'recording_mode':settings['logging_mode'],'server_time':iso_now()}

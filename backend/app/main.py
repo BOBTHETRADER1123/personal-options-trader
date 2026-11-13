@@ -37,7 +37,7 @@ from .stocks import NSE_CASH, StockMaster
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
-from . import broker_setup
+from . import broker_setup, watchlists
 
 from .log_safety import install as install_safe_logs
 install_safe_logs()
@@ -67,6 +67,7 @@ sheets_service=None
 storage_archiver=None
 kotak_setup=None
 stock_master=None
+watchlist_service=watchlists.WatchlistService()
 _active_positions=[]
 _activity_until=0.0
 _viewers=0
@@ -849,6 +850,85 @@ async def reload_instruments():
         await refresh_selected_feeds(db,force=True)
     return {'ok':True,'live_contracts':len(catalog.all(demo=False))}
 
+class WatchlistCreate(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    name:str=Field(min_length=1,max_length=60)
+    revision:int|None=Field(default=None,ge=0,strict=True)
+
+class WatchlistUpdate(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    name:str|None=Field(default=None,min_length=1,max_length=60)
+    instrument_ids:list[str]|None=Field(default=None,max_length=watchlists.LIMITS['items_per_watchlist'])
+    revision:int|None=Field(default=None,ge=0,strict=True)
+
+
+def read_watchlist_snapshot(db,active_list_id=None):
+    with bounded_read(db):
+        settings=engine.get_settings(db)
+        status=(feed_manager.statuses() if feed_manager else feed_status).get('kotak',{})
+        payload,identifiers=watchlist_service.snapshot(db,catalog,settings,engine.latest_quote,engine.age_seconds,feed=status,active_list_id=active_list_id)
+    return payload,identifiers if not settings.get('demo_mode') else set()
+
+async def watchlist_snapshot(db,current,active_list_id=None):
+    payload,identifiers=await asyncio.to_thread(read_watchlist_snapshot,db,active_list_id)
+    owner='watchlist:'+current.token_hash
+    with _quote_selection_lock:
+        if identifiers:
+            if owner not in _quote_selection_requests and len(_quote_selection_requests)>=8:
+                oldest=min(_quote_selection_requests,key=lambda key:_quote_selection_requests[key][0])
+                _quote_selection_requests.pop(oldest,None)
+            _quote_selection_requests[owner]=(time.monotonic()+30,identifiers)
+        else:_quote_selection_requests.pop(owner,None)
+    touch_activity()
+    await refresh_selected_feeds(db)
+    return payload
+
+@app.get('/api/watchlists/search')
+def watchlist_search(q:str=Query('',max_length=100),category:Literal['stocks','fno','commodities']|None=None,
+                     limit:int=Query(30,ge=1,le=50),underlying:str|None=Query(None,max_length=60),
+                     expiry:str|None=Query(None,max_length=10),current=Depends(require_session),db=Depends(get_db)):
+    return watchlist_service.search(catalog,q,category,limit,underlying=underlying,expiry=expiry)
+
+@app.get('/api/watchlists')
+async def get_watchlists(active_list_id:str|None=Query(None,max_length=80),current=Depends(require_session),db=Depends(get_db)):
+    return await watchlist_snapshot(db,current,active_list_id)
+
+@app.post('/api/watchlists',status_code=201)
+async def create_watchlist(payload:WatchlistCreate,request:Request,current=Depends(require_session),db=Depends(get_db)):
+    rate_limit(request,'watchlist-edit',limit=60,seconds=60)
+    async with write_lock:
+        await ensure_writer(db)
+        def persist():
+            watchlist_service.mutate(db,catalog,'create',name=payload.name,revision=payload.revision)
+            db.commit()
+        await asyncio.to_thread(persist)
+    return await watchlist_snapshot(db,current)
+
+@app.patch('/api/watchlists/{watchlist_id}')
+async def edit_watchlist(watchlist_id:str,payload:WatchlistUpdate,request:Request,current=Depends(require_session),db=Depends(get_db)):
+    rate_limit(request,'watchlist-edit',limit=60,seconds=60)
+    async with write_lock:
+        await ensure_writer(db)
+        def persist():
+            watchlist_service.mutate(db,catalog,'update',list_id=watchlist_id,name=payload.name,
+                                    instrument_ids=payload.instrument_ids,revision=payload.revision)
+            db.commit()
+        await asyncio.to_thread(persist)
+    return await watchlist_snapshot(db,current)
+
+@app.delete('/api/watchlists/{watchlist_id}')
+async def delete_watchlist(watchlist_id:str,request:Request,revision:int|None=Query(None,ge=0),
+                          current=Depends(require_session),db=Depends(get_db)):
+    rate_limit(request,'watchlist-edit',limit=60,seconds=60)
+    async with write_lock:
+        await ensure_writer(db)
+        def persist():
+            watchlist_service.mutate(db,catalog,'delete',list_id=watchlist_id,revision=revision)
+            db.commit()
+        await asyncio.to_thread(persist)
+    return await watchlist_snapshot(db,current)
+
+
 @app.get('/api/stocks',dependencies=[Depends(require_session)])
 def list_stocks(q:str=Query('',max_length=100),limit:int=Query(25,ge=1,le=100),db=Depends(get_db)):
     if stock_master is None:
@@ -908,7 +988,7 @@ def resolve_quote_selection(db,items):
 def read_selected_quotes(db,contracts,stale_after):
     result=[]
     public_fields=('broker','instrument_id','underlying','exchange','segment','symbol','expiry','strike','option_type',
-                   'ltp','bid','ask','received_at','exchange_timestamp','open_interest','volume','previous_close','source','demo')
+                   'ltp','bid','ask','received_at','exchange_timestamp','open_interest','volume','previous_close','open','high','low','source','demo')
     for contract in contracts:
         identifier=contract.get('instrument_id',contract['id']);broker=contract['broker']
         quote=engine.latest_quote(db,identifier,broker)
@@ -1117,13 +1197,13 @@ async def websocket(ws:WebSocket):
                 last_send=time.monotonic()
             await asyncio.sleep(1)
         await ws.close(code=4401)
-    except (WebSocketDisconnect,RuntimeError):pass
+    except (WebSocketDisconnect,OSError,RuntimeError):pass
     except (TimeoutError,ValueError):
-        with suppress(RuntimeError):await ws.close(code=1013)
+        with suppress(WebSocketDisconnect,OSError,RuntimeError):await ws.close(code=1013)
     except SQLAlchemyError as error:
         log_database_error('Workspace stream',error)
         if is_database_unavailable(error):database_unavailable()
-        with suppress(RuntimeError):await ws.close(code=1013)
+        with suppress(WebSocketDisconnect,OSError,RuntimeError):await ws.close(code=1013)
     finally:
         if registration is not None:_dashboard_publisher.unregister(registration)
         if accepted:_viewers=max(0,_viewers-1)

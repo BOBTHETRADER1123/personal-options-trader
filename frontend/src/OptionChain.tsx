@@ -1,8 +1,11 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRight, Check, ChevronDown, ChevronUp, Clock3, DownloadCloud, Layers, Loader2, Minus, Plus, RefreshCw, Search, Settings2, ShieldCheck, Trash2, X } from 'lucide-react';
 import { api, money, num, time, uid } from './api';
 import type { Row } from './components';
 import './OptionChain.css';
+import OptionChainSummary from './OptionChainSummary';
+import ChainBasketPreview from './ChainBasketPreview';
+import { centerChainViewport, requireMarketChain, visibleStrikeRows } from './chainView';
 
 export type ChainSelection = {
   nonce: string;
@@ -18,13 +21,14 @@ export type ChainSelection = {
 type Underlying = { key: string; symbol: string; name: string; exchange: string; kind: string; expiries?: string[]; lot_size?: number; contract_count?: number };
 type ChainLeg = Row & { instrument_id: string; contract?: Row; ltp?: number | null; option_type: string; strike: number; expiry: string; lot_size: number };
 type StrikeRow = { strike: number; pcr?: number | null; atm?: boolean; itm_call?: boolean; itm_put?: boolean; ce?: ChainLeg | null; pe?: ChainLeg | null };
-type ChainResponse = Row & { underlying: Underlying; rows: StrikeRow[]; instruments: Row[]; quotes?: Row[]; summary: Row; expiries: string[]; expiry: string };
+type ChainResponse = Row & { demo?:boolean; mode?:'sample'|'live'; underlying: Underlying; rows: StrikeRow[]; instruments: Row[]; quotes?: Row[]; summary: Row; expiries: string[]; expiry: string };
 type BasketLeg = { key: string; side: 'BUY' | 'SELL'; lots: number; contract: Row; quote?: Row; data: ChainLeg };
 type BasketContext = { key: string; underlying: string; label: string; broker: string; mode: 'sample' | 'live'; tradingEnabled: boolean };
 type Column = { key: string; label: string; title: string; width: number; format: 'quantity' | 'percent' | 'number' | 'greek' | 'buildup' };
 const COLUMNS: Column[] = [
   { key: 'buildup', label: 'Buildup', title: 'Price and open-interest direction', width: 130, format: 'buildup' },
   { key: 'oi', label: 'OI', title: 'Open interest', width: 98, format: 'quantity' },
+  { key: 'oi_change', label: 'Chg OI', title: 'Open-interest change and reported buildup', width: 104, format: 'quantity' },
   { key: 'oi_change_percent', label: 'OI chg (%)', title: 'Open-interest change from the supplied prior value', width: 95, format: 'percent' },
   { key: 'volume', label: 'Volume', title: 'Traded volume', width: 98, format: 'quantity' },
   { key: 'volume_change_percent', label: 'Vol chg (%)', title: 'Volume change from the supplied prior volume', width: 98, format: 'percent' },
@@ -37,7 +41,7 @@ const COLUMNS: Column[] = [
   { key: 'ask', label: 'Ask', title: 'Best ask premium', width: 82, format: 'number' },
   { key: 'ltp_change_percent', label: 'LTP chg (%)', title: 'Premium change from the supplied previous close', width: 95, format: 'percent' },
 ];
-const DEFAULT_COLUMNS = COLUMNS.slice(0, 7).map(c => c.key);
+const DEFAULT_COLUMNS = ['oi', 'oi_change', 'volume', 'iv', 'delta'];
 const finite = (value: unknown): value is number => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
 function valueText(value: unknown, digits = 2) { return finite(value) ? num(Number(value), digits) : '—'; }
 function percentText(value: unknown) { return finite(value) ? `${Number(value) > 0 ? '+' : ''}${num(Number(value), 2)}%` : '—'; }
@@ -167,9 +171,12 @@ export function contractMasterSources(master: Row): string {
 }
 
 
-function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { initialMode?: 'sample' | 'live'; onBuildStrategy: (selection: ChainSelection) => void; onNotify: (message: string, error?: boolean) => void }) {
-  const [mode, setMode] = useState<'sample' | 'live'>(initialMode);
+function OptionChain({ paperTrades, onBuildStrategy, onNotify }: { paperTrades?: Row[]; onBuildStrategy: (selection: ChainSelection) => void; onNotify: (message: string, error?: boolean) => void }) {
+  // This screen only requests the independent Kotak market catalog and quotes.
+  const [mode] = useState<'sample' | 'live'>('live');
   const [broker, setBroker] = useState('kotak');
+  const [chainStyle,setChainStyle]=useState(()=>{try{const value=localStorage.getItem('pot-chain-style');return value&&['classic','terminal','aurora'].includes(value)?value:'aurora';}catch{return 'aurora';}});
+  useEffect(()=>{try{localStorage.setItem('pot-chain-style',chainStyle);}catch{/* Display preference remains usable without browser storage. */}},[chainStyle]);
   const [exchange, setExchange] = useState('all');
   const [query, setQuery] = useState(''), [searchTerm, setSearchTerm] = useState('');
   const [universe, setUniverse] = useState<Underlying[]>([]), [total, setTotal] = useState(0), [master, setMaster] = useState<Row>({});
@@ -182,10 +189,13 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
   const [showBuildup, setShowBuildup] = useState(true), [inLots, setInLots] = useState(false), [autoRefresh, setAutoRefresh] = useState(true);
   const [basket, setBasket] = useState<BasketLeg[]>([]), [basketContext, setBasketContext] = useState<BasketContext | null>(null), [basketOpen, setBasketOpen] = useState(true);
   const [clock, setClock] = useState(Date.now());
+  const [strikeWindow,setStrikeWindow]=useState('10');
+  const [strikeAnchor,setStrikeAnchor]=useState<{scope:string;strike:number}|null>(null);
+  const [centerRequest,setCenterRequest]=useState(0);
   const searchRef = useRef<HTMLDivElement>(null), settingsRef = useRef<HTMLDivElement>(null), tableRef = useRef<HTMLDivElement>(null), atmRef = useRef<HTMLTableRowElement>(null);
   const selectedRef = useRef<Underlying | null>(null), universeRequest = useRef(0), chainRequest = useRef(0), lastRefresh = useRef(0);
   const masterController = useRef<AbortController | null>(null), masterInFlight = useRef(false);
-  const scopeRef = useRef('sample:kotak'), initialScroll = useRef(''), chainController = useRef<AbortController | null>(null), chainInFlight = useRef(false);
+  const scopeRef = useRef('live:kotak'), initialScroll = useRef(''), chainController = useRef<AbortController | null>(null), chainInFlight = useRef(false);
   selectedRef.current = selected;
 
   useEffect(() => () => { masterController.current?.abort(); }, []);
@@ -238,6 +248,7 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
     try {
       const result = await api<ChainResponse>(`/api/option-chain?${params}`, { signal: controller.signal });
       if (request !== chainRequest.current || scopeRef.current !== scope) return;
+      requireMarketChain(result);
       setChain(result); if (result.master) setMaster(result.master); setClock(Date.now());
       if (!expiry && result.expiry) setExpiry(result.expiry);
       const latest = new Map((result.rows || []).flatMap(r => [r.ce, r.pe]).filter((l): l is ChainLeg => Boolean(l)).map(l => [l.instrument_id, l]));
@@ -258,21 +269,26 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
     const timer = setInterval(() => { if (document.visibilityState === 'visible') void loadChain(); }, interval);
     return () => clearInterval(timer);
   }, [autoRefresh, selected?.key, loadChain, chain?.status, chain?.refresh_after_seconds, chainError, mode]);
-  useEffect(() => {
-    const key = `${mode}:${selected?.key}:${expiry}`;
-    if (!chain?.rows.length || initialScroll.current === key || !atmRef.current || !tableRef.current) return;
-    const timer = setTimeout(() => {
-      const viewport = tableRef.current, row = atmRef.current;
-      if (viewport && row) { viewport.scrollTop = Math.max(0, row.offsetTop - viewport.clientHeight / 2 + row.clientHeight / 2); viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2); }
-      initialScroll.current = key;
-    }, 50);
-    return () => clearTimeout(timer);
-  }, [chain?.rows.length, chain?.atm_basis, mode, selected?.key, expiry]);
-
-  function changeScope(nextMode: 'sample' | 'live', nextBroker = broker) {
-    ++chainRequest.current; ++universeRequest.current;
-    setMode(nextMode); setBroker(nextBroker); setSelected(null); selectedRef.current = null; setExpiry(''); setChain(null); setQuery(''); setSearchTerm(''); setUniverse([]); setSearchOpen(false); setChainError(''); setUniverseError('');
+  const selectionScope = `${mode}:${broker}:${selected?.key}:${expiry}`;
+  const scrollScope = `${selectionScope}:${strikeWindow}`;
+  function centerAtm() {
+    const viewport = tableRef.current, row = atmRef.current;
+    if (!viewport || !row) return;
+    centerChainViewport(viewport,row);
   }
+  function goToAtm(){
+    const atm=chain?.rows.find(row=>row.atm);
+    if(!atm)return;
+    setStrikeAnchor({scope:selectionScope,strike:atm.strike});
+    initialScroll.current='';
+    setCenterRequest(value=>value+1);
+  }
+
+  function changeScope(nextBroker = broker) {
+    ++chainRequest.current; ++universeRequest.current;
+    setBroker(nextBroker); setSelected(null); selectedRef.current = null; setExpiry(''); setChain(null); setQuery(''); setSearchTerm(''); setUniverse([]); setSearchOpen(false); setChainError(''); setUniverseError('');
+  }
+
   async function updateMaster() {
     if (masterInFlight.current) return;
     masterInFlight.current = true; setMasterLoading(true);
@@ -319,7 +335,21 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
   }
 
   const activeColumns = useMemo(() => COLUMNS.filter(c => columns.includes(c.key) && (showBuildup || c.key !== 'buildup')), [columns, showBuildup]);
-  const rows = chain?.rows || [], summary = chain?.summary || {}, legColumnCount = activeColumns.length + 2;
+  const allRows = chain?.rows || [], summary = chain?.summary || {}, legColumnCount = activeColumns.length + 2;
+  const currentChain=chain?.underlying?.key===selected?.key&&chain?.expiry===expiry;
+  const anchor=strikeAnchor?.scope===selectionScope?strikeAnchor.strike:allRows.find(row=>row.atm)?.strike??null;
+  const rows=useMemo(()=>visibleStrikeRows(allRows,strikeWindow==='all'?null:Number(strikeWindow),anchor),[allRows,strikeWindow,anchor]);
+  useLayoutEffect(()=>{
+    if(!currentChain||strikeAnchor?.scope===selectionScope)return;
+    const atm=allRows.find(row=>row.atm);
+    if(atm)setStrikeAnchor({scope:selectionScope,strike:atm.strike});
+  },[allRows,currentChain,selectionScope,strikeAnchor?.scope]);
+  useLayoutEffect(()=>{
+    if(!currentChain||!rows.length||initialScroll.current===scrollScope||!atmRef.current||!tableRef.current)return;
+    centerAtm();initialScroll.current=scrollScope;
+    // Changing quotes/ATM flags keeps the selected anchor and the scroll offsets.
+  },[rows,currentChain,scrollScope,centerRequest]);
+  const tableWidth = 108 + 2 * (94 + 108 + activeColumns.reduce((total, column) => total + column.width, 0));
   const maxOi = useMemo(() => Math.max(1, ...rows.flatMap(r => [r.ce?.oi, r.pe?.oi]).filter(finite).map(Number)), [rows]);
   const updatedAt = chain?.updated_at || chain?.as_of;
   const updatedMs = updatedAt ? Date.parse(updatedAt) : NaN;
@@ -331,13 +361,15 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
   const canNormalize = chain?.quantity_unit === 'units';
   const premiumKnown = basket.length > 0 && basket.every(item => finite(item.data.ltp)&&(!item.contract.demo?Boolean(item.contract.price_multiplier)||item.contract.exchange!=='MCX':true));
   const premium = basket.reduce((sum, item) => sum + (item.side === 'BUY' ? -1 : 1) * Number(item.data.ltp || 0) * item.lots * Number(item.contract.lot_size || 1) * Number(item.contract.price_multiplier || 1), 0);
+  const payoffLegs=useMemo(()=>basket.map(item=>({...item.contract,broker:basketContext?.broker,underlying:item.contract.underlying||basketContext?.underlying,side:item.side,lots:item.lots,open_lots:item.lots,entry_price:finite(item.data.ltp)?Number(item.data.ltp):undefined})),[basket,basketContext]);
   const basketBuildEnabled = Boolean(basketContext?.tradingEnabled) && (mode==='sample'||(!contractMasterBlocked(master)&&basket.every(item=>!item.data.stale&&finite(item.data.ltp)))) && (!chain || basketContext?.key !== selected?.key || chain.mode_matches_workspace !== false);
 
   function renderCell(leg: ChainLeg | null | undefined, column: Column, side: 'ce' | 'pe') {
     const raw = leg?.[column.key], value = column.format === 'quantity' && inLots && canNormalize && finite(raw) && finite(leg?.lot_size) ? Number(raw) / Number(leg?.lot_size) : raw;
     if (column.format === 'buildup') return <td key={`${side}-${column.key}`} className="oc-buildup-cell"><span className={`oc-buildup ${buildupTone(raw)}`}>{raw ? String(raw).replace(/_/g, ' ') : '—'}</span></td>;
-    return <td key={`${side}-${column.key}`} className={`${column.format === 'percent' ? changeTone(value) : ''} ${column.key === 'oi' ? 'oc-oi-cell' : ''}`} title={finite(value) ? `${num(Number(value), 4)}${column.format === 'percent' ? '%' : ''}` : 'Not supplied by this source'}>
+    return <td key={`${side}-${column.key}`} className={`${column.format === 'percent' || column.key === 'oi_change' ? changeTone(value) : ''} ${column.key === 'oi' ? 'oc-oi-cell' : ''}`} title={finite(value) ? `${num(Number(value), 4)}${column.format === 'percent' ? '%' : ''}` : 'Not supplied by this source'}>
       {column.format === 'quantity' ? compact(value) : column.format === 'percent' ? percentText(value) : valueText(value, column.format === 'greek' ? 4 : 2)}
+      {column.key === 'oi_change' && showBuildup && leg?.buildup && <span className={`oc-inline-buildup ${buildupTone(leg.buildup)}`} title={String(leg.buildup)}>{({'long buildup':'LB','short buildup':'SB','short covering':'SC','long unwinding':'LU'} as Record<string,string>)[String(leg.buildup).toLowerCase().replace(/_/g,' ')] || String(leg.buildup)}</span>}
       {column.key === 'oi' && finite(raw) && <i className={`oc-oi-bar ${side}`} style={{ width: `${Math.max(0, Math.min(100, Number(raw) / maxOi * 100))}%` }} />}
     </td>;
   }
@@ -353,9 +385,9 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
 
   // Dashboard P&L messages arrive every second; unchanged strike cells do
   // not need to render again until their chain, controls or basket changes.
-  const optionTable = useMemo(() => (<table className="oc-table"><colgroup>{activeColumns.map(c => <col key={`ce-${c.key}`} style={{ width: c.width }} />)}<col style={{ width: 94 }} /><col style={{ width: 80 }} /><col style={{ width: 108 }} /><col style={{ width: 80 }} /><col style={{ width: 94 }} />{[...activeColumns].reverse().map(c => <col key={`pe-${c.key}`} style={{ width: c.width }} />)}</colgroup><thead><tr className="oc-side-head"><th colSpan={legColumnCount} className="oc-call-heading"><span>CALLS <i>CE</i></span><small>Call OI {compact(summary.total_call_oi)}</small></th><th rowSpan={2} className="oc-strike-heading">Strike price<small>Strike PCR</small></th><th colSpan={legColumnCount} className="oc-put-heading"><span>PUTS <i>PE</i></span><small>Put OI {compact(summary.total_put_oi)}</small></th></tr><tr className="oc-column-head">{activeColumns.map(c => <th key={`ce-${c.key}`} title={c.title}>{c.label}</th>)}<th>LTP <small>chg (%)</small></th><th>Buy / Sell</th><th>Buy / Sell</th><th>LTP <small>chg (%)</small></th>{[...activeColumns].reverse().map(c => <th key={`pe-${c.key}`} title={c.title}>{c.label}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.strike} className={row.atm ? 'oc-atm-row' : ''} ref={row.atm ? atmRef : undefined}>{activeColumns.map(c => renderCell(row.ce, c, 'ce'))}{ltpCell(row.ce)}{actions(row.ce, 'CE')}<th scope="row" className={`oc-strike-cell ${row.atm ? 'atm' : ''}`}><strong>{num(row.strike, row.strike % 1 ? 2 : 0)}</strong><small>{row.atm ? <span>{chain?.atm_basis === 'futures_reference' ? 'Near futures' : 'ATM'} {finite(chain?.atm_price) ? `· ${num(Number(chain?.atm_price))}` : ''}</span> : valueText(row.pcr)}</small></th>{actions(row.pe, 'PE')}{ltpCell(row.pe)}{[...activeColumns].reverse().map(c => renderCell(row.pe, c, 'pe'))}</tr>)}</tbody></table>), [rows, activeColumns, legColumnCount, maxOi, inLots, canNormalize, mode, basket, basketContext, selected, broker, chain, master, onNotify]);
+  const optionTable = useMemo(() => (<table className="oc-table" style={{width:tableWidth}}><colgroup>{activeColumns.map(c => <col key={`ce-${c.key}`} style={{ width: c.width }} />)}<col style={{ width: 94 }} /><col style={{ width: 108 }} /><col style={{ width: 108 }} /><col style={{ width: 108 }} /><col style={{ width: 94 }} />{[...activeColumns].reverse().map(c => <col key={`pe-${c.key}`} style={{ width: c.width }} />)}</colgroup><thead><tr className="oc-side-head"><th colSpan={legColumnCount} className="oc-call-heading"><span>CALLS <i>CE</i></span><small>Call OI {compact(summary.total_call_oi)}</small></th><th rowSpan={2} className="oc-strike-heading">Strike price<small>Strike PCR</small></th><th colSpan={legColumnCount} className="oc-put-heading"><span>PUTS <i>PE</i></span><small>Put OI {compact(summary.total_put_oi)}</small></th></tr><tr className="oc-column-head">{activeColumns.map(c => <th key={`ce-${c.key}`} title={c.title}>{c.label}</th>)}<th>LTP <small>chg (%)</small></th><th>Buy / Sell</th><th>Buy / Sell</th><th>LTP <small>chg (%)</small></th>{[...activeColumns].reverse().map(c => <th key={`pe-${c.key}`} title={c.title}>{c.label}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.strike} className={row.atm ? 'oc-atm-row' : ''} ref={row.atm ? atmRef : undefined}>{activeColumns.map(c => renderCell(row.ce, c, 'ce'))}{ltpCell(row.ce)}{actions(row.ce, 'CE')}<th scope="row" className={`oc-strike-cell ${row.atm ? 'atm' : ''}`}><strong>{num(row.strike, row.strike % 1 ? 2 : 0)}</strong><small>{row.atm ? <span>{chain?.atm_basis === 'futures_reference' ? 'Near futures' : 'ATM'} {finite(chain?.atm_price) ? `· ${num(Number(chain?.atm_price))}` : ''}</span> : valueText(row.pcr)}</small></th>{actions(row.pe, 'PE')}{ltpCell(row.pe)}{[...activeColumns].reverse().map(c => renderCell(row.pe, c, 'pe'))}</tr>)}</tbody></table>), [rows, activeColumns, legColumnCount, tableWidth, maxOi, inLots, canNormalize, mode, basket, basketContext, selected, broker, chain, master, onNotify]);
 
-  return <div className="option-chain-page">
+  return <div className="option-chain-page" data-chain-style={chainStyle}>
     <section className="oc-toolbar" aria-label="Option chain controls">
       <div className="oc-instrument-search" ref={searchRef}>
         <Search size={17} />
@@ -371,25 +403,27 @@ function OptionChain({ initialMode = 'sample', onBuildStrategy, onNotify }: { in
           {universeLoading && !universe.length ? <p className="oc-list-message"><Loader2 className="oc-spin" size={16} />Loading contracts…</p> : universe.length ? universe.map((item, index) => <button id={`oc-result-${index}`} role="option" aria-selected={item.key === selected?.key} className={index === searchIndex ? 'highlighted' : ''} key={item.key} onMouseEnter={() => setSearchIndex(index)} onClick={() => chooseUnderlying(item)}><span><strong>{item.symbol}</strong><small>{item.name || item.symbol}</small></span><span><i>{item.kind === 'index' ? 'INDEX' : item.kind === 'commodity'?'COMMODITY':'STOCK'}</i><small>{item.exchange}</small></span></button>) : <p className="oc-list-message">{universeError || 'No matching option contracts. Try the symbol or company name.'}</p>}
         </div>}
       </div>
-      <div className="oc-mode-switch" aria-label="Chain data mode"><button aria-pressed={mode === 'sample'} className={mode === 'sample' ? 'active' : ''} onClick={() => changeScope('sample')}>Sample chain</button><button aria-pressed={mode === 'live'} className={mode === 'live' ? 'active' : ''} onClick={() => changeScope('live')}>Market chain</button></div>
-      <label className="oc-source-select"><span>Exchange</span><select aria-label="Option chain exchange" value={exchange} onChange={e=>{setExchange(e.target.value);changeScope(mode,broker);}}><option value="all">All exchanges</option><option value="NSE">NSE</option><option value="BSE">BSE</option><option value="MCX">MCX</option></select></label><label className="oc-source-select"><span>Source</span><select aria-label="Option chain source" value={broker} onChange={e => changeScope(mode, e.target.value)}><option value="kotak">Kotak Neo</option></select></label>
+      <div className="oc-style-switch" role="group" aria-label="Option chain style">{['classic','terminal','aurora'].map(style=><button key={style} type="button" aria-pressed={chainStyle===style} className={chainStyle===style?'active':''} onClick={()=>setChainStyle(style)}>{style[0].toUpperCase()+style.slice(1)}</button>)}</div><span className="oc-live-source"><ShieldCheck size={14}/>Kotak Neo market data</span>
+      <label className="oc-source-select"><span>Exchange</span><select aria-label="Option chain exchange" value={exchange} onChange={e=>{setExchange(e.target.value);changeScope(broker);}}><option value="all">All exchanges</option><option value="NSE">NSE</option><option value="BSE">BSE</option><option value="MCX">MCX</option></select></label><label className="oc-source-select"><span>Source</span><select aria-label="Option chain source" value={broker} onChange={e => changeScope(e.target.value)}><option value="kotak">Kotak Neo</option></select></label>
       {mode === 'live' && <button className="oc-master-button" onClick={updateMaster} disabled={masterLoading} title="Refresh the official instrument master">{masterLoading ? <Loader2 className="oc-spin" size={15} /> : <DownloadCloud size={15} />}<span>Update contracts</span></button>}
     </section>
 
     <section className="oc-chain-panel">
       <div className="oc-chain-heading"><div><div className="oc-title-row"><h2>{selected?.symbol || 'Options'} <span>Option Chain</span></h2><span className={`oc-data-tag ${mode === 'sample' ? 'sample' : stale ? 'stale' : ''}`}><i />{mode === 'sample' ? 'SYNTHETIC SAMPLE' : stale ? 'STALE DATA' : chain?.status === 'connected' || chain?.status === 'live' ? 'MARKET DATA' : 'MARKET CATALOG'}</span></div><p>{selected ? `${selected.name || selected.symbol} · ${selected.exchange}` : 'Choose a stock or index to inspect its calls and puts.'}{mode === 'live' ? ` · Last successful master refresh: ${master.last_successful_refresh_at ? `${time(master.last_successful_refresh_at, true)} IST` : 'never completed'}` : ''}</p></div><div className="oc-spot" title={referenceIsFuture ? `${reference.symbol} · ${reference.note} · Received ${time(reference.quote_at, true)} IST` : undefined}><span>{mode === 'sample' ? 'Sample reference' : referenceIsFuture ? `Futures reference · ${expiryLabel(reference.expiry)}` : 'Underlying spot'}</span><strong>{valueText(displayedReference)}</strong>{referenceIsFuture && reference.stale && <small className="oc-negative">Stale reference</small>}</div></div>
+      <OptionChainSummary summary={summary} rows={allRows} selected={selected} trades={paperTrades} mode={mode} broker={broker}/>
       <div className="oc-expiry-row"><span className="oc-control-label">Expiry</span><div className="oc-expiry-tabs">{(chain?.expiries || selected?.expiries || []).slice(0, 3).map(date => <button key={date} className={expiry === date ? 'active' : ''} aria-pressed={expiry === date} onClick={() => setExpiry(date)}>{expiryLabel(date)}</button>)}</div><label className="oc-next-expiry"><select aria-label="Select option expiry" value={expiry} disabled={!selected} onChange={e => setExpiry(e.target.value)}>{!(chain?.expiries || selected?.expiries || []).length && <option value="">Choose expiry</option>}{(chain?.expiries || selected?.expiries || []).map(date => <option key={date} value={date}>{expiryLabel(date, true)}</option>)}</select><ChevronDown size={13} /></label><div className="oc-freshness"><Clock3 size={12} />{chainLoading ? 'Refreshing…' : updatedAt ? `Updated ${time(updatedAt)}${age !== null ? ` · ${age}s ago` : ''}` : 'Awaiting data'}</div></div>
-      <div className="oc-summary-row"><div><span>ATM IV</span><strong>{finite(summary.atm_iv) ? `${valueText(summary.atm_iv)}%` : '—'}</strong></div><div><span>Days to expiry</span><strong>{valueText(summary.days_to_expiry, 0)}</strong></div><div><span>Market lot</span><strong>{valueText(summary.lot_size || selected?.lot_size, 0)}</strong></div><div><span>Put / call ratio</span><strong>{valueText(summary.pcr)}</strong></div><div className="oc-display-controls"><label title={canNormalize ? 'Divide OI and volume by each contract’s lot size' : 'This source does not declare quantity units'}><input type="checkbox" checked={inLots} disabled={!canNormalize} onChange={e => setInLots(e.target.checked)} />OI & volume in lots</label><label><input type="checkbox" checked={showBuildup} onChange={e => setShowBuildup(e.target.checked)} />Buildup</label><label><input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} />Auto refresh</label></div><div className="oc-action-tools"><button aria-label="Refresh option chain" title="Refresh option chain; minimum three seconds between requests" disabled={chainLoading || !selected || clock - lastRefresh.current < 3000} onClick={() => void loadChain(true)}><RefreshCw className={chainLoading ? 'oc-spin' : ''} size={16} /></button><div className="oc-settings" ref={settingsRef}><button aria-label="Choose option chain columns" aria-expanded={settingsOpen} title="Choose columns" onClick={() => setSettingsOpen(!settingsOpen)}><Settings2 size={17} /></button>{settingsOpen && <div className="oc-column-popover"><strong>Chain columns</strong><p>LTP, strikes and buy/sell controls stay visible.</p>{COLUMNS.map(column => <label key={column.key}><input type="checkbox" checked={columns.includes(column.key)} onChange={e => setColumns(current => e.target.checked ? [...current, column.key] : current.filter(c => c !== column.key))} />{column.label}</label>)}<button onClick={() => setColumns(DEFAULT_COLUMNS)}>Reset columns</button></div>}</div></div></div>
+      <div className="oc-chain-controls"><label className="oc-strike-window">Strike range<select aria-label="Strike range" value={strikeWindow} onChange={event=>setStrikeWindow(event.target.value)}><option value="5">±5 strikes</option><option value="10">±10 strikes</option><option value="all">All strikes</option></select></label><div className="oc-display-controls"><label title={canNormalize ? 'Divide OI and volume by each contract’s lot size' : 'This source does not declare quantity units'}><input type="checkbox" checked={inLots} disabled={!canNormalize} onChange={e => setInLots(e.target.checked)} />OI & volume in lots</label><label><input type="checkbox" checked={showBuildup} onChange={e => setShowBuildup(e.target.checked)} />Buildup</label><label><input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} />Auto refresh</label></div><div className="oc-action-tools"><button aria-label="Refresh option chain" title="Refresh option chain; minimum three seconds between requests" disabled={chainLoading || !selected || clock - lastRefresh.current < 3000} onClick={() => void loadChain(true)}><RefreshCw className={chainLoading ? 'oc-spin' : ''} size={16} /></button><div className="oc-settings" ref={settingsRef}><button aria-label="Choose option chain columns" aria-expanded={settingsOpen} title="Choose columns" onClick={() => setSettingsOpen(!settingsOpen)}><Settings2 size={17} /></button>{settingsOpen && <div className="oc-column-popover"><strong>Chain columns</strong><p>LTP, strikes and buy/sell controls stay visible.</p>{COLUMNS.map(column => <label key={column.key}><input type="checkbox" checked={columns.includes(column.key)} onChange={e => setColumns(current => e.target.checked ? [...current, column.key] : current.filter(c => c !== column.key))} />{column.label}</label>)}<button onClick={() => setColumns(DEFAULT_COLUMNS)}>Reset columns</button></div>}</div></div></div>
+      <div className="oc-chain-tools"><button type="button" className="oc-secondary" onClick={goToAtm} disabled={!allRows.some(row=>row.atm)}>Go to ATM</button><span>Strikes stay fixed · quote updates preserve your scroll position</span></div>
 
       {mode === 'live' && (contractMasterBlocked(master) || master.last_error || masterLoading) && <div className="oc-notice error" role="status"><ShieldCheck size={15} /><span>{(masterLoading || master.refresh_in_progress) ? contractRefreshProgress(master) : contractMasterBlocked(master) ? 'Contract data is stale or unverified. New paper trades are blocked. Existing positions and history are preserved.' : ''} {contractMasterDiagnostic(master)}{contractMasterSources(master) && <small> Last verified CSV dates: {contractMasterSources(master)}.</small>}</span><button disabled={masterLoading} onClick={async () => { try { setMaster(await contractRequest(`/api/option-chain/master/status?broker=${broker}`)); } catch (error) { onNotify((error as Error).message, true); } }}>Check refresh status</button></div>}
       {(mode === 'sample' || chain?.message || chain?.mode_matches_workspace === false || universeError || chainError) && <div className={`oc-notice ${chainError || universeError ? 'error' : ''}`} role={chainError || universeError ? 'alert' : 'status'}><ShieldCheck size={15} /><span>{chainError || universeError || chain?.message || (mode === 'sample' ? 'Fictional practice contracts and prices. Sample metrics are not exchange observations.' : '')}{chain?.mode_matches_workspace === false && <strong> Switch the workspace data mode in Settings before building a strategy from this chain.</strong>}</span>{chainError && <button onClick={() => void loadChain(true)}>Retry</button>}</div>}
       {chainLoading && !chain ? <div className="oc-empty"><Loader2 className="oc-spin" size={26} /><h3>Loading the option chain</h3><p>Matching contracts, strikes and available market fields.</p></div> : !rows.length ? <div className="oc-empty"><Layers size={27} /><h3>{universeLoading ? 'Loading F&O contracts' : selected ? 'No option chain available yet' : 'Choose an F&O stock or index'}</h3><p>{chainError || universeError || chain?.message || 'Search the instrument list, select an expiry, and the calls and puts will appear here.'}</p>{mode === 'live' && <button className="oc-secondary" onClick={updateMaster} disabled={masterLoading}>{masterLoading ? 'Updating…' : 'Refresh contract list'}</button>}</div> : <div className="oc-table-scroll" ref={tableRef} tabIndex={0} aria-label="Scrollable call and put option chain">
         {optionTable}
       </div>}
-      <div className="oc-table-foot"><span><i className="oc-legend-call" />Calls <i className="oc-legend-put" />Puts <span className="oc-foot-divider">·</span> {rows.length} strikes {expiry ? `· ${expiryLabel(expiry, true)}` : ''}</span><span>— = unavailable from source · LTP is premium per unit · {inLots && canNormalize ? 'OI / volume shown in lots' : 'OI / volume shown as received'}</span></div>
+      <div className="oc-table-foot"><span><i className="oc-legend-call" />Calls <i className="oc-legend-put" />Puts <span className="oc-foot-divider">·</span> {rows.length} of {allRows.length} strikes {expiry ? `· ${expiryLabel(expiry, true)}` : ''}</span><span>— = unavailable from source · LTP is premium per unit · {inLots && canNormalize ? 'OI / volume shown in lots' : 'OI / volume shown as received'}</span></div>
     </section>
 
-    <section className={`oc-basket ${basket.length ? 'has-legs' : ''}`} aria-label="Option chain strategy basket"><div className="oc-basket-head"><button className="oc-basket-toggle" onClick={() => setBasketOpen(!basketOpen)} aria-expanded={basketOpen}><Layers size={18} /><strong>Strategy basket</strong><span>{basket.length} {basket.length === 1 ? 'leg' : 'legs'}</span>{basket.length > 0 && (basketOpen ? <ChevronDown size={14} /> : <ChevronUp size={14} />)}</button>{basket.length ? <div className="oc-basket-actions"><div><small>Indicative premium · fees excluded</small><strong>{premiumKnown ? `${money(Math.abs(premium))} ${premium >= 0 ? 'credit' : 'debit'}` : 'Awaiting prices'}</strong></div><button className="oc-basket-clear" onClick={() => { setBasket([]); setBasketContext(null); }}><Trash2 size={14} />Clear</button><button className="oc-build-button" disabled={!basketBuildEnabled} onClick={build}>Build strategy<ArrowRight size={16} /></button></div> : <p>Use <b>B</b> or <b>S</b> beside a call or put to build a paper strategy.</p>}</div>{basket.length > 0 && basketOpen && <div className="oc-basket-content">{basket.map(item => <div className="oc-basket-leg" key={item.key}><button className={`oc-side-toggle ${item.side === 'BUY' ? 'buy' : 'sell'}`} title="Switch paper leg side" aria-label={`Switch ${item.data.strike} ${item.data.option_type} side from ${item.side}`} onClick={() => setBasket(current => current.map(l => l.key === item.key ? { ...l, side: l.side === 'BUY' ? 'SELL' : 'BUY' } : l))}>{item.side === 'BUY' ? 'B' : 'S'}</button><div className="oc-basket-contract"><strong>{basketContext?.label} {num(Number(item.contract.strike), 0)} <i className={item.contract.option_type === 'CE' ? 'ce' : 'pe'}>{item.contract.option_type}</i></strong><small>{expiryLabel(item.contract.expiry, true)} · {item.contract.lot_size} units / lot · {basketContext?.mode === 'sample' ? 'Sample' : 'Market data'}</small></div><div className="oc-lot-stepper"><button aria-label={`Reduce lots for ${item.contract.strike} ${item.contract.option_type}`} disabled={item.lots <= 1} onClick={() => changeLots(item.key, item.lots - 1)}><Minus size={12} /></button><input type="number" aria-label={`Lots for ${item.contract.strike} ${item.contract.option_type}`} min={1} max={1000} value={item.lots} onChange={e => changeLots(item.key, Number(e.target.value))} /><button aria-label={`Increase lots for ${item.contract.strike} ${item.contract.option_type}`} disabled={item.lots >= 1000} onClick={() => changeLots(item.key, item.lots + 1)}><Plus size={12} /></button></div><strong className="oc-basket-ltp">{valueText(item.data.ltp)}</strong><button className="oc-remove-leg" aria-label={`Remove ${item.contract.strike} ${item.contract.option_type} from basket`} onClick={() => removeLeg(item.key)}><X size={15} /></button></div>)}{!basketBuildEnabled && <p className="oc-basket-warning">{basketContext?.mode === 'live' && contractMasterBlocked(master) ? 'New paper trades are blocked until the official contract master is current and verified.' : <>Switch workspace Settings to {basketContext?.mode === 'sample' ? 'sample' : 'market-data'} mode to review these legs. Browsing an option chain does not change your workspace mode.</>}</p>}</div>}</section>
+    <section className={`oc-basket ${basket.length ? 'has-legs' : ''}`} aria-label="Option chain strategy basket"><div className="oc-basket-head"><button className="oc-basket-toggle" onClick={() => setBasketOpen(!basketOpen)} aria-expanded={basketOpen}><Layers size={18} /><strong>Strategy basket</strong><span>{basket.length} {basket.length === 1 ? 'leg' : 'legs'}</span>{basket.length > 0 && (basketOpen ? <ChevronDown size={14} /> : <ChevronUp size={14} />)}</button>{basket.length ? <div className="oc-basket-actions"><div><small>Indicative premium · fees excluded</small><strong>{premiumKnown ? `${money(Math.abs(premium))} ${premium >= 0 ? 'credit' : 'debit'}` : 'Awaiting prices'}</strong></div><button className="oc-basket-clear" onClick={() => { setBasket([]); setBasketContext(null); }}><Trash2 size={14} />Clear</button><button className="oc-build-button" disabled={!basketBuildEnabled} onClick={build}>Build strategy<ArrowRight size={16} /></button></div> : <p>Use <b>B</b> or <b>S</b> beside a call or put to build a paper strategy.</p>}</div>{basket.length>0&&basketOpen&&<ChainBasketPreview legs={payoffLegs} reference={basketContext?.key===selected?.key&&finite(displayedReference)?Number(displayedReference):undefined} stale={basket.some(item=>item.data.stale)}/>}{basket.length > 0 && basketOpen && <div className="oc-basket-content">{basket.map(item => <div className="oc-basket-leg" key={item.key}><button className={`oc-side-toggle ${item.side === 'BUY' ? 'buy' : 'sell'}`} title="Switch paper leg side" aria-label={`Switch ${item.data.strike} ${item.data.option_type} side from ${item.side}`} onClick={() => setBasket(current => current.map(l => l.key === item.key ? { ...l, side: l.side === 'BUY' ? 'SELL' : 'BUY' } : l))}>{item.side === 'BUY' ? 'B' : 'S'}</button><div className="oc-basket-contract"><strong>{basketContext?.label} {num(Number(item.contract.strike), 0)} <i className={item.contract.option_type === 'CE' ? 'ce' : 'pe'}>{item.contract.option_type}</i></strong><small>{expiryLabel(item.contract.expiry, true)} · {item.contract.lot_size} units / lot · {basketContext?.mode === 'sample' ? 'Sample' : 'Market data'}</small></div><div className="oc-lot-stepper"><button aria-label={`Reduce lots for ${item.contract.strike} ${item.contract.option_type}`} disabled={item.lots <= 1} onClick={() => changeLots(item.key, item.lots - 1)}><Minus size={12} /></button><input type="number" aria-label={`Lots for ${item.contract.strike} ${item.contract.option_type}`} min={1} max={1000} value={item.lots} onChange={e => changeLots(item.key, Number(e.target.value))} /><button aria-label={`Increase lots for ${item.contract.strike} ${item.contract.option_type}`} disabled={item.lots >= 1000} onClick={() => changeLots(item.key, item.lots + 1)}><Plus size={12} /></button></div><strong className="oc-basket-ltp">{valueText(item.data.ltp)}</strong><button className="oc-remove-leg" aria-label={`Remove ${item.contract.strike} ${item.contract.option_type} from basket`} onClick={() => removeLeg(item.key)}><X size={15} /></button></div>)}{!basketBuildEnabled && <p className="oc-basket-warning">{basketContext?.mode === 'live' && contractMasterBlocked(master) ? 'New paper trades are blocked until the official contract master is current and verified.' : <>Switch workspace Settings to {basketContext?.mode === 'sample' ? 'sample' : 'market-data'} mode to review these legs. Browsing an option chain does not change your workspace mode.</>}</p>}</div>}</section>
     <p className="oc-safety-note"><ShieldCheck size={13} />Read-only market data. Every strategy and order in this workspace is a paper simulation.</p>
   </div>;
 }

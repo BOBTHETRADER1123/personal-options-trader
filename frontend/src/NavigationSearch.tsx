@@ -4,7 +4,13 @@ import { ArrowRight, Search } from 'lucide-react';
 import { Modal } from './components';
 
 const pages = [
-  { id: 'overview', label: 'Overview', description: 'Your paper portfolio and desk status' },
+  { id: 'overview', label: 'Dashboard', description: 'Your paper portfolio and desk status' },
+  { id: 'watchlist', label: 'Watchlist', description: 'Custom lists, live quotes and quick paper trades' },
+  { id: 'stocks', label: 'Stocks', description: 'Cash shares and their paper positions' },
+  { id: 'fno', label: 'F&O', description: 'Equity and index futures and options' },
+  { id: 'commodities', label: 'Commodities', description: 'MCX futures and options' },
+  { id: 'analytics', label: 'Combined Analytics', description: 'Recorded performance across three categories' },
+  { id: 'history', label: 'Trade History', description: 'Saved trade journal and historical records' },
   { id: 'positions', label: 'Positions & trades', description: 'Open strategies and saved trade history' },
   { id: 'chain', label: 'Option chain', description: 'Calls, puts and available contracts' },
   { id: 'builder', label: 'Strategy builder', description: 'Build and review a paper strategy' },
