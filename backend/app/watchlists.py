@@ -161,6 +161,8 @@ class WatchlistService:
         tokens=query.strip().upper().split();groups=self._groups(catalog) if catalog else []
         groups=[group for group in groups if not category or group['category']==category]
         if underlying:groups=[group for group in groups if group['rows'][0].get('underlying')==underlying]
+        if category=='stocks' and not groups:
+            return {'instruments':[],'total':0,'truncated':False,'selection_required':True,'message':'Official stock listings have not loaded. Use Refresh stock listings to request the current Kotak cash master.','limit':limit,'mode':'PAPER'}
         # Narrow symbol/company queries before inspecting exact derivative contracts.
         if tokens:
             named=[group for group in groups if tokens[0] in group['text'] or (len(group['symbol'])>=2 and tokens[0].startswith(group['symbol']))]

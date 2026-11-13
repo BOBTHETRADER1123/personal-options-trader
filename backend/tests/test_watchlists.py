@@ -277,3 +277,9 @@ def test_search_accepts_exact_compact_trading_symbols_and_cash_suffix(fixture):
         response=c.get('/api/watchlists/search',params={'category':category,'q':symbol})
         assert response.status_code==200
         assert [item['instrument_id'] for item in response.json()['instruments']]==[identifier]
+
+
+def test_empty_stock_master_explains_explicit_refresh_without_network(fixture):
+    f=fixture;f.catalog.stock_rows=[];f.catalog.revision+=1
+    result=signed(f).get('/api/watchlists/search?category=stocks&q=RELIANCE').json()
+    assert result['instruments']==[] and 'Refresh stock listings' in result['message']

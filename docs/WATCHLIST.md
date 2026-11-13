@@ -8,8 +8,9 @@ Open https://personal-options-trader.vercel.app/ and sign in with your app passw
 
 1. Open **Watchlist**. Choose Watchlist 1, Watchlist 2 or Favourites, or create a named list.
 2. Select **Add instrument** and choose Stocks, F&O or Commodities. Search the company or underlying symbol. For derivatives, include the expiry, strike and CE/PE/FUT when choosing the exact contract.
-3. Add a current Kotak contract. Expired or unavailable entries remain visible with a warning so the app can retain their identity and your trade history.
-4. Use manual order to drag rows, or use the up/down controls on a phone. Sorting by price change, percentage, volume or symbol changes the view; manual reordering changes the saved list.
+3. If Stocks reports that listings have not loaded, choose **Refresh stock listings** once. This requests the existing official Kotak cash master without opening another feed.
+4. Add a current Kotak contract. Expired or unavailable entries remain visible with a warning so the app can retain their identity and your trade history.
+5. Use manual order to drag rows, or use the up/down controls on a phone. Sorting by price change, percentage, volume or symbol changes the view; manual reordering changes the saved list.
 
 Lists are stored in your private application database and shared by phone and desktop. The last selected list and appearance preferences are device preferences. Simultaneous edits use revision checks rather than silently overwrite another device's changes. If an edit conflicts, reload the list and apply your change again.
 
@@ -24,6 +25,12 @@ Limits keep the one-worker server bounded: ten lists, fifty instruments per list
 - If a submission result is uncertain, retry keeps the same request identifier. Check Positions before creating a second order.
 
 New trades are classified on the server. Cash shares belong to Stocks, exchange equity/index derivatives to F&O, and MCX derivatives to Commodities. Mixed-category new baskets are rejected. Watchlist removal does not close a trade or delete its journal, P&L history or export.
+
+## Long-term equity paper holdings
+
+Stocks means cash equity shares, including currently listed companies from the official Kotak cash master. Stock contracts have no expiry or six-month holding limit. Open holdings remain in the durable database until you explicitly sell/close them; daily exports and archiving must retain the active position. Use Manage existing position to partially sell or close an existing holding. A new SELL order is a separately identified paper position.
+
+The app does not currently apply automatic verified dividends, stock splits or other corporate actions. Long-term results must be interpreted with that limitation until verified corporate-action handling is added. Future session calendars still require verified official data; an unknown calendar must not erase a holding or fabricate a fill.
 
 ## Read prices honestly
 
