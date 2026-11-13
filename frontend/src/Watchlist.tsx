@@ -68,7 +68,7 @@ export default function Watchlist({trades,quotes,feed={},settings,onManage,onCha
  },[searchOpen,query,searchCategory,stockRefreshVersion]);
  async function refreshStockListings(){
   if(stocksRefreshing)return;const abort=new AbortController();stockRefreshController.current=abort;const timeout=setTimeout(()=>abort.abort(),90000);setStocksRefreshing(true);setSearchError('');
-  try{const result=await api('/api/stocks/refresh',{method:'POST',signal:abort.signal});if(!result.ok)throw new Error(result.master?.message||'Official stock listings could not be refreshed. Existing records are retained.');if(mounted.current){setStockRefreshVersion(value=>value+1);notify('Official stock listings refreshed.');}}
+  try{const result=await api('/api/stocks/master/refresh',{method:'POST',signal:abort.signal});if(!result.ok)throw new Error(result.master?.message||'Official stock listings could not be refreshed. Existing records are retained.');if(mounted.current){setStockRefreshVersion(value=>value+1);notify('Official stock listings refreshed.');}}
   catch(reason){if(mounted.current)setSearchError((reason as Error).name==='AbortError'?'Stock refresh took too long. Check again before retrying.':(reason as Error).message);}
   finally{clearTimeout(timeout);if(mounted.current)setStocksRefreshing(false);}
  }

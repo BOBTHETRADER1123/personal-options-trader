@@ -283,3 +283,34 @@ def test_empty_stock_master_explains_explicit_refresh_without_network(fixture):
     f=fixture;f.catalog.stock_rows=[];f.catalog.revision+=1
     result=signed(f).get('/api/watchlists/search?category=stocks&q=RELIANCE').json()
     assert result['instruments']==[] and 'Refresh stock listings' in result['message']
+
+
+def test_cash_equity_survives_five_years_and_database_cache_restart(fixture,monkeypatch):
+    monkeypatch.setattr(engine,'ExchangeCalendar',lambda:SimpleNamespace(state=lambda *_:{'open':True,'known':True}))
+    f=fixture;row=f.rows[1];mark(f,row);c=signed(f)
+    result=c.post('/api/trades',json={'name':'Long term equity','underlying':row['underlying'],'brokers':['kotak'],
+        'legs':[{'instrument_id':row['id'],'side':'BUY','lots':12}],
+        'idempotency_key':'five-year-equity','confirmed':True})
+    assert result.status_code==201
+    assert result.json().get('trades'),result.json()
+    original=result.json()['trades'][0];future=datetime.now(timezone.utc)+timedelta(days=5*366)
+    class FutureClock(datetime):
+        @classmethod
+        def now(cls,tz=None):return future.astimezone(tz) if tz else future.replace(tzinfo=None)
+    monkeypatch.setattr(engine,'datetime',FutureClock);engine.clear_cache()
+    with f.factory() as db:
+        restored=engine.list_trades(db,demo=False)[0]
+        assert restored['id']==original['id'] and restored['status']=='open' and restored['category']=='stocks'
+        leg=restored['legs'][0]
+        assert leg['expiry'] is None and leg['open_lots']==12 and leg['lot_size']==1
+        assert not leg['expired'] and not leg['settlement_required']
+        assert db.get(Trade,original['id']).status=='open'
+
+
+def test_official_cash_refresh_endpoint_uses_existing_stock_service(fixture,monkeypatch):
+    calls=[]
+    class Service:
+        async def refresh(self,db):calls.append(True);return {'ok':True,'master':{'status':'ready'}}
+    monkeypatch.setattr(main,'stock_master',Service())
+    result=signed(fixture).post('/api/stocks/master/refresh')
+    assert result.status_code==200 and result.json()['ok'] and calls==[True]
