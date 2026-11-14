@@ -148,7 +148,7 @@ export default function App(){
   const reference=instruments.find(row=>row.underlying===payload.underlying)?.spot;
   const riskCharges=Number(addingTo?.charges||0)+previews.reduce((total,item)=>total+Number(item.estimatedCharges||0),0);
   const risk=await api('/api/risk',{method:'POST',body:JSON.stringify({legs:legData,charges:riskCharges,realized_pnl:Number(addingTo?.realized_pnl||0),...(reference?{spot:reference}:{})}),signal:controller.signal});
-  return {payload,analysis:{...analysis,...risk},previews,quoted_at:new Date(now).toISOString(),demo:mode,fill_basis:currentSettings.fill_basis||'bid_ask',slippage_bps:Number(currentSettings.slippage_bps||0),brokerage_per_order:Number(currentSettings.brokerage_per_order??20),charges_percent:Number(currentSettings.charges_percent??.05)};
+  return {payload,analysis:{...analysis,...risk,legs:legData,broker:source,demo:mode},previews,quoted_at:new Date(now).toISOString(),demo:mode,fill_basis:currentSettings.fill_basis||'bid_ask',slippage_bps:Number(currentSettings.slippage_bps||0),brokerage_per_order:Number(currentSettings.brokerage_per_order??20),charges_percent:Number(currentSettings.charges_percent??.05)};
   }finally{clearTimeout(timeout);}
  }
  async function reviewTrade(payload:Row,analysis:Row){const request=++previewRequest.current;setPreviewLoading(true);try{const prepared=await prepareReview(payload,analysis);if(request===previewRequest.current)setReview(prepared);}catch(error){if(request===previewRequest.current)notify((error as Error).message,true);}finally{if(request===previewRequest.current)setPreviewLoading(false);}}

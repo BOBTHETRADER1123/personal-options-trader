@@ -344,7 +344,7 @@ def premium_cash_flow(leg,lots=None,price=None):
     return -(1 if leg['side']=='BUY' else -1)*(leg.get('filled_lots',0) if lots is None else lots)*monetary_units(leg)*(leg['entry_price'] if price is None else price)
 
 
-RISK_VERSION=4
+RISK_VERSION=5
 
 
 def stock_cost_basis(legs):

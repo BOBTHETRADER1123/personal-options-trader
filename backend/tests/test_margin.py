@@ -155,3 +155,67 @@ def test_credentials_are_not_part_of_basket_identity():
     clean = unavailable_for_basket(original)
     original[0].update(access_token="PRIVATE_TOKEN", mpin="PRIVATE_MPIN", clientCode="PRIVATE_ACCOUNT")
     assert unavailable_for_basket(original)["request_fingerprint"] == clean["request_fingerprint"]
+
+
+def test_iron_butterfly_remaining_option_premiums_are_separate_from_margin():
+    rows = [
+        {"broker": "kotak", "exchange": "MCX", "underlying": "NATURALGAS", "expiry": "2030-11-20",
+         "option_type": kind, "side": side, "strike": strike, "entry_price": price,
+         "lots": 1, "open_lots": 1, "lot_size": 1250, "price_multiplier": 1}
+        for side, strike, kind, price in [
+            ("BUY", 300, "PE", 2.00), ("SELL", 315, "PE", 7.00),
+            ("SELL", 315, "CE", 5.00), ("BUY", 330, "CE", 2.00),
+        ]
+    ]
+    result = unavailable_for_basket(rows)
+    assert result["premium_paid"] == 5000
+    assert result["premium_received"] == 15000
+    assert result["net_premium"] == 10000
+    assert result["provider_request_performed"] is False
+    assert all(result[key] is None for key in MARGIN_FIELDS)
+    # Partial exit and another expiry affect cash-flow totals, not margin availability.
+    rows[0].update(lots=2, open_lots=1)
+    rows[1].update(open_lots=0)
+    rows[2].update(expiry="2030-12-18")
+    rows[3].update(enabled=False)
+    result = unavailable_for_basket(rows)
+    assert result["premium_paid"] == 2500
+    assert result["premium_received"] == 6250
+    assert result["net_premium"] == 3750
+
+
+def test_five_leg_gross_option_cash_flows_reconcile_to_net_debit():
+    result = unavailable_for_basket(legs())
+    assert result["premium_paid"] == 31817.50
+    assert result["premium_received"] == 21554
+    assert result["net_premium"] == -10263.50
+    assert result["premium_received"] - result["premium_paid"] == result["net_premium"]
+
+
+@pytest.mark.parametrize("unknown", [{"price_multiplier": None}, {"exchange": "MCX"}])
+def test_unknown_option_monetary_conversion_preserves_unknown_cash_flows(unknown):
+    original = legs()
+    original[0].pop("price_multiplier", None)
+    original[0].update(unknown)
+    result = unavailable_for_basket(original)
+    assert result["net_premium"] is None
+    assert result["premium_received"] is None
+    assert result["premium_paid"] == 31817.50
+    assert result["total_margin"] is None
+
+
+def test_futures_and_fully_closed_options_have_no_remaining_option_cash_flow():
+    rows = legs()
+    for row in rows:
+        row["open_lots"] = 0
+    rows.append({"side": "BUY", "option_type": "FUT", "price": 24000, "lot_size": 65, "lots": 1})
+    result = unavailable_for_basket(rows)
+    assert result["premium_paid"] == result["premium_received"] == result["net_premium"] == 0
+    assert result["total_margin"] is None
+
+
+def test_explicit_net_premium_override_does_not_override_gross_cash_flows():
+    result = unavailable_for_basket(legs(), net_premium="-10263.505")
+    assert result["net_premium"] == -10263.51
+    assert result["premium_paid"] == 31817.50
+    assert result["premium_received"] == 21554

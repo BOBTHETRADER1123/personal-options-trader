@@ -87,10 +87,12 @@ def _timestamp(value: datetime | str | None) -> str:
     return instant.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
-def _portfolio(legs: Iterable[Mapping], broker: str) -> tuple[list[dict], Decimal | None]:
+def _portfolio(legs: Iterable[Mapping], broker: str) -> tuple[list[dict], Decimal | None, Decimal | None, Decimal | None]:
     """Canonical remaining exposure; never retain arbitrary credential fields."""
     canonical = []
     premium = Decimal(0)
+    paid = received = Decimal(0)
+    paid_complete = received_complete = True
     complete_premium = True
     for leg in legs:
         if not isinstance(leg, Mapping):
@@ -126,18 +128,28 @@ def _portfolio(legs: Iterable[Mapping], broker: str) -> tuple[list[dict], Decima
         if kind == "FUT":
             continue
         entry = leg.get("entry_price", leg.get("price"))
-        multiplier = leg.get("price_multiplier", 1)
+        multiplier = leg.get("price_multiplier", None if leg.get("exchange") == "MCX" else 1)
         if entry is None or multiplier is None:
             complete_premium = False
+            if side == "BUY":
+                paid_complete = False
+            else:
+                received_complete = False
             continue
         price = _decimal(entry, "Entry premium")
         if price < 0:
             raise ValueError("Entry premium must be nonnegative.")
         factor = _decimal(multiplier, "Price multiplier", positive=True)
-        premium += (1 if side == "SELL" else -1) * price * lots * lot_size * factor
+        cash_flow = price * lots * lot_size * factor
+        if side == "BUY":
+            paid += cash_flow
+        else:
+            received += cash_flow
+        premium += (1 if side == "SELL" else -1) * cash_flow
     # Leg insertion order has no effect on the hypothetical basket identity.
     canonical.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
-    return canonical, premium if complete_premium else None
+    return (canonical, premium if complete_premium else None,
+            paid if paid_complete else None, received if received_complete else None)
 
 
 def unavailable_for_basket(
@@ -152,7 +164,7 @@ def unavailable_for_basket(
     """
     if broker not in _SOURCES:
         raise ValueError("Unsupported broker for paper margin assessment.")
-    canonical, derived_premium = _portfolio(legs, broker)
+    canonical, derived_premium, paid, received = _portfolio(legs, broker)
     premium = derived_premium if net_premium is None else _decimal(net_premium, "Net premium")
     encoded = json.dumps({"broker": broker, "legs": canonical}, sort_keys=True, separators=(",", ":"))
     fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -160,6 +172,10 @@ def unavailable_for_basket(
         "status": "unavailable", "label": "Broker margin unavailable", "verified": False,
         "broker": broker, **dict.fromkeys(MARGIN_FIELDS),
         "net_premium": None if premium is None else float(premium.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "premium_paid": None if paid is None else float(paid.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "premium_received": None if received is None else float(received.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "premium_scope": "remaining_open_option_legs_at_entry_prices_excluding_charges",
+        "provider_request_performed": False,
         "estimate": None, "verification_scope": "complete_hypothetical_paper_portfolio",
         **_SOURCES[broker], "as_of": _timestamp(as_of),
         "request_fingerprint": fingerprint, "active_leg_count": len(canonical),

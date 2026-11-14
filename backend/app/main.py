@@ -7,7 +7,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Literal
@@ -1104,6 +1104,14 @@ async def kotak_margin_required(payload:KotakMarginInput,request:Request,db=Depe
     contract=catalog.find(payload.instrument_id,'kotak') if catalog else None
     if not contract or contract.get('demo') is not False or contract.get('broker')!='kotak':
         raise HTTPException(422,'Select a genuine Kotak contract from the current instrument master.')
+    if not contract_master_status(contract)['ready']:
+        raise HTTPException(422,"The contract master is unavailable or stale. Refresh today's validated contracts before requesting margin.")
+    try:
+        expiry=date.fromisoformat(str(contract.get('expiry','')))
+    except (ValueError,TypeError):
+        raise HTTPException(422,'Select a contract with a valid expiry from the current instrument master.') from None
+    if expiry<datetime.now(timezone(timedelta(hours=5,minutes=30))).date():
+        raise HTTPException(422,'Expired contracts cannot receive a current margin check.')
     if feed_manager is None:raise HTTPException(409,'No Kotak market-data session is available.')
     # Network I/O never holds a database transaction or writer lock.
     option_chain.finish_read_transaction(db)

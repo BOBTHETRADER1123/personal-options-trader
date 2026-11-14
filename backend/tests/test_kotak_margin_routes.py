@@ -1,7 +1,7 @@
 """Protected margin diagnostics, using isolated SQLite and an SDK fake only."""
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -35,12 +35,14 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "write_lock", asyncio.Lock())
     monkeypatch.setattr(main, "rate_limit", lambda *args, **kwargs: None)
     row = {"id": "kotak:nse_fo:53782", "token": "53782", "broker": "kotak", "demo": False,
-           "segment": "nse_fo", "lot_size": 65, "expiry": "2030-11-03", "symbol": "NIFTY30NOV22700CE"}
+           "segment": "nse_fo", "lot_size": 65, "expiry": "2030-11-03", "symbol": "NIFTY30NOV22700CE",
+           "master_active": True, "master_refresh_at": datetime.now(timezone.utc).isoformat(),
+           "master_source_date": datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()}
     lookup = []
     def find(identifier, broker):
         lookup.append((identifier, broker))
         return row if identifier == row["id"] and broker == "kotak" else None
-    monkeypatch.setattr(main, "catalog", SimpleNamespace(find=find))
+    monkeypatch.setattr(main, "catalog", SimpleNamespace(find=find, row=row))
     calls = []
     class SDK:
         def margin_required(self, **inputs):
@@ -126,3 +128,23 @@ def test_basket_preview_rejects_foreign_broker_instead_of_server_error(isolated)
     response = client.post("/api/margin/preview", headers=authorize(client), json={"legs": [leg]})
     assert response.status_code == 422, response.text
     assert calls == []
+
+
+@pytest.mark.parametrize("changed", [
+    {"master_active": False},
+    {"master_source_date": "2020-01-01"},
+    {"master_refresh_at": "2020-01-01T00:00:00+00:00"},
+    {"master_refresh_at": "invalid"},
+    {"master_source_date": None},
+    {"expiry": "2020-01-01"},
+    {"expiry": "invalid"},
+])
+def test_stale_historical_or_expired_contract_is_rejected_before_provider_or_writes(isolated, changed):
+    client, factory, calls, lookup = isolated
+    main.catalog.row.update(changed)
+    response = client.post("/api/brokers/kotak/margin-required", headers=authorize(client), json=body())
+    assert response.status_code == 422, response.text
+    assert calls == [], "Invalid contract provenance must not cause a broker margin request"
+    with factory() as db:
+        assert not list(db.scalars(select(Event))), "Rejected checks must not write margin audit events"
+        assert not list(db.scalars(select(Trade))), "Margin checks must never create positions"

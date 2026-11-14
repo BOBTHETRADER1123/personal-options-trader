@@ -87,3 +87,19 @@ def test_future_receipt_is_not_treated_as_fresh_and_corrupt_prices_are_rejected(
     for row in [{'ltp':True},{'ltp':float('inf')},{'ltp':1,'ask':-1},
                 {'ltp':1,'received_at':future},{'ltp':1,'received_at':'not-a-time'}]:
         with pytest.raises(ValueError):engine.validate_quote(row)
+
+
+def test_naturalgas_butterfly_payoff_is_not_required_margin():
+    from app.payoff import strategy_risk
+    rows = [("BUY", 300, "PE", 2.00), ("SELL", 315, "PE", 7.00),
+            ("SELL", 315, "CE", 5.00), ("BUY", 330, "CE", 2.00)]
+    legs = [dict(broker="kotak", exchange="MCX", underlying="NATURALGAS", expiry="2030-11-20",
+                 side=side, strike=strike, option_type=kind, entry_price=price,
+                 lots=1, open_lots=1, lot_size=1250, price_multiplier=1)
+            for side, strike, kind, price in rows]
+    risk = strategy_risk(legs, charges=100)
+    assert risk["net_premium"] == 10000
+    assert risk["max_profit"] == 9900
+    assert risk["max_loss"] == 8850
+    assert risk["breakevens"] == [307.08, 322.92]
+    assert risk["estimated_margin"] is None and risk["hedge_benefit"] is None

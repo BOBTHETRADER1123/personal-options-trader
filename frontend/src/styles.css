@@ -631,3 +631,8 @@ body{background:var(--bg)}.sidebar{background:#131416}.topbar{background:#141517
 .execution-caution label{display:flex;flex-direction:row;align-items:flex-start;gap:10px;margin-top:14px;cursor:pointer}
 .execution-caution input{width:16px;height:16px;margin-top:3px;flex-shrink:0;accent-color:#0a82f9}
 @media(max-width:700px){.execution-preview-heading{padding-left:18px;padding-right:18px}.execution-caution{margin:16px 18px}.execution-preview-heading .text-btn{margin-left:0}}
+
+/* Keep the read-only diagnostic within the existing risk-panel grid. */
+.kotak-margin-check { grid-column:1/-1;padding:20px }
+.kotak-margin-check>h3 { margin:0 0 12px;font-size:14px }
+.kotak-margin-check>.help-note { padding:10px 0 }

@@ -2,6 +2,7 @@ import { money, time } from './api';
 import { Help } from './components';
 import type { Row } from './components';
 import { brokerMarginValue } from './tradeMath';
+import KotakMarginCheck from './KotakMarginCheck';
 
 /** Only explicit complete, fresh basket calculations may show portfolio figures. */
 export function exchangeMarginValue(source:Row,key:string):number|null{
@@ -21,10 +22,13 @@ export default function MarginBreakdown({source,layout='detail',includeBroker=tr
   ['Verified hedge benefit',brokerMarginValue(source,'hedge_benefit')],
   ['Final capital required',brokerMarginValue(source,'final_capital_required')],
  ];
+ const premiumRows:[string,number|null][]=[['Option premium paid · remaining legs',typeof broker.premium_paid==='number'&&Number.isFinite(broker.premium_paid)?broker.premium_paid:null],['Option premium received · remaining legs',typeof broker.premium_received==='number'&&Number.isFinite(broker.premium_received)?broker.premium_received:null]];
  const component=(label:string,value:number|null)=>layout==='review'?<span key={label}>{label}<strong>{value==null?'Unavailable':money(value)}</strong></span>:<div key={label}><span>{label}</span><strong>{value==null?(label==='Kotak Neo basket margin'?'Broker margin unavailable':'Unavailable'):money(value)}</strong></div>;
  return <>
-  {layout==='review'?<div className="review-risk">{rows.map(([label,value])=>component(label,value))}</div>:rows.map(([label,value])=>component(label,value))}
-  <Help>Exchange source: {exchange.source||'No validated exchange risk calculation'}. Parameter file: {exchange.parameter_version||'Unavailable'}. Data: {exchange.freshness||'unavailable'}. Calculated: {exchange.as_of?`${time(exchange.as_of,true)} IST`:'Not calculated'}. {exchange.reason||'Complete current SPAN, ELM, premium settlement, special and expiry rules must be validated before an exchange total is shown.'}</Help>
-  <Help>Broker source: {broker.source||'No verified Kotak Neo basket response'}. Checked: {broker.as_of?`${time(broker.as_of,true)} IST`:'Not checked'}. {broker.reason||'Single-order margin checks do not establish the margin of an isolated paper basket. Expiry loss is separate from margin.'}</Help>
+  {layout==='review'?<div className="review-risk">{[...rows,...premiumRows].map(([label,value])=>component(label,value))}</div>:[...rows,...premiumRows].map(([label,value])=>component(label,value))}
+  <Help>Exchange source: {exchange.source||'No validated exchange risk calculation'}. Parameter file: {exchange.parameter_version||'Unavailable'}. Data: {exchange.freshness||'unavailable'}. {exchange.verified===true?'Calculated':'Availability assessed'}: {exchange.as_of?`${time(exchange.as_of,true)} IST`:'Not calculated'}. {exchange.reason||'Complete current SPAN, ELM, premium settlement, special and expiry rules must be validated before an exchange total is shown.'}</Help>
+  <Help>Premiums are cash flows for the remaining option quantities at their recorded or preview entry prices, before charges. Premium cash flow, expiry loss and broker margin are separate; none establishes buying power.</Help>
+  <Help>Broker source: {broker.source||'No verified Kotak Neo basket response'}. {broker.verified===true?'Quoted':'Availability assessed'}: {broker.as_of?`${time(broker.as_of,true)} IST`:'Not checked'}. {broker.reason||'Single-order margin checks do not establish the margin of an isolated paper basket. Expiry loss is separate from margin.'}</Help>
+  <KotakMarginCheck source={source}/>
  </>;
 }
