@@ -87,7 +87,7 @@ class WatchlistService:
     def snapshot(self,db,catalog,settings,quote_getter,age_seconds,*,feed=None,now=None,active_list_id=None):
         state=read_state(db);valid_ids=set()
         active_id=active_list_id or state['watchlists'][0]['id']
-        if not any(saved['id']==active_id for saved in state['watchlists']):raise HTTPException(404,'Watchlist not found.')
+        if not any(saved['id']==active_id for saved in state['watchlists']):active_id=state['watchlists'][0]['id']
         quotes={}
         for saved in state['watchlists']:
             items=[]

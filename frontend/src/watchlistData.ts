@@ -6,7 +6,7 @@ export const numberValue=(value:unknown):number|null=>value!==null&&value!==unde
 export const contractId=(contract:Row)=>String(contract.instrument_id||contract.id||'');
 export function latestWatchQuote(item:Row,quotes:Row[]):Row|null{
  const contract=item.contract||{},id=String(item.instrument_id||contractId(contract));
- const candidates=[item.quote,...quotes].filter((quote):quote is Row=>Boolean(quote&&quote.broker==='kotak'&&quote.instrument_id===id&&quote.demo===false&&Number.isFinite(Date.parse(quote.received_at||''))&&(!quote.exchange||quote.exchange===contract.exchange)&&(!quote.segment||quote.segment===contract.segment)));
+ const candidates=[item.quote,...quotes].filter((quote):quote is Row=>Boolean(quote&&quote.broker==='kotak'&&quote.instrument_id===id&&quote.demo===false&&Number.isFinite(Date.parse(quote.received_at||''))&&['exchange','segment','underlying','expiry','strike','option_type','lot_size'].every(key=>quote[key]===undefined||quote[key]===null||contract[key]===undefined||quote[key]===contract[key])));
  return candidates.sort((a,b)=>Date.parse(b.received_at||'')-Date.parse(a.received_at||''))[0]||null;
 }
 export function watchQuoteAge(quote:Row|null,now=Date.now()):number|null{

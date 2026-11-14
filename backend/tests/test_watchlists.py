@@ -314,3 +314,11 @@ def test_official_cash_refresh_endpoint_uses_existing_stock_service(fixture,monk
     monkeypatch.setattr(main,'stock_master',Service())
     result=signed(fixture).post('/api/stocks/master/refresh')
     assert result.status_code==200 and result.json()['ok'] and calls==[True]
+
+
+def test_deleted_watchlist_on_another_device_falls_back_without_writing(fixture):
+    f=fixture;c=signed(f);c.delete('/api/watchlists/favourites')
+    revision=c.get('/api/watchlists').json()['revision']
+    result=c.get('/api/watchlists?active_list_id=favourites')
+    assert result.status_code==200 and result.json()['active_list_id']=='watchlist-1'
+    assert result.json()['revision']==revision

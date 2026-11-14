@@ -18,17 +18,17 @@ Limits keep the one-worker server bounded: ten lists, fifty instruments per list
 
 ## BUY, SELL and existing positions
 
-- **BUY / SELL** opens a new paper-order panel for the exact instrument. Stocks use share quantity; derivatives use lots and the official contract lot size. Choose market or limit entry and review the estimated fill, trade value and charges.
+- **BUY** opens a new paper-order panel for the exact instrument. For derivatives, **SELL** opens a separate short paper order; for equities, **SELL** opens management of already owned paper shares. Stocks use share quantity; derivatives use lots and the official contract lot size. Choose market or limit entry and review the estimated fill, trade value and charges.
 - **Confirm Paper Trade** rechecks the quote and settings, then uses the existing paper execution engine. The backend remains responsible for the current contract, session, quote freshness, buying power and final fill. Significant price changes require another review.
-- A limit that has not crossed remains pending; it is not shown as an executed market fill.
-- The existing-position badge opens management controls. Use these to add quantity, partially exit or close an existing position. A new BUY/SELL order remains a separately identified paper trade.
+- A BUY limit that has not crossed remains pending; it is not shown as an executed market fill. Equity exits currently use market sales through holding management; pending stock SELL exits are not implemented.
+- The existing-position badge opens management controls. Use these to add quantity, partially exit or close an existing position. A new equity BUY or derivative BUY/SELL order remains a separately identified paper trade. Equity sales reduce an existing holding.
 - If a submission result is uncertain, retry keeps the same request identifier. Check Positions before creating a second order.
 
 New trades are classified on the server. Cash shares belong to Stocks, exchange equity/index derivatives to F&O, and MCX derivatives to Commodities. Mixed-category new baskets are rejected. Watchlist removal does not close a trade or delete its journal, P&L history or export.
 
 ## Long-term equity paper holdings
 
-Stocks means cash equity shares, including currently listed companies from the official Kotak cash master. Stock contracts have no expiry or six-month holding limit. Open holdings remain in the durable database until you explicitly sell/close them; daily exports and archiving must retain the active position. Use Manage existing position to partially sell or close an existing holding. A new SELL order is a separately identified paper position.
+Stocks means cash equity shares, including currently listed companies from the official Kotak cash master. Stock contracts have no expiry or six-month holding limit. Open holdings remain in the durable database until you explicitly sell/close them; daily exports and archiving must retain the active position. Use Manage existing position to partially sell or close an existing holding. For equity shares, SELL opens existing-holding management and cannot create a short cash position. For derivatives, a new SELL order is a separately identified paper position.
 
 The app does not currently apply automatic verified dividends, stock splits or other corporate actions. Long-term results must be interpreted with that limitation until verified corporate-action handling is added. Future session calendars still require verified official data; an unknown calendar must not erase a holding or fabricate a fill.
 

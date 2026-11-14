@@ -14,7 +14,7 @@ import logging
 import threading
 import weakref
 from collections import OrderedDict
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from datetime import datetime, timezone
 from sqlalchemy import select, delete, update, func, event as sqlalchemy_event
 from sqlalchemy.orm import Session
@@ -253,14 +253,53 @@ def validate_new_exposure(contract,settings):
         raise HTTPException(409,status['reason'])
 
 
+class _CashLimitTickMismatch(HTTPException):
+    """A saved cash limit can become off-grid when the official tick changes."""
+
+
+def _cash_limit_price(contract,settings,limit_price):
+    """Validate a paper BUY limit against the current verified cash master.
+
+    Pending legs may predate a tick change or omit cached tick metadata. Always
+    use the current master, never a caller-supplied or frozen historical tick.
+    Decimal remainder avoids float division rejecting valid prices such as
+    100.15 at a 0.05 tick. This helper is used at entry and at pending execution.
+    """
+    if isinstance(limit_price,bool) or not isinstance(limit_price,(int,float)):
+        raise HTTPException(422,'Set a positive finite paper limit price.')
+    try:limit_number=float(limit_price)
+    except (ValueError,OverflowError):limit_number=float('nan')
+    if not math.isfinite(limit_number) or limit_number<=0:
+        raise HTTPException(422,'Set a positive finite paper limit price.')
+    validate_new_exposure(contract,settings)
+    identifier=contract.get('instrument_id') or contract.get('id')
+    current=catalog.find(identifier,contract.get('broker')) if catalog and identifier else None
+    tick=current.get('tick_size') if current else None
+    if isinstance(tick,bool) or not isinstance(tick,(int,float)):
+        raise HTTPException(409,'Verified stock tick size unavailable. Refresh stock listings before a limit buy.')
+    try:tick_number=float(tick)
+    except (ValueError,OverflowError):tick_number=float('nan')
+    if not math.isfinite(tick_number) or tick_number<=0:
+        raise HTTPException(409,'Verified stock tick size unavailable. Refresh stock listings before a limit buy.')
+    value=Decimal(str(limit_price));step=Decimal(str(tick))
+    with localcontext() as context:
+        context.prec=max(28,len(value.as_tuple().digits)+len(step.as_tuple().digits)
+                         +abs(value.as_tuple().exponent)+abs(step.as_tuple().exponent)+4)
+        if value % step:
+            raise _CashLimitTickMismatch(422,f'Use a paper stock limit in multiples of the current {step:f} tick.')
+    return limit_number
+
+
 def execution_price(db,contract,side,broker,settings,manual=None,quote_override=None,limit_price=None):
     if broker not in BROKERS and manual is None:raise HTTPException(409,'This broker is retired. No new market-price fills are available.')
     stock=contract.get('option_type')=='EQ'
     if stock:
-        if settings.get('demo_mode') or manual is not None or limit_price is not None:
-            raise HTTPException(422,'Stock trades require current Kotak quotes and a simulated market price.')
-        validate_new_exposure(contract,settings)
-        if not ExchangeCalendar().state(contract,datetime.now(timezone.utc))['open']:
+        if settings.get('demo_mode') or manual is not None:
+            raise HTTPException(422,'Stock trades require current Kotak quotes; manual fill prices are unavailable.')
+        if limit_price is not None:limit_price=_cash_limit_price(contract,settings,limit_price)
+        else:validate_new_exposure(contract,settings)
+        session=ExchangeCalendar().state(contract,datetime.now(timezone.utc))
+        if not session.get('known') or not session.get('open'):
             raise HTTPException(409,'Paper stock orders are available during verified NSE cash-market sessions.')
     if manual is not None:
         if not math.isfinite(float(manual)) or manual<0:raise HTTPException(422,'Paper fill price must be nonnegative and finite.')
@@ -518,8 +557,12 @@ def new_leg(db,request,broker,settings,at):
     if stock:
         if item['side']!='BUY':
             raise HTTPException(422,'Sell shares from an existing paper stock position.')
-        if item.get('order_type','MARKET')!='MARKET' or any(item.get(key) is not None for key in ('price','stop_loss','target')):
-            raise HTTPException(422,'Paper stock orders currently support market orders only.')
+        order_type=item.get('order_type','MARKET')
+        if order_type not in ('MARKET','LIMIT') or any(item.get(key) is not None for key in ('stop_loss','target')):
+            raise HTTPException(422,'Paper stock buys support market or limit entry without automatic exit triggers.')
+        if order_type=='MARKET' and item.get('price') is not None:
+            raise HTTPException(422,'A paper market buy uses the current Kotak quote, not a manual price.')
+        if order_type=='LIMIT':_cash_limit_price(contract,settings,item.get('price'))
     else:
         validate_new_exposure(contract,settings)
     quote=resolve_quote(db,contract,broker,settings)
@@ -532,7 +575,7 @@ def new_leg(db,request,broker,settings,at):
         compare=fill_reference(quote,item['side'],settings)
         pending=compare>item['price'] if item['side']=='BUY' else compare<item['price']
     if pending:price=float(item['price']); slip=0.0
-    elif stock:price,slip=market_price,market_slip
+    elif stock and item.get('order_type','MARKET')=='MARKET':price,slip=market_price,market_slip
     else:
         price,quote,slip=execution_price(db,contract,item['side'],broker,settings,
             limit_price=item['price'] if item.get('order_type')=='LIMIT' else None)
@@ -603,7 +646,7 @@ def apply_action(db,trade_id,payload):
     if not row:raise HTTPException(404,'Trade not found.')
     trade=copy.deepcopy(row.data);settings=get_settings(db);action=payload['action'];at=iso_now()
     stock=any(leg.get('option_type')=='EQ' for leg in trade['legs'])
-    if stock and (action not in ('add_lots','partial_exit','exit_leg','exit_strategy','duplicate','edit')
+    if stock and (action not in ('add_lots','partial_exit','exit_leg','exit_strategy','duplicate','edit','cancel_pending')
                   or any(payload.get(key) is not None for key in ('price','stop_loss','target','leg'))):
         raise HTTPException(422,'Paper stock positions support share purchases, sales and renaming at current market prices.')
     if trade['broker'] not in BROKERS and action not in {'edit','cancel_pending','settle_expiry'}:
@@ -806,12 +849,25 @@ def revalue_quote(db,entry):
                     if not _quote_matches_leg(leg,quote):continue
                     changed=True;leg['current_price']=float(quote['ltp']);leg['quote_at']=quote['received_at'];leg['exchange_quote_at']=quote.get('exchange_timestamp');leg['exchange_timestamp_basis']=quote.get('exchange_timestamp_basis');leg['quote_event_id']=entry.id;leg['quote_source']=quote['broker'];leg['bid']=quote.get('bid');leg['ask']=quote.get('ask')
                     if leg['status']=='pending' and fresh:
-                        price=fill_reference(quote,leg['side'],settings)
+                        pending_settings={**settings,'demo_mode':bool(trade.get('demo'))} if leg.get('option_type')=='EQ' else settings
+                        price=fill_reference(quote,leg['side'],pending_settings)
                         crossed=price<=leg['limit_price'] if leg['side']=='BUY' else price>=leg['limit_price']
                         if crossed:
-                            if not _pending_master_permitted(db,trade,leg,settings,quote['received_at']):continue
-                            fill,_,slip=execution_price(db,leg,leg['side'],trade['broker'],settings,quote_override=quote,limit_price=leg['limit_price'])
-                            if not _pending_fill_permitted(db,trade,leg,settings,fill,quote['received_at']):continue
+                            if not _pending_master_permitted(db,trade,leg,pending_settings,quote['received_at']):continue
+                            try:
+                                fill,_,slip=execution_price(db,leg,leg['side'],trade['broker'],pending_settings,quote_override=quote,limit_price=leg['limit_price'])
+                            except HTTPException as error:
+                                # Cash limits survive closed/unknown sessions and
+                                # unusable quotes. These are expected waiting
+                                # conditions, not failed accounting or fake fills.
+                                if leg.get('option_type')!='EQ' or (error.status_code!=409 and not isinstance(error,_CashLimitTickMismatch)):raise
+                                reason=str(error.detail)
+                                if leg.get('limit_waiting_reason')!=reason:
+                                    event(db,trade,'limit_waiting_for_cash_market',{'leg_id':leg['id'],'note':reason},quote['received_at'])
+                                leg['limit_waiting_reason']=reason
+                                continue
+                            leg.pop('limit_waiting_reason',None)
+                            if not _pending_fill_permitted(db,trade,leg,pending_settings,fill,quote['received_at']):continue
                             leg['entry_price']=fill;leg['entry_at']=quote['received_at'];leg['open_lots']=leg['lots'];leg['filled_lots']=leg['lots'];leg['status']='open';leg['charges']+=charges(fill,leg['lots']*monetary_units(leg),settings);leg['slippage_cost']+=slip*leg['lots']*monetary_units(leg);trade['net_premium']+=premium_cash_flow(leg,leg['filled_lots'],fill);event(db,trade,'limit_filled',{'leg_id':leg['id'],'price':fill,'quote_event_id':entry.id,'processed_at':iso_now()},quote['received_at'])
                     if leg['status']=='open' and fresh:
                         stop=leg.get('stop_loss');target=leg.get('target');p=quote['ltp'];buy=leg['side']=='BUY'

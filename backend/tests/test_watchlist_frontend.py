@@ -20,13 +20,13 @@ const at=new Date().toISOString(),contract={id:'kotak:test',instrument_id:'kotak
 const quote={...contract,ltp:100,bid:99.9,ask:100.1,previous_close:90,received_at:at};
 const item={instrument_id:contract.id,contract,quote};
 const newest={...quote,ltp:101,received_at:new Date(Date.now()+1000).toISOString()};
-const contaminated=[{...newest,broker:'other'},{...newest,demo:true},{...newest,instrument_id:'other'},{...newest,exchange:'MCX'},{...newest,segment:'mcx_fo'},{...newest,received_at:'invalid'},newest];
+const contaminated=[{...newest,broker:'other'},{...newest,demo:true},{...newest,instrument_id:'other'},{...newest,exchange:'MCX'},{...newest,segment:'mcx_fo'},{...newest,received_at:'invalid'},{...newest,underlying:'RECYCLED'},{...newest,expiry:'2030-11-30'},{...newest,option_type:'CE'},{...newest,lot_size:65}].map(value=>({...value,ltp:999,received_at:value.received_at==='invalid'?'invalid':new Date(Date.now()+2000).toISOString()})).concat([newest]);
 const original=[{instrument_id:'a'},{instrument_id:'b'},{instrument_id:'c'}];
 const success={mode:'PAPER',results:[{broker:'kotak',success:true,trade_id:'paper-1',trade:{id:'paper-1',status:'open'}}]};
 const failures=[{}, {...success,mode:'REAL'},{...success,results:[{broker:'kotak',success:false,trade_id:'paper-1',trade:{id:'paper-1'}}]},{...success,results:[{broker:'kotak',success:true,trade_id:'paper-1',trade:{id:'mismatch'}}]}];
 const props={contract,side:'BUY',settings:{demo_mode:false,fill_basis:'bid_ask',slippage_bps:0,brokerage_per_order:20,charges_percent:.05,stale_after_seconds:10},positions:[],onClose:()=>{},onSuccess:()=>{},onManage:()=>{},notify:()=>{}};
 const render=extra=>renderToStaticMarkup(React.createElement(Order,{...props,quote,...extra}));
-console.log(JSON.stringify({newest:data.latestWatchQuote(item,contaminated)?.ltp,stale:[data.watchQuoteStale(null,10),data.watchQuoteStale({...quote,stale:true},10),data.watchQuoteStale({...quote,received_at:new Date(Date.now()-20000).toISOString()},10),data.watchQuoteStale(quote,10)],changeMissing:data.watchChange({...quote,previous_close:null}),order:data.reorderedWatchIds(original,'c','a'),untouched:original.map(v=>v.instrument_id),success:data.successfulPaperTrade(success)?.id,rejections:failures.map(data.successfulPaperTrade),live:render({}),missing:render({quote:null}),staleOrder:render({quote:{...quote,received_at:new Date(Date.now()-20000).toISOString()}}),demoOrder:render({settings:{...props.settings,demo_mode:true}}),fallback:render({quote:{...quote,bid:null,ask:null}})}));`;
+console.log(JSON.stringify({newest:data.latestWatchQuote(item,contaminated)?.ltp,stale:[data.watchQuoteStale(null,10),data.watchQuoteStale({...quote,stale:true},10),data.watchQuoteStale({...quote,received_at:new Date(Date.now()-20000).toISOString()},10),data.watchQuoteStale(quote,10)],changeMissing:data.watchChange({...quote,previous_close:null}),order:data.reorderedWatchIds(original,'c','a'),untouched:original.map(v=>v.instrument_id),success:data.successfulPaperTrade(success)?.id,rejections:failures.map(data.successfulPaperTrade),live:render({}),missing:render({quote:null}),staleOrder:render({quote:{...quote,received_at:new Date(Date.now()-20000).toISOString()}}),demoOrder:render({settings:{...props.settings,demo_mode:true}}),fallback:render({quote:{...quote,bid:null,ask:null}}),equitySellEmpty:render({side:'SELL'}),equitySellOwned:render({side:'SELL',positions:[{id:'held-equity',name:'Owned equity',legs:[{instrument_id:contract.id,side:'BUY',open_lots:12}]}]})}));`;
 const output=esbuild.buildSync({stdin:{contents:source,resolveDir:root,sourcefile:'watchlist-helper-test.tsx',loader:'tsx'},bundle:true,write:false,platform:'node',format:'cjs',jsx:'automatic',loader:{'.css':'empty'},define:{'import.meta.env':'{}'}}).outputFiles[0].text;
 const mod=new Module(root+'/watchlist-helper-test.cjs');mod._compile(output,root+'/watchlist-helper-test.cjs');
 """
@@ -68,3 +68,15 @@ def test_order_confirmation_requires_fresh_genuine_quotes_and_spread_review(rend
         assert confirm_disabled(rendered[name]) is True,name
     assert 'Quantity' in rendered['live'] and 'shares' in rendered['live']
     assert 'No real broker order is sent.' in rendered['live']
+
+
+def test_equity_sell_manages_owned_shares_without_opening_a_short(rendered):
+    empty=rendered['equitySellEmpty'];owned=rendered['equitySellOwned']
+    assert 'No equity shares to sell' in empty
+    assert 'Manage shares to sell' in owned and '12 shares held' in owned
+    assert 'market exits' in owned
+    for html in (empty,owned):
+        assert 'Confirm Paper Trade' not in html
+        assert 'New paper sell order' not in html
+    assert 'value="SELL"' not in rendered['live']
+    assert 'value="LIMIT"' in rendered['live']
