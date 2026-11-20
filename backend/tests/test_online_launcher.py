@@ -166,6 +166,9 @@ def test_stop_touches_only_online_process_with_exact_creation_token(project, mon
 def test_unverifiable_service_does_not_start_process_or_create_report_state(project, monkeypatch):
     config = launcher.load_config(project)
     monkeypatch.setattr(launcher, 'ROOT', project)
+    # Keep this test focused on service verification; the fixture uses a
+    # Windows folder path, which is not absolute to pathlib on Linux runners.
+    monkeypatch.setattr(launcher, 'load_config', lambda root=launcher.ROOT: config)
     # The product is Windows-only; the test runner is Linux.
     monkeypatch.setattr(launcher.os, 'name', 'nt')
     monkeypatch.setattr(launcher, 'paper_health', lambda url: False)
