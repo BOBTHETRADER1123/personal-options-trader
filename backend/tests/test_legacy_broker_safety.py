@@ -1,4 +1,4 @@
-"""Retired broker history survives while all new runtime access uses Kotak only."""
+"""Preserved legacy trade history stays read-only; Kotak is the active broker."""
 import asyncio
 import copy
 import json
@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from app import engine,option_chain
 from app.brokers import FeedManager
 from app.database import Base,configure_sqlite
-from app.instruments import BROKERS,LEGACY_BROKERS,ContractCatalog,import_master
+from app.instruments import BROKERS,LEGACY_BROKERS,ContractCatalog,import_master,normalize_row
 from app.models import Trade,ActionRecord
 from app.schemas import TradeInput,SettingsInput
 
@@ -72,6 +72,8 @@ def test_retired_master_import_and_live_chain_reject_before_network(tmp_path):
  output=tmp_path/'master.json'
  with pytest.raises(ValueError,match='Only Kotak Neo'):import_master('fivepaisa','',output)
  assert not output.exists()
+ with pytest.raises(ValueError,match='Only Kotak Neo'):
+  normalize_row('fivepaisa',{})
  for operation in (option_chain.validate_broker,option_chain.download_master,option_chain.configured):
   with pytest.raises(HTTPException) as error:operation('fivepaisa')
   assert error.value.status_code==422

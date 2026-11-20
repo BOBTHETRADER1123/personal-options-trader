@@ -1,12 +1,12 @@
 # Your Personal Options Trader
 
-This is your private paper-trading website. **Kotak Neo is the only enabled broker. The app cannot place real broker orders.** Existing 5paisa and Dhan trade histories and exports are preserved as historical records; they are not active connection or new-trade choices.
+This is your personal paper-trading website. **Kotak Neo is the only enabled broker. The app cannot place real broker orders.** Older imported broker history remains read-only and is not an active connection or new-trade choice.
 
 ## Open the website
 
 Open [Personal Options Trader](https://personal-options-trader.vercel.app/) on your phone or laptop and sign in with your existing app password. Both devices use the same online workspace.
 
-The configured online setup is Vercel for the website, RamNaym server **1606** for the backend, and SQLite at `/app/data/trading.db` on its persistent volume. It does not depend on Neon or your laptop remaining switched on. The hosting plan must remain active, and broker sessions, market permissions and service connectivity must be available. No uninterrupted-uptime guarantee is implied.
+The configured online setup uses Vercel for the website, RamNaym for the backend, and SQLite at `/app/data/trading.db` on persistent storage. It does not depend on your laptop remaining switched on. The hosting plan must remain active, and broker sessions, market permissions and service connectivity must be available. No uninterrupted-uptime guarantee is implied.
 
 If the page says **Connection unavailable**, use **Check connection** after the backend is reachable. A loading Vercel page alone does not prove the backend is healthy. Do not create a second owner account or replace the database to fix a connection error.
 

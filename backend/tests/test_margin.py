@@ -103,14 +103,10 @@ def test_unverified_monetary_conversion_does_not_guess_premium():
     assert result["net_premium"] is None and result["total_margin"] is None
 
 
-def test_retired_broker_is_independent_and_does_not_enable_connection():
+def test_retired_broker_has_no_margin_assessment_adapter():
     five = [{**leg, "broker": "fivepaisa"} for leg in legs()]
-    result = unavailable_for_basket(five, broker="fivepaisa")
-    assert result["status"] == "unavailable" and result["verified"] is False
-    assert "disabled" in result["source"] and "Kotak Neo only" in result["reason"]
-    assert result["request_fingerprint"] != unavailable_for_basket(legs())["request_fingerprint"]
-    with pytest.raises(ValueError, match="mix brokers"):
-        unavailable_for_basket(five)
+    with pytest.raises(ValueError, match="Unsupported broker"):
+        unavailable_for_basket(five, broker="fivepaisa")
 
 
 @pytest.mark.parametrize("change", [

@@ -24,11 +24,8 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 BROKERS = ("kotak",)
 LEGACY_BROKERS = ("dhan", "fivepaisa")
-# Offline decoding remains available for preserved historical imports only.
-PARSABLE_BROKERS = ("kotak", "fivepaisa")
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_PATH = Path(__file__).resolve().parents[1] / "data" / "instruments.json"
-FIVEPAISA_MASTER_URL = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/all"
 
 
 def _date(value: object) -> str:
@@ -43,7 +40,6 @@ def _date(value: object) -> str:
     dotnet = re.fullmatch(r"/?Date\((-?\d+)(?:[+-]\d+)?\)/?", text)
     if dotnet:
         return datetime.fromtimestamp(int(dotnet[1]) / 1000, IST).date().isoformat()
-    # 5paisa currently uses integer YYYYMMDD or epoch milliseconds, depending on dump.
     if re.fullmatch(r"\d{10,13}", text):
         number = int(text)
         return datetime.fromtimestamp(number / (1000 if len(text) > 10 else 1), IST).date().isoformat()
@@ -190,14 +186,12 @@ _MCX_ENERGY_UNITS = {
 }
 
 
-def _mcx_conversion(broker, row, underlying, lot_size):
+def _mcx_conversion(row, underlying, lot_size):
     """Return an extra monetary factor, never multiply contract quantity twice.
 
-    5paisa documents Multiplier as a TOTAL QUANTITY conversion. It is not an
-    additional factor after our lot_size has already expanded lots to units.
     Unknown commodities remain unavailable until explicitly verified.
     """
-    raw_multiplier = _pick(row, "Multiplier", "MULTIPLIER") if broker == "fivepaisa" else _pick(row, "lMultiplier")
+    raw_multiplier = _pick(row, "lMultiplier")
     try:
         quantity_multiplier = _positive(raw_multiplier) if raw_multiplier else None
     except (ValueError, TypeError, OverflowError):
@@ -213,24 +207,20 @@ def _mcx_conversion(broker, row, underlying, lot_size):
     specification = _MCX_ENERGY_UNITS.get(_underlying(underlying))
     if not specification or lot_size != specification[0]:
         return result
-    if broker == "fivepaisa":
-        verified = quantity_multiplier == lot_size
-    else:
-        def unit(field):return re.sub(r"\s+", "", _pick(row, field)).casefold()
-        allowed_units = specification[1]
-        # The broker explicitly supplies the quoted unit and traded quantity
-        # unit. Require unity quotation/conversion factors, not a name-based
-        # assumption about an arbitrary MCX contract.
-        units_ok = unit("pPriceUnits") in allowed_units and unit("pTrdUnits") in allowed_units
-        delivery = unit("pDeliveryUnits")
-        units_ok = units_ok and (not delivery or delivery in allowed_units)
-        try:
-            quotation = _positive(_pick(row, "dPriceQuatation", "dPriceQuotation"))
-            factors_ok = all(not _pick(row, key) or _positive(_pick(row, key)) == 1
-                             for key in ("dPriceNum", "dPriceDen", "dGenNum", "dGenDen"))
-            verified = units_ok and quotation == 1 and factors_ok
-        except (ValueError, TypeError, OverflowError):
-            verified = False
+    def unit(field):return re.sub(r"\s+", "", _pick(row, field)).casefold()
+    allowed_units = specification[1]
+    # The official Kotak master must explicitly supply the quotation and trade
+    # units. Do not infer a monetary conversion from a symbol or quantity alone.
+    units_ok = unit("pPriceUnits") in allowed_units and unit("pTrdUnits") in allowed_units
+    delivery = unit("pDeliveryUnits")
+    units_ok = units_ok and (not delivery or delivery in allowed_units)
+    try:
+        quotation = _positive(_pick(row, "dPriceQuatation", "dPriceQuotation"))
+        factors_ok = all(not _pick(row, key) or _positive(_pick(row, key)) == 1
+                         for key in ("dPriceNum", "dPriceDen", "dGenNum", "dGenDen"))
+        verified = units_ok and quotation == 1 and factors_ok
+    except (ValueError, TypeError, OverflowError):
+        verified = False
     if verified:
         result.update(price_multiplier=1.0, multiplier_verified=True,
                       monetary_conversion_source="mcx_energy_contract_units_v1")
@@ -272,33 +262,21 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     Kotak changed its CSV schema; transformed-v1 fields are supported. A schema
     change fails validation rather than inventing missing tokens or lot sizes.
     """
-    if broker not in PARSABLE_BROKERS:
-        raise ValueError("Unknown broker")
+    if broker != "kotak":
+        raise ValueError("Only Kotak Neo contracts can be normalized for new trading.")
     row = {str(key).strip().rstrip(";"): value for key, value in row.items()}
-    if broker == "fivepaisa":
-        token = _pick(row, "ScripCode", "token")
-        exchange = {"N": "NSE", "B": "BSE", "M": "MCX"}.get(_pick(row, "Exch"), _pick(row, "exchange"))
-        segment = _pick(row, "ExchType", "segment", default="D")
-        symbol = _pick(row, "Name", "ScripData", "symbol")
-        underlying = _pick(row, "SymbolRoot", "underlying")
-        expiry = _pick(row, "Expiry", "expiry")
-        strike = _pick(row, "StrikeRate", "strike")
-        option_type = _pick(row, "ScripType", "option_type")
-        lot = _pick(row, "LotSize", "lot_size")
-        tick = _pick(row, "TickSize", "tick_size", default="0.05")
-    else:
-        # Documented transformed-v1 names. Native files must include a segment
-        # column or the operator must supply --segment, never infer from token.
-        token = _pick(row, "pSymbol", "instrument_token", "token")
-        segment = _pick(row, "pExchSeg", "exchange_segment", "segment", default=exchange_segment or "")
-        exchange = {"nse_fo": "NSE", "bse_fo": "BSE", "mcx_fo": "MCX"}.get(segment.lower(), _pick(row, "exchange"))
-        symbol = _pick(row, "pTrdSymbol", "trading_symbol", "symbol")
-        underlying = _pick(row, "pSymbolName", "pUnderlying", "underlying")
-        expiry, expiry_schema = _kotak_row_expiry(row, segment, underlying)
-        strike = _kotak_native_price(row, "dStrikePrice", "strike")
-        option_type = _pick(row, "pOptionType", "option_type")
-        lot = _pick(row, "lLotSize", "lot_size")
-        tick = _kotak_native_price(row, "dTickSize", "tick_size", default="0.05")
+    # Documented transformed-v1 names. Native files must include a segment
+    # column or the operator must supply --segment, never infer from token.
+    token = _pick(row, "pSymbol", "instrument_token", "token")
+    segment = _pick(row, "pExchSeg", "exchange_segment", "segment", default=exchange_segment or "")
+    exchange = {"nse_fo": "NSE", "bse_fo": "BSE", "mcx_fo": "MCX"}.get(segment.lower(), _pick(row, "exchange"))
+    symbol = _pick(row, "pTrdSymbol", "trading_symbol", "symbol")
+    underlying = _pick(row, "pSymbolName", "pUnderlying", "underlying")
+    expiry, expiry_schema = _kotak_row_expiry(row, segment, underlying)
+    strike = _kotak_native_price(row, "dStrikePrice", "strike")
+    option_type = _pick(row, "pOptionType", "option_type")
+    lot = _pick(row, "lLotSize", "lot_size")
+    tick = _kotak_native_price(row, "dTickSize", "tick_size", default="0.05")
     option_type = option_type.upper()
     # Both official masters use XX for futures in derivative segments. An
     # explicit FUT in the normalized template is supported as well; cash XX
@@ -309,7 +287,7 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
         raise ValueError("Not an option contract")
     if not token or not symbol or not underlying or not segment or exchange not in {"NSE", "BSE", "MCX"}:
         raise ValueError("Missing token, symbol, underlying, exchange or segment")
-    allowed_segments = ({"nse_fo", "bse_fo", "mcx_fo"} if broker == "kotak" else {"D"})
+    allowed_segments = {"nse_fo", "bse_fo", "mcx_fo"}
     if segment not in allowed_segments:
         raise ValueError("Unsupported derivative segment")
     if not str(token).isdigit():
@@ -318,9 +296,9 @@ def normalize_row(broker: str, row: dict, exchange_segment: str | None = None) -
     parsed_strike = 0.0 if option_type == "FUT" else _positive(strike)
     parsed_lot = _positive(lot, True)
     # Kotak native paise fields were converted only for the supported schema
-    # above. Normalized template prices and 5paisa prices are already human units.
-    contract_id = f"{broker}:{exchange}:{segment}:{token}" if broker == "fivepaisa" else f"{broker}:{segment}:{token}"
-    conversion = (_mcx_conversion(broker, row, underlying, parsed_lot) if exchange == "MCX" else
+    # above. Explicit normalized template prices remain in human units.
+    contract_id = f"{broker}:{segment}:{token}"
+    conversion = (_mcx_conversion(row, underlying, parsed_lot) if exchange == "MCX" else
                   {"price_multiplier": 1.0, "multiplier_verified": True,
                    "broker_quantity_multiplier": None, "monetary_conversion_source": None})
     return {"id": contract_id, "instrument_id": contract_id, "broker": broker,
@@ -850,8 +828,6 @@ def main():
             url = client.scrip_master(exchange_segment=args.segment)
             if not isinstance(url, str) or not url.startswith("https://"):
                 raise ValueError("Broker did not return an HTTPS CSV URL")
-        else:
-            url = FIVEPAISA_MASTER_URL
         with urllib.request.urlopen(url, timeout=90) as response:
             text = response.read(50_000_001).decode("utf-8-sig")
             if len(text) > 50_000_000:

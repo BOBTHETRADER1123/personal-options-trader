@@ -1,10 +1,6 @@
 # Verified MCX energy monetary units
 
-Verified on 27 October 2026. The paper engine expands `lots * lot_size` first.
-The extra `price_multiplier` is therefore **1** when the broker lot already
-contains the physical contract quantity below. Applying the broker quantity
-multiplier again would square exposure.
-
+Verified for Kotak Neo on 27 October 2026. The paper engine expands lots times lot size first. The extra price multiplier is therefore **1** when the contract lot already contains the physical quantity below. Applying a quantity multiplier again would square the exposure.
 | MCX symbol | Physical quantity in one lot | Price quotation |
 |---|---:|---|
 | CRUDEOIL | 100 barrels | INR per barrel |
@@ -12,14 +8,7 @@ multiplier again would square exposure.
 | NATURALGAS | 1,250 MMBtu | INR per MMBtu |
 | NATGASMINI | 250 MMBtu | INR per MMBtu |
 
-5paisa explicitly defines its native `Multiplier` as a **total quantity**
-conversion, rather than a second monetary factor. The current public master
-contains matching `LotSize` and `Multiplier` for all four products (CE, PE and
-XX futures). We require both native fields to match the specification quantity.
-The original positive native multiplier is retained as
-`broker_quantity_multiplier`, separately from the effective price multiplier.
-
-Kotak requires the same exact product and lot quantity, explicitly matching
+Kotak's official master must identify the exact product and lot quantity, explicitly matching
 `pPriceUnits` and `pTrdUnits`, compatible delivery units where supplied, and
 unity `dPriceQuatation` plus any supplied numerator/denominator factors.
 A native `lMultiplier=-1` is not used to guess a conversion. Missing or
@@ -33,7 +22,6 @@ Persisted trade legs and history are never rewritten by catalog loading.
 
 ## Primary references
 
-- [5paisa scrip master field definitions](https://xstream.5paisa.com/dev-docs/docFundamentals/scrip-master): `LotSize`, rupee `TickSize`, and quantity `Multiplier`.
 - [MCX Crude Oil products and current specifications](https://www.mcxindia.com/products/energy/crude-oil).
 - [MCX Natural Gas products and current specifications](https://www.mcxindia.com/products/energy/natural-gas).
 - [Crude Oil futures, January 2026 onwards](https://www.mcxindia.com/docs/default-source/products/contract-specification/crude-oil/crude-oil-january-2026-contract-onwards267be8c1-650a-4baa-aabd-ffcc9364c100.pdf).

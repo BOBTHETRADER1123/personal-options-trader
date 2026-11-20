@@ -62,14 +62,6 @@ def test_future_ignores_native_no_strike_sentinel_but_scales_tick():
     assert result['option_type'] == 'FUT' and result['strike'] == 0 and result['tick_size'] == .05
 
 
-def test_fivepaisa_human_price_fields_and_strict_multiplier_unchanged():
-    row = {'Exch':'M', 'ExchType':'D', 'ScripCode':'123', 'Name':'OPAQUE', 'SymbolRoot':'NATURALGAS',
-           'Expiry':'20301029', 'StrikeRate':'545', 'TickSize':'.05', 'ScripType':'CE', 'LotSize':'1250', 'Multiplier':'1250'}
-    result = normalize_row('fivepaisa', row)
-    assert result['strike'] == 545 and result['tick_size'] == .05 and result['price_multiplier'] == 1
-    assert normalize_row('fivepaisa', {**row, 'Multiplier':'-1'})['price_multiplier'] is None
-
-
 def test_direct_bse_end_of_day_epoch_keeps_utc_business_date():
     result = normalize_row('kotak', native(pExchSeg='bse_fo', pSymbolName='SENSEX', lExpiryDate='1795219199'))
     assert result['expiry'] == '2026-11-20'

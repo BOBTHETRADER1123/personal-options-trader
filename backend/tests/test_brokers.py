@@ -86,29 +86,7 @@ def test_kotak_documented_mcx_epoch_has_no_offset():
     assert row["expiry"] == "2030-10-29"
 
 
-def test_fivepaisa_native_master_normalization():
-    row = normalize_row("fivepaisa", {"ScripCode": "123", "Exch": "M", "ExchType": "D", "Name": "GOLD CE", "SymbolRoot": "GOLD",
-                                      "Expiry": "20301029", "StrikeRate": "75000", "ScripType": "CE", "LotSize": "100"})
-    assert row["exchange"] == "MCX" and row["segment"] == "D" and row["expiry"] == "2030-10-29"
-    assert row["price_multiplier"] is None and row["multiplier_verified"] is False
-
-
-def test_quantity_multiplier_does_not_authorize_unverified_mcx_value():
-    data = {"ScripCode": "123", "Exch": "M", "ExchType": "D", "Name": "GOLD CE", "SymbolRoot": "GOLD",
-            "Expiry": "20301029", "StrikeRate": "75000", "ScripType": "CE", "LotSize": "1", "Multiplier": "100"}
-    row = normalize_row("fivepaisa", data)
-    assert row["lot_size"] == 1 and row["price_multiplier"] is None
-    assert row["multiplier_verified"] is False
-    explicit = normalize_row("fivepaisa", {**data, "price_multiplier": "100"})
-    assert explicit["price_multiplier"] == 100 and explicit["monetary_conversion_source"]
-    with pytest.raises(ValueError):
-        normalize_row("fivepaisa", {**data, "price_multiplier": "0"})
-
-
-def test_equity_multiplier_is_one_and_demo_mcx_explicitly_fictional():
-    data = {"ScripCode": "123", "Exch": "N", "ExchType": "D", "Name": "NIFTY CE", "SymbolRoot": "NIFTY",
-            "Expiry": "20301029", "StrikeRate": "25000", "ScripType": "CE", "LotSize": "50"}
-    assert normalize_row("fivepaisa", data)["price_multiplier"] == 1
+def test_demo_mcx_explicitly_fictional():
     assert all(r["price_multiplier"] == 1 and r["demo"] for r in demo_contracts() if r["exchange"] == "MCX")
 
 
@@ -128,15 +106,6 @@ def test_kotak_master_import_preserves_retired_rows_and_is_atomic(tmp_path):
     assert path.read_bytes()==before
     with pytest.raises(ValueError,match="Only Kotak Neo"):import_master("fivepaisa",text,path)
     assert path.read_bytes()==before
-
-
-def test_retired_all_segment_master_cannot_be_imported_and_currency_is_not_relabelled(tmp_path):
-    currency={"ScripCode":"456","Exch":"N","ExchType":"U","Name":"USDINR CE","SymbolRoot":"USDINR",
-              "Expiry":"2030-10-29","StrikeRate":"85","ScripType":"CE","LotSize":"1000"}
-    with pytest.raises(ValueError,match="Unsupported derivative segment"):normalize_row("fivepaisa",currency)
-    path=tmp_path/"master.json"
-    with pytest.raises(ValueError,match="Only Kotak Neo"):import_master("fivepaisa","",path)
-    assert not path.exists()
 
 
 def test_market_session_without_calendar_unknown(monkeypatch):
@@ -194,17 +163,9 @@ def test_legacy_master_does_not_block_current_broker_and_cannot_be_imported(tmp_
         import_master('dhan','',path)
 
 
-def test_fivepaisa_tokens_are_scoped_to_exchange():
-    data={'ScripCode':'123','Exch':'N','ExchType':'D','Name':'EXAMPLE','SymbolRoot':'NIFTY','Expiry':'20301029','StrikeRate':'25000','ScripType':'CE','LotSize':'50'}
-    assert normalize_row('fivepaisa',data)['id']!=normalize_row('fivepaisa',{**data,'Exch':'B'})['id']
-
-
-@pytest.mark.parametrize('broker,raw',[
-    ('fivepaisa',{'ScripCode':'123','Exch':'N','ExchType':'D','Name':'NIFTY FUT','SymbolRoot':'NIFTY','Expiry':'20301029','StrikeRate':'0','ScripType':'XX','LotSize':'50'}),
-    ('kotak',{'pSymbol':'123','pExchSeg':'nse_fo','pTrdSymbol':'NIFTY FUT','pSymbolName':'NIFTY','expiry':'2030-10-29','dStrikePrice':'0','pOptionType':'XX','lLotSize':'50'}),
-])
-def test_native_future_master_not_mislabelled_as_call(broker,raw):
-    result=normalize_row(broker,raw)
+def test_kotak_native_future_master_not_mislabelled_as_call():
+    raw={'pSymbol':'123','pExchSeg':'nse_fo','pTrdSymbol':'NIFTY FUT','pSymbolName':'NIFTY','expiry':'2030-10-29','dStrikePrice':'0','pOptionType':'XX','lLotSize':'50'}
+    result=normalize_row('kotak',raw)
     assert result['option_type']=='FUT' and result['instrument_type']=='future' and result['strike']==0
 
 

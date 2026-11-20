@@ -1,6 +1,6 @@
 # Kotak Neo market-data connection
 
-**Kotak Neo is the only enabled broker for live market data and new paper trades.** 5paisa and Dhan integrations are retired. Saved trades, daily reports and archives from those brokers remain historical records; preserving them does not enable a feed or permit a new execution.
+**Kotak Neo is the only enabled broker for live market data and new paper trades.** Older imported records remain read-only history; they do not enable another feed or permit another broker execution.
 
 The application is paper-trading only. No actual broker order-placement endpoint is called. Broker market-data permissions, supported contracts and session availability still apply.
 
@@ -10,7 +10,7 @@ The adapter uses the official asynchronous SFeed implementation from the [Kotak 
 
 Authentication and subscription failures produce sanitized status messages. Transport reconnects use bounded backoff, reconnect counts and resubscription to the selected contracts. The application enforces the SFeed subscription budget; it does not subscribe to the entire imported master.
 
-An untraded strike may contain a zero, blank or missing LTP. It produces no new usable quote and does not reset the previous price's timestamp or stop other valid subscriptions. Malformed or negative/nonfinite prices remain explicit failures. Missing fields are never borrowed from another broker or replaced with invented live values.
+An untraded strike may contain a zero, blank or missing LTP. It produces no new usable quote and does not reset the previous price's timestamp or stop other valid subscriptions. Malformed or negative/nonfinite prices remain explicit failures. Missing fields are never replaced with invented live values.
 
 ## Owner-only private setup
 
@@ -96,4 +96,4 @@ The server's dated exchange calendar controls recording sessions, including holi
 
 During a real exchange session on server **1606**, verify Kotak authentication, quote reception and timestamps, session expiry, transport reconnection, paper entry/partial exit/full exit, one-second recording with website tabs closed, and restart resubscription. Check the exact recording gaps, exports, backups and measured CPU/RAM/latency.
 
-Offline parser and accounting tests do not prove an authenticated broker connection. Earlier 5paisa login, master or socket observations are historical evidence only. They are not evidence that the current Kotak-only deployment has passed live acceptance. No real broker order may be sent during testing.
+Offline parser and accounting tests do not prove an authenticated broker connection. Current Kotak deployment acceptance still requires a real-session check. No real broker order may be sent during testing.

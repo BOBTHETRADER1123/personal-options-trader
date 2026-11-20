@@ -16,10 +16,6 @@ For a valid comparison, select the exact NSE NIFTY expiry and verified units for
 
 **Numerical comparison status:** the official calculator was opened on 30 October, but selection/search did not yield a verified basket result. NATURALGAS search displayed “No results found” before complete exchange/segment selection; this does not establish instrument unavailability. No verified calculator result for the five specified legs has been captured. No numerical broker margin or hedge benefit is claimed to have passed comparison. Record the actual result and timestamp before marking this check complete.
 
-## 5paisa research only
-
-The [official Multi Order Margin documentation](https://xstream.5paisa.com/dev-docs/funds-management-system/Multi%20order%20margin) documents a set of hypothetical orders, combined margin including hedge benefits and a `CoverPositions` flag. The documented response provides `TotalMarginRequired`, not separate SPAN/ELM/additional or a standalone hedge-benefit amount. The [official SDK](https://github.com/OpenApi-5p/py5paisa/blob/master/py5paisa/py5paisa.py) exposes `multi_order_Margin`. Its account-funds `margin()` call is a different operation. 5paisa remains disabled; none of these APIs were connected, authenticated or tested in this Kotak-only application.
-
 ## Provenance and safe diagnostics
 
 `backend/app/margin.py` is a pure availability assessment. It performs no network requests, order calls or automatic logging, including during one-second P&L updates. Each response identifies broker, official documentation, assessment time, complete paper portfolio scope and a hash of remaining contract exposures. A change in lots, remaining legs, expiry, strike or broker changes the assessment identity. An assessment timestamp does not imply a verified broker quote.

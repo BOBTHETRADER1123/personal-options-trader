@@ -21,9 +21,6 @@ KOTAK_MARGIN_DOCUMENTATION = (
     "docs/functions/portfolio/margin_required.md"
 )
 KOTAK_MARGIN_CALCULATOR = "https://www.kotakneo.com/calculator/margin-calculator/"
-FIVEPAISA_MULTI_ORDER_DOCUMENTATION = (
-    "https://xstream.5paisa.com/dev-docs/funds-management-system/Multi%20order%20margin"
-)
 MARGIN_FIELDS = (
     "span_margin", "elm", "additional_margin", "total_margin",
     "hedge_benefit", "final_capital_required",
@@ -37,14 +34,6 @@ _SOURCES = {
             "No officially documented complete hypothetical basket margin adapter has "
             "been verified for this app. Single-order results may include the real "
             "account's positions and must not be added or used as paper basket margin."
-        ),
-    },
-    "fivepaisa": {
-        "source": "5paisa official Multi Order Margin documentation; integration disabled",
-        "source_url": FIVEPAISA_MULTI_ORDER_DOCUMENTATION,
-        "reason": (
-            "5paisa documents combined multi-order margin with hedge benefit, but this "
-            "application is Kotak Neo only. No 5paisa request or connection is enabled."
         ),
     },
 }

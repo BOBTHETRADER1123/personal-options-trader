@@ -1,6 +1,6 @@
 # Google authorization and cloud trade archives
 
-The current design uses Vercel, RamNaym server 1606 and verified local SQLite at `/app/data/trading.db`. Neon and the original laptop records are preserved separately for recovery. This document describes implemented behavior and setup; it is not evidence that Google consent or production uploads have already passed.
+The current design uses Vercel, RamNaym and SQLite on persistent storage. Neon and the original laptop records are preserved separately for recovery. This guide describes implemented behavior and setup; it is not evidence that Google consent or production uploads have already passed.
 
 The older laptop companion and its existing `Personal Options Trader Backups` folder are separate. The cloud application uses its own owner-authorized Google OAuth client. It never copies Codex connector tokens into the backend.
 
@@ -62,10 +62,9 @@ Paper Trading Records/
       Kotak Neo/
         <trade>_summary.xlsx
         <trade>_history.csv.gz
-      5paisa/
-        <trade>_summary.xlsx
-        <trade>_history.csv.gz
 ```
+
+Existing archived files are left in their existing Drive folders and are not renamed by this workflow.
 
 The immutable export manifest supplies actual filenames. The compact individual-trade workbook summarizes final P&L, observed maximum profit/loss, legs and costs. Available one-second history is retained in a separate CSV.gz. Old compact trades have no invented historical rows. The new full daily workbook is a separate reporting workflow.
 

@@ -145,8 +145,6 @@ Observed **30 October 2026** access results:
 
 Therefore **genuine exchange SPAN, verified Kotak basket margin and numerical calculator parity remain untested/unavailable**. The change deliberately withholds amounts instead of publishing plausible-looking estimates. No anti-bot bypass, undocumented calculator endpoint or paid data service was used. Details and acceptance conditions are in [exchange margin data](EXCHANGE-MARGIN-DATA.md).
 
-The earlier 5paisa research documents an official combined multi-order margin interface, but 5paisa stays disabled. It was not authenticated or tested as part of this Kotak-only change.
-
 ## Regression coverage and release checks
 
 Automated fixtures cover the requested CE portfolio, actual saved PE interpretation, NATURALGAS spread, finite and unlimited tails, all roots/zero intervals, mixed settlement groups, lot/quantity changes, partial closes and realized offsets, stale and future timestamps, malformed financial inputs, safe margin display, scalar diagnostic scope and official-file quarantine boundaries. Broker responses and exchange fixtures in these automated tests are mocked or synthetic.
@@ -164,4 +162,3 @@ Final local release checks on 4 November: 734 backend tests passed, 0 failed, wi
 - [MCXCCL risk files](https://www.mcxccl.com/risk-management/daily-span-risk-parameter-file)
 - [MCXCCL risk and devolvement FAQ](https://www.mcxccl.com/risk-management/faq)
 - [ICCL risk parameter page](https://www.icclindia.com/riskmgmt/RiskparameterNEW.aspx)
-- [5paisa research-only multi-order margin documentation](https://xstream.5paisa.com/dev-docs/funds-management-system/Multi%20order%20margin)

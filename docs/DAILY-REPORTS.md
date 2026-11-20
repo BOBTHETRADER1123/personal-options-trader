@@ -4,7 +4,7 @@ This guide describes the implemented daily-report workflow. It does not certify 
 
 ## What a daily report contains
 
-Dates use **Asia/Kolkata (IST)**. A broker-specific trade has its own worksheet, such as `Trade_001_Kotak` or `Trade_002_5paisa`. Mirrored broker executions remain separate and share a strategy ID. A position held over several dates keeps its original trade ID; subsequent daily worksheets are marked `Continued`.
+Dates use **Asia/Kolkata (IST)**. Each broker-specific execution has its own worksheet, for example Trade_001_Kotak and Trade_002_Kotak. Mirrored executions remain separate and share a strategy ID. A position held over several dates keeps its original trade ID; subsequent daily worksheets are marked `Continued`.
 
 Each workbook includes `Daily_Summary`, trade identity and lifecycle information, and the observations actually captured for that date. Columns include original quote timestamps, quote age, stale/reused status, quantities, leg P&L, strategy P&L, costs, estimated margin, theoretical payoff and observed P&L extrema when those values were captured. Missing historical values are not recreated from today's prices. Estimated costs and margin are not official broker figures.
 

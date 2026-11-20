@@ -1,8 +1,8 @@
 # Excel reports and the laptop companion
 
-The current cloud service is RamNaym #1606 with persistent SQLite. This guide covers the optional individual-trade laptop companion; use [Daily Excel Downloads](DAILY-REPORTS.md) for complete daily one-second workbooks and [cloud backups](GOOGLE-DRIVE-CLOUD.md) for unattended Google uploads. Historical broker-labelled files remain readable; new trades use Kotak Neo only.
+The current cloud service uses persistent SQLite. This guide covers the optional individual-trade laptop companion; use [Daily Excel Downloads](DAILY-REPORTS.md) for complete daily one-second workbooks and [cloud backups](GOOGLE-DRIVE-CLOUD.md) for unattended Google uploads. Existing archived files remain readable; new trades use Kotak Neo only.
 
-Every completed paper trade has its own export job, workbook and immutable manifest. Dhan, Kotak Neo and 5paisa reports are separated by broker, year, month and trade ID. All report times use **Asia/Kolkata**. Sample-mode reports state that prices and fills are simulated.
+Every completed paper trade has its own export job, workbook and immutable manifest. New reports use the active Kotak Neo account; existing archived reports remain in place and are not rewritten. All report times use **Asia/Kolkata**. Sample-mode reports state that prices and fills are simulated.
 
 The closing transaction queues a compact trade summary. A background worker generates Excel without delaying the trading request. Workbook bytes stay in the database until collected; temporary runtime files are not their only copy. New summary jobs omit raw quote and timeline arrays. Report lists read metadata without loading full workbooks or histories.
 
@@ -19,9 +19,9 @@ The connected [Google Drive backup workflow](GOOGLE-DRIVE-BACKUPS.md) saves avai
 
 1. Finish the main Windows installation in the project README. Keep this entire project folder on your laptop.
 2. Open the **companion** folder inside the project. Double-click **start-companion.bat**.
-3. On the first run, enter your backend URL. For an app running only on this laptop, press Enter to use `http://127.0.0.1:8000`. For the current cloud app, enter `https://libzw8xd976f.ramnaymcloud.com`, without `/api`.
+3. On the first run, enter your backend URL. For an app running only on this laptop, press Enter to use `http://127.0.0.1:8000`. For the current cloud app, enter the backend HTTPS address from your private hosting settings, without the API path.
 4. Choose the folder for your reports, or press Enter to use `Documents/PaperTrading/Trades`. The setup saves a private configuration file called `companion/.env` on your laptop.
-5. Setup displays a **hash**. For local use, open the project's root `.env` file in Notepad and put the displayed hash after `COMPANION_TOKEN_SHA256=`. For the cloud app, add the same setting to RamNaym #1606's private environment settings. Do not put the raw companion token in Vercel, GitHub or browser settings.
+5. Setup displays a **hash**. For local use, open the project's root `.env` file in Notepad and put the displayed hash after `COMPANION_TOKEN_SHA256=`. For the cloud app, add the same setting to the backend's private environment settings. Do not put the raw companion token in Vercel, GitHub or browser settings.
 6. Restart the backend after setting the hash. Leave the companion window running. It makes an outbound request to your backend approximately every ten seconds; it does not open a public port on your laptop.
 7. Complete a paper trade. Open **Reports** in the website. It should first show the job as queued/preparing, then ready for your laptop, and finally saved after verification.
 8. Open the chosen folder. The workbook is inside a broker/year/month/trade subfolder, for example `Kotak Neo/2026/10/Trade_<id>/NIFTY_<id>_<closing-time>_IST.xlsx`. The dates come from the actual closing time.

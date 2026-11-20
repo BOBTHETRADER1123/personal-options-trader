@@ -1,14 +1,14 @@
 # Personal Options Trader
 
-This is an update to the existing personal paper-trading app. It preserves working features and records. Only **Kotak Neo** is enabled for market data and new paper trades. Saved 5paisa and Dhan records remain historical; their integrations are disabled. Real broker order placement is disabled.
+This is the existing personal paper-trading app. **Kotak Neo** is the only enabled source for market data and new paper trades. Older imported broker records remain read-only for history; they are not active integrations. Real broker order placement is disabled.
 
 ## Current setup and deployment status
 
-The production deployment is **Vercel frontend + RamNaym server 1606 backend + SQLite at `/app/data/trading.db`** on the verified persistent volume. One asynchronous application worker owns market recording. The existing React/TypeScript frontend is retained.
+The production setup uses a **Vercel frontend, a FastAPI backend and SQLite at `/app/data/trading.db`** on persistent storage. One asynchronous application worker owns market recording.
 
-**Migration verified on 25 October 2026:** the public Vercel website now connects to RamNaym SQLite and reports database_ready=true. The approved laptop copy contains one owner, four saved sample trades, 78,172 original quote records and 104,612 original history rows. Owner sign-in through Vercel and an authenticated WebSocket were observed. A subsequent source-only redeploy and container restart retained the account and four trades; the private bootstrap payload is absent from the active image, and the worker limit remains one. Those migration checks do not prove broker feeds or Google uploads. Kotak MCX quote delivery was subsequently observed on 28 October; full live-load and recovery acceptance remains outstanding. Sample trades remain separate from genuine broker-data paper trades. The old Neon database and laptop source remain preserved.
+Service availability, broker feeds and Google uploads depend on the current provider and account configuration. Automated tests and previous deployment checks do not guarantee uninterrupted service or a live broker connection. Sample trades remain separate from genuine broker-data paper trades.
 
-Website: [personal-options-trader.vercel.app](https://personal-options-trader.vercel.app/). Private source: [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader). `http://127.0.0.1:8011` is an isolated laptop preview, not the public cloud service.
+Website: [Personal Options Trader](https://personal-options-trader.vercel.app/). Source: [GitHub repository](https://github.com/BOBTHETRADER1123/personal-options-trader). A `127.0.0.1` address is an isolated laptop preview, not the public cloud service.
 
 ## Start with these guides
 
@@ -37,15 +37,15 @@ Mocked tests are not proof of authenticated broker connectivity or a successful 
 
 Use Python 3.12 and the existing virtual environment. Backend dependencies are in `backend/requirements.txt`, with supported Kotak dependencies in `backend/requirements-brokers.txt`. Frontend scripts are in `frontend/package.json`. Production packaging is in `deploy/ramnaym`; environment templates are in `.env.example`. Never commit private environment files, database copies, OAuth tokens or credentials.
 
-The laptop workspace and old cloud records remain preserved. [START-HERE.md](START-HERE.md), [laptop export/companion recovery](docs/EXPORTS.md) and [existing laptop Drive backups](docs/GOOGLE-DRIVE-BACKUPS.md) describe earlier local workflows. They are separate from the new unattended cloud setup. Do not delete the old database until replacement data and recovery evidence are verified.
+The laptop workspace and older records remain separate recovery sources. [START-HERE.md](START-HERE.md), [laptop export/companion recovery](docs/EXPORTS.md) and [existing laptop Drive backups](docs/GOOGLE-DRIVE-BACKUPS.md) describe those workflows. Do not delete a database until replacement data and recovery evidence are verified.
 
 ## Latest verified update — 29 October 2026
 
-- The Kotak feed, option-chain and responsive website update is published. The full isolated suite passed **543 tests**, and TypeScript/production builds passed.
+- The Kotak feed, option-chain and responsive website are in the existing deployment. Automated checks have passed in previous releases; check [TEST-REPORT.md](TEST-REPORT.md) for the latest exact results.
 - Normal contract-selection changes use incremental subscriptions. Touch-line data retains LTP, best bid/ask, OI, volume and original timestamps. Unrelated chain quotes no longer copy the entire saved ledger.
 - A clearly labelled futures reference locates nearby option strikes when a fresh verified mark is available. It is not described as cash spot.
 - Four genuine open paper strategies survived the backend update. Closed trades can be removed from website history and performance, then restored through **Removed trades**; original exports and records remain preserved.
-- Sustained hosted live-feed CPU, recording/reconnection and complete Google backup acceptance must still be checked during applicable exchange sessions. Offline tests do not guarantee uninterrupted hosting or broker availability.
+- Sustained hosted live-feed CPU, recording/reconnection and complete Google backup acceptance still need checks during applicable exchange sessions. Offline tests do not guarantee uninterrupted hosting or broker availability.
 
 ## Repository contents and housekeeping
 

@@ -23,8 +23,8 @@
 ## Kotak-only release and contract-loading repair — 28 October 2026
 
 - Complete offline regression suite: **527 passed**, one existing Starlette/httpx deprecation warning. TypeScript and the production Vite build passed.
-- Kotak Neo is the only active broker in website choices, request schemas, market-data adapters, option chains and new paper trades. Removed 5paisa sign-in routes cannot exchange or restore credentials.
-- Saved retired-broker trade records and report schemas are preserved. Tests verify their source data is unchanged, their history remains readable, and they cannot restart feeds or create new fills.
+- Kotak Neo is the only active broker in website choices, request schemas, market-data adapters, option chains and new paper trades.
+- Older imported records and report schemas remain read-only. Tests verify their source data is unchanged and they cannot restart feeds or create new fills.
 - The dashboard no longer downloads the full instrument master. Strategy contracts are loaded in bounded pages for the selected exchange, underlying and expiries; selected-leg quotes have their own bounded, authenticated subscription request.
 - Catalog lookups are indexed. An isolated Windows benchmark with 300,000 synthetic contracts measured 1,000 last-contract lookups at 18.463 seconds before indexing and 0.000544 seconds after. This is not a live server capacity result.
 - Actual SQLite DELETE-journal concurrency tests verify that readers close before socket waits, another writer can commit during reconfiguration, and quote database reads leave the event loop responsive.
@@ -37,13 +37,9 @@
   alias, all **10 MCX accounting/session tests passed** separately.
 - Buy and sell paper-ledger tests verify a one-rupee move changes net P&L by
   exactly the physical quantity: 100/10 barrels or 1250/250 MMBtu, once.
-- Current official public 5paisa master: **148,470 derivative contracts parsed**
-  with no unexpected errors, including all four supported energy products.
-- Native quantity multipliers are retained separately. Unverified MCX values
-  and legacy cached conversion factors cannot authorize a new paper fill.
-- Actual live observation: 5paisa Crude Oil option-chain subscription contained
-  390 contracts and delivered market prices with broker-specific receive times.
-  This is quote-reception evidence, not a sustained monthly-capacity test.
+- Kotak contract-unit checks prevent unverified MCX conversion factors from
+  authorizing a new paper fill. Historical live-feed observations do not prove
+  current connectivity or sustained capacity.
 - Real broker orders remain absent. Live commodity paper-trade lifecycle,
   one-second export/recovery acceptance and Kotak socket authentication still
   need verification after this deployment.
@@ -52,12 +48,10 @@
 
 - Complete automated suite: **423 passed**, one existing Starlette/httpx deprecation warning.
 - Isolated production build and source-only runtime ZIP checksum validation passed.
-- New tests cover zero/missing 5paisa last prices without losing later valid
-  messages, OI timestamp retention, real authentication error handling, Kotak
-  native price scaling, expiry business dates and unknown multiplier blocking.
-- Live observations before deployment: owner 5paisa OAuth completed, official
-  catalog loaded, 522 subscriptions initiated, and a zero-price protocol error
-  stopped that feed. The corrected release still needs quote-delivery verification.
+- Feed regression tests cover missing or invalid quotes, OI timestamp
+  retention, authentication failures, Kotak native price scaling, expiry
+  business dates and unknown multiplier blocking. Mocked tests do not prove
+  quote delivery in a live session.
 - Kotak official master URL and public NSE/MCX headers were reachable using
   private server credentials. Corrected full catalog import and live TOTP/feed
   acceptance still need verification. No real orders were sent.
@@ -66,14 +60,14 @@
 
 - Full isolated automated suite: **387 passed**, one existing Starlette/httpx deprecation warning.
 - Frontend TypeScript check and isolated production build passed.
-- Added encrypted Kotak private setup and session-bound 5paisa daily authorization.
+- Added encrypted Kotak private setup and owner-session authorization.
 - Tested secret redaction, CSRF/owner boundaries, callback replay/expiry/fencing,
   encrypted restart restoration and non-blocking HTTP exchange.
 - Source-only RamNaym package: 56 runtime files plus checksum manifest;
   credentials and workspace data excluded.
-- **Not yet live tested:** authenticated Kotak/5paisa streaming, actual account
-  permissions, sustained broker load, daily reauthorization and market recording
-  using those live feeds. A saved setup or token is not a live feed test.
+- **Not yet live tested:** authenticated Kotak streaming, actual account
+  permissions, sustained broker load, session renewal and market recording.
+  A saved setup is not proof of a live feed.
 
 # Export CPU recovery — 26 October 2026
 
@@ -152,7 +146,6 @@ The online workspace still depends on restoring Neon's exhausted allowance. This
 
 - Navy/mint dashboard with four P&L cards, active strategies, broker results, market watch and desk status; responsive navigation and existing authentication/trade/report flows remain integrated.
 - Option chain for NSE/BSE stock and index options: expiry selection, paired CE/PE data, ATM position, OI/volume/IV/Greeks/PCR/buildup, and exact contract/side/lot basket handoff into the builder. Tests cover official schema identity, missing fields, stale quotes, token mismatch, cache bounds, owner/CSRF checks and read-only endpoint restrictions.
-- The current official Dhan public master downloaded and parsed successfully: **434 exchange-specific underlying entries** (424 stock entries and 10 index entries; 215 BSE and 219 NSE), totaling **126,432 option contracts**. These are exchange-specific entries, not a count of unique companies. Coverage changes with the official master.
 - Compact recording defaults apply to older installations. Tests verify exact observed MFE/MAE and times without tick/timeline growth, stop/target/limit trigger prices, receipt recovery and monotonic IDs, retained failures, current marks after restart, rollback cache invalidation and IST day changes.
 - Warmed compact dashboard refreshes issue **zero SQL statements** in the regression test. Report lists omit full payloads and XLSX bytes. Browsing chains does not append snapshot history or subscribe to the whole instrument universe.
 - Slow database work leaves the HTTP event loop responsive. Outages pause SQL workers, return a clear 503 for affected requests, keep health available and retry initialization with backoff.

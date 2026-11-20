@@ -122,7 +122,7 @@ def get_settings(db):
         if stored.get('recording_policy_version',0)<3:
             result['logging_mode']='full_history';result['recording_policy_version']=3
         # Current broker experiments cannot silently cross-source another
-        # broker's fills or current marks. Older Dhan records remain readable.
+        # broker's fills or current marks. Older imported records remain readable.
         result['preferred_feed']='broker'
         state['settings']=result
     return copy.deepcopy(state['settings'])
