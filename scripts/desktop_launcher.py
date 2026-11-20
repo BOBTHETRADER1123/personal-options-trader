@@ -19,6 +19,12 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 URL = 'http://127.0.0.1:8000'
 
+def process_creation_flags():
+    """Use Windows-only flags only on Windows; CI can still exercise the wrapper elsewhere."""
+    if os.name != 'nt':
+        return 0
+    return subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+
 def env_values(path: Path):
     from dotenv import dotenv_values
     return dict(dotenv_values(path)) if path.exists() else {}
@@ -123,7 +129,7 @@ def start_process(role: str, arguments: list[str]):
     with (state / f'{role}.log').open('ab') as log:
         process = subprocess.Popen(arguments, cwd=ROOT, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, close_fds=True,
-                                   creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+                                   creationflags=process_creation_flags())
     token = process_token(process.pid)
     if token is None:
         raise RuntimeError(f'The {role} process could not be started. See .desktop/{role}.log.')

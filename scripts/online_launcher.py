@@ -25,6 +25,7 @@ _spec = importlib.util.spec_from_file_location('online_desktop_helpers', Path(__
 _desktop = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_desktop)
 process_token = _desktop.process_token
+process_creation_flags = _desktop.process_creation_flags
 
 
 @dataclass
@@ -155,7 +156,7 @@ def start_online(config):
     with (state / f'{ROLE}.log').open('ab') as output:
         process = subprocess.Popen([str(python), str(ROOT / 'scripts' / 'online_launcher.py'), '--run-companion'],
             cwd=ROOT, env=environment, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+            close_fds=True, creationflags=process_creation_flags())
     creation = process_token(process.pid)
     if creation is None:
         raise RuntimeError('The online companion did not start. See .desktop/online-companion.log.')

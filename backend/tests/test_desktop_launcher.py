@@ -241,6 +241,15 @@ def test_creation_check_closes_handle_without_stopping(monkeypatch):
     assert api.closed == [123]
 
 
+def test_process_flags_are_platform_safe_and_keep_windows_background_mode(monkeypatch):
+    monkeypatch.setattr(launcher.subprocess, 'CREATE_NO_WINDOW', 0x08000000, raising=False)
+    monkeypatch.setattr(launcher.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
+    monkeypatch.setattr(launcher.os, 'name', 'nt')
+    assert launcher.process_creation_flags() == (0x08000000 | 0x00000200)
+    monkeypatch.setattr(launcher.os, 'name', 'posix')
+    assert launcher.process_creation_flags() == 0
+
+
 def test_start_reuses_only_matching_recorded_process(project, monkeypatch):
     state = project / '.desktop'
     state.mkdir()

@@ -130,6 +130,10 @@ def test_stale_pid_starts_only_the_online_wrapper_without_private_ambient_env(pr
     monkeypatch.setattr(launcher, 'process_token', lambda pid: 790 if pid == 56 else 999)
     for key in ('DATABASE_URL', 'DATA_DIR', 'BACKEND_URL', 'COMPANION_TOKEN', 'TRADES_FOLDER', 'POLL_SECONDS', 'PUBLIC_WEBSITE_URL'):
         monkeypatch.setenv(key, 'must-not-leak-into-online-child')
+    # Exercise the Windows launch branch on GitHub's Linux runner.
+    monkeypatch.setattr(launcher.os, 'name', 'nt')
+    monkeypatch.setattr(launcher.subprocess, 'CREATE_NO_WINDOW', 0x08000000, raising=False)
+    monkeypatch.setattr(launcher.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
     observed = {}
     def spawn(arguments, **kwargs):
         observed.update(arguments=arguments, **kwargs)
@@ -139,7 +143,7 @@ def test_stale_pid_starts_only_the_online_wrapper_without_private_ambient_env(pr
     assert observed['arguments'] == [str(project / '.venv' / 'Scripts' / 'python.exe'), str(project / 'scripts' / 'online_launcher.py'), '--run-companion']
     assert TOKEN not in ' '.join(observed['arguments'])
     assert not any(key in observed['env'] for key in ('DATABASE_URL', 'DATA_DIR', 'BACKEND_URL', 'COMPANION_TOKEN', 'TRADES_FOLDER', 'POLL_SECONDS', 'PUBLIC_WEBSITE_URL'))
-    assert observed['creationflags'] & launcher.subprocess.CREATE_NO_WINDOW
+    assert observed['creationflags'] == (launcher.subprocess.CREATE_NO_WINDOW | launcher.subprocess.CREATE_NEW_PROCESS_GROUP)
     stored = json.loads((state / 'online-companion.json').read_text())
     assert stored['creation'] == 999 and stored['pid'] == 60
     assert TOKEN not in json.dumps(stored)
@@ -162,6 +166,8 @@ def test_stop_touches_only_online_process_with_exact_creation_token(project, mon
 def test_unverifiable_service_does_not_start_process_or_create_report_state(project, monkeypatch):
     config = launcher.load_config(project)
     monkeypatch.setattr(launcher, 'ROOT', project)
+    # The product is Windows-only; the test runner is Linux.
+    monkeypatch.setattr(launcher.os, 'name', 'nt')
     monkeypatch.setattr(launcher, 'paper_health', lambda url: False)
     monkeypatch.setattr(launcher, 'start_online', lambda config: pytest.fail('No process should start'))
     with pytest.raises(RuntimeError, match='could not be verified'):
